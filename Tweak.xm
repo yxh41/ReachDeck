@@ -156,13 +156,64 @@ static UIWindowScene *RBSceneFor(UIWindow *hint) {
     return nil;
 }
 
-static UIWindow *RBReachabilityWindow(UIWindowScene *scene) {
-    if (!scene) return nil;
-    for (UIWindow *w in scene.windows) {
-        NSString *name = NSStringFromClass([w class]);
-        if ([name isEqualToString:@"SBReachabilityWindow"]) return w;
+// 0.1.2: the reachability window's hidden flag is NOT a usable signal -- it is
+// hidden on most of the repeated viewWillAppear callbacks. The reliable signal is
+// the screen shift itself: _containerViewYOffset (and SBHomeGrabberView.origin.y)
+// goes to about -337pt while reachability is up and 0 when it is down.
+static UIView *rbBgView = nil;
+static UIWindow *rbOverlayWindow = nil;
+static dispatch_source_t rbPoll = nil;
+static int rbPollTicks = 0;
+
+static BOOL RBShiftActive(CGFloat *outOffset) {
+    UIView *bg = rbBgView;
+    if (!bg) return NO;
+    CGFloat off = MSHookIvar<CGFloat>(bg, "_containerViewYOffset");
+    CGFloat grabberY = 0.0;
+    Class grabberClass = NSClassFromString(@"SBHomeGrabberView");
+    for (UIView *v in bg.subviews) {
+        if (grabberClass && [v isKindOfClass:grabberClass]) { grabberY = v.frame.origin.y; break; }
     }
-    return nil;
+    if (outOffset) *outOffset = off;
+    return (off > 40.0 || off < -40.0 || grabberY < -40.0);
+}
+
+static UIWindow *RBOverlayWindow(UIWindowScene *scene) {
+    if (!scene) return nil;
+    if (rbOverlayWindow && rbOverlayWindow.windowScene == scene) return rbOverlayWindow;
+    if (rbOverlayWindow) { rbOverlayWindow.hidden = YES; rbOverlayWindow = nil; }
+    UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
+    w.frame = scene.coordinateSpace.bounds;
+    w.windowLevel = UIWindowLevelAlert + 20;
+    w.backgroundColor = [UIColor clearColor];
+    w.opaque = NO;
+    // Touches fall through to reachability, so dismissing still works.
+    w.userInteractionEnabled = NO;
+    w.rootViewController = [[UIViewController alloc] init];
+    w.rootViewController.view.backgroundColor = [UIColor clearColor];
+    w.rootViewController.view.userInteractionEnabled = NO;
+    w.hidden = YES;   // shown only while the screen is actually shifted
+    rbOverlayWindow = w;
+    RBLog(@"overlayWindow created level=%.0f bounds=%@", w.windowLevel, NSStringFromCGRect(w.bounds));
+    return w;
+}
+
+static void RBStartShiftPoll(void) {
+    if (rbPoll) return;
+    rbPoll = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(rbPoll, DISPATCH_TIME_NOW, (uint64_t)(0.08 * NSEC_PER_SEC), 0);
+    dispatch_source_set_event_handler(rbPoll, ^{
+        if (!rbOverlayWindow || !rbContainer) return;
+        CGFloat off = 0.0;
+        BOOL up = RBShiftActive(&off);
+        if (++rbPollTicks % 50 == 0) RBLog(@"shiftPoll heartbeat up=%d offset=%.1f hidden=%d", (int)up, (double)off, (int)rbOverlayWindow.hidden);
+        if (rbOverlayWindow.hidden == up) {
+            rbOverlayWindow.hidden = !up;    // never makeKey
+            RBLog(@"shiftPoll up=%d offset=%.1f windowHidden=%d", (int)up, (double)off, (int)rbOverlayWindow.hidden);
+        }
+    });
+    dispatch_resume(rbPoll);
+    RBLog(@"shiftPoll started");
 }
 
 // ---- Private SpringBoard interfaces ----
@@ -223,6 +274,10 @@ static UIWindow *RBReachabilityWindow(UIWindowScene *scene) {
         rbContainer = nil;
         rbCardView = nil;
     }
+    if (rbOverlayWindow) {
+        rbOverlayWindow.hidden = YES;
+        RBLog(@"viewWillDisappear -> overlay hidden");
+    }
 }
 
 %new
@@ -260,8 +315,10 @@ static UIWindow *RBReachabilityWindow(UIWindowScene *scene) {
     // later appearance bail out and leave the first layout (and the old position)
     // frozen. SBReachabilityWindow is found straight from the scene instead.
     UIWindowScene *scene = RBSceneFor(bg.window);
-    UIWindow *rWin = RBReachabilityWindow(scene);
+    rbBgView = bg;
+    UIWindow *rWin = RBOverlayWindow(scene);
     UIView *host = rWin ?: (UIView *)(bg.window ?: bg);
+    RBStartShiftPoll();
     RBLog(@"addRBContainer host=%@ isWindow=%d reachWin=%@ scene=%@",
           NSStringFromClass([host class]), (int)[host isKindOfClass:[UIWindow class]],
           NSStringFromClass([rWin class]), NSStringFromClass([scene class]));
