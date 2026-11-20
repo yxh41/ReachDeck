@@ -127,6 +127,39 @@ static void RBReloadSettings(void) {
     RBRebuildCards();
 }
 
+// Pick where the overlay should live. 0.0.7 proved the geometry (card at
+// {16,24,358,80} in window coordinates, alpha 1, background 0.72 black) while
+// SBReachabilityBackgroundView itself reported super=(null)/win=(null) at appear
+// time, so "is the host actually on top of the screen" is the only open question.
+// Answer it from data, not assumptions: enumerate the scene's windows, log every
+// one with its level, and mount on the highest full-screen visible window. The
+// 400pt height filter deliberately skips status-bar-sized windows, whose bounds
+// would clip an 80pt card.
+static UIView *RBPickHost(UIView *bg) {
+    UIWindowScene *scene = bg.window.windowScene;
+    if (!scene) {
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
+        }
+    }
+    if (!scene) { RBLog(@"pickHost: no window scene, stay on bg"); return bg; }
+
+    UIWindow *best = nil;
+    for (UIWindow *w in scene.windows) {
+        RBLog(@"  sceneWin %@ level=%.0f hidden=%d alpha=%.2f bounds=%@",
+              NSStringFromClass([w class]), w.windowLevel, (int)w.hidden, w.alpha,
+              NSStringFromCGRect(w.bounds));
+        if (w.hidden || w.alpha < 0.01) continue;
+        if (w.bounds.size.height < 400.0 || w.bounds.size.width < 300.0) continue;
+        if (!best || w.windowLevel > best.windowLevel) best = w;
+    }
+    if (!best) { RBLog(@"pickHost: no full-screen window, stay on bg"); return bg; }
+
+    RBLog(@"pickHost best=%@ level=%.0f", NSStringFromClass([best class]), best.windowLevel);
+    if (best == bg.window) return bg;   // same surface: keep the simpler mount
+    return best;
+}
+
 // ---- Private SpringBoard interfaces ----
 @interface SBReachabilityManager : NSObject
 + (id)sharedInstance;
@@ -201,6 +234,20 @@ static void RBReloadSettings(void) {
     if (![bg isKindOfClass:[UIView class]]) { RBLog(@"addRBContainer bail: no bg view"); return; }
 
     UIWindow *win = bg.window;
+    // The 0.0.7 log shows bg.window == nil inside viewWillAppear: the controller's
+    // view is not attached to its window yet. Picking a host at that moment means
+    // guessing the scene, so wait for the real attachment instead.
+    if (!win) {
+        RBLog(@"addRBContainer: bg has no window yet -> retry in 0.35s");
+        __weak SBReachabilityBackgroundViewController *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            SBReachabilityBackgroundViewController *s = weakSelf;
+            if (!s) return;
+            if (rbContainer) { RBLog(@"retry: already mounted, skip"); return; }
+            [s addRBContainer];
+        });
+        return;
+    }
     UIView *topEffect = MSHookIvar<UIView *>(bg, "_topWallpaperEffectView");
     UIView *wallContainer = MSHookIvar<UIView *>(bg, "_wallpaperContainerView");
     RBLog(@"addRBContainer bg=%@ frame=%@ alpha=%.2f hidden=%d super=%@ win=%@",
@@ -220,14 +267,14 @@ static void RBReloadSettings(void) {
 
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 
-    // MOUNT CHANGE (0.0.7): mount on the controller's own view and force it above
-    // every sibling. 0.0.4/0.0.5 mounted into _topWallpaperEffectView (ReachPlayer's
-    // proven target) and produced a correctly sized 358x80 card that was still not
-    // visible — the classic symptom of host-internal layers drawing over user
-    // subviews. bg + bringSubviewToFront removes that variable entirely.
-    UIView *host = bg;
+    // MOUNT CHANGE (0.0.8): pick the highest full-screen visible window instead of
+    // assuming the controller's view is on top. 0.0.7 already produced a perfect
+    // card rect in window coordinates and it still did not show, so the remaining
+    // variable is which surface we are painted on.
+    UIView *host = RBPickHost(bg);
     rbHostView = host;
-    RBLog(@"addRBContainer host=%@", NSStringFromClass([host class]));
+    BOOL hostIsWindow = [host isKindOfClass:[UIWindow class]];
+    RBLog(@"addRBContainer host=%@ isWindow=%d", NSStringFromClass([host class]), (int)hostIsWindow);
 
     UIView *container = [[UIView alloc] initWithFrame:host.bounds];
     container.translatesAutoresizingMaskIntoConstraints = NO;
@@ -250,10 +297,13 @@ static void RBReloadSettings(void) {
     stack.alignment = UIStackViewAlignmentFill;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:stack];
+    // On a bare window there is no controller chrome, so leave room for the status
+    // bar / Dynamic Island; inside the reachability view the original 24pt is right.
+    CGFloat topInset = hostIsWindow ? 60.0 : 24.0;
     [NSLayoutConstraint activateConstraints:@[
         [stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16],
         [stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
-        [stack.topAnchor constraintEqualToAnchor:container.topAnchor constant:24],
+        [stack.topAnchor constraintEqualToAnchor:container.topAnchor constant:topInset],
         [stack.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-24],
     ]];
 
@@ -273,23 +323,23 @@ static void RBReloadSettings(void) {
     }
 
     rbContainer = container;
-    RBLog(@"addRBContainer mounted host=%@ bounds=%@", NSStringFromClass([host class]), NSStringFromCGRect(host.bounds));
+    RBLog(@"addRBContainer mounted host=%@ isWindow=%d bounds=%@ topInset=%.0f",
+          NSStringFromClass([host class]), (int)hostIsWindow, NSStringFromCGRect(host.bounds), topInset);
 
     // POST-LAYOUT PROOF (0.0.7): one runloop later report real on-screen geometry.
     // "container.window != nil" plus a non-empty rect in window coordinates is the
     // only evidence that the card is actually drawn, so this is logged, not assumed.
     __weak UIView *wContainer = container;
-    __weak UIView *wBg = bg;
     __weak UIView *wCard = rbCardView;
     UIWindow *wWin = win;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIView *c = wContainer, *b = wBg, *cv = wCard;
+        UIView *c = wContainer, *cv = wCard;
         if (!c) { RBLog(@"postMount container gone"); return; }
-        [b bringSubviewToFront:c];
         RBLog(@"postMount container win=%d frame=%@ inWindow=%@ alpha=%.2f hidden=%d super=%@",
               (int)(c.window != nil), NSStringFromCGRect(c.frame),
               NSStringFromCGRect([c convertRect:c.bounds toView:nil]),
               c.alpha, (int)c.hidden, NSStringFromClass([c.superview class]));
+        [c.superview bringSubviewToFront:c];
         if (!c.window && wWin) {
             RBLog(@"postMount container not in a window -> remount on window %@", NSStringFromClass([wWin class]));
             [c removeFromSuperview];
@@ -311,6 +361,19 @@ static void RBReloadSettings(void) {
                   cv.alpha, (int)cv.hidden, (int)(cv.window != nil));
             RBLog(@"postMount card stack=%@ stackFrame=%@ cardBg=%@",
                   NSStringFromClass([stackView class]), NSStringFromCGRect(stackView.frame), cv.backgroundColor);
+        }
+        // Ancestor chain (0.0.8): a single hidden or alpha-0 ancestor makes a
+        // perfectly laid out card invisible, and that is the one thing the previous
+        // logs could not rule out. Walk to the window and print every hop.
+        int depth = 0;
+        for (UIView *a = c.superview; a && depth < 12; a = a.superview, depth++) {
+            RBLog(@"  ancestor[%d] %@ alpha=%.2f hidden=%d frame=%@",
+                  depth, NSStringFromClass([a class]), a.alpha, (int)a.hidden, NSStringFromCGRect(a.frame));
+        }
+        if (c.window) {
+            RBLog(@"postMount window=%@ level=%.0f bounds=%@",
+                  NSStringFromClass([c.window class]), c.window.windowLevel,
+                  NSStringFromCGRect(c.window.bounds));
         }
     });
 }
