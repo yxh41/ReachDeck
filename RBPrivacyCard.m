@@ -124,11 +124,16 @@
     self.rowsStack.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:self.rowsStack];
 
+    // INVISIBLE CARD FIX (0.0.3): a plain UIView has no intrinsicContentSize,
+    // so as a UIStackView arrangedSubview its height collapses to 0 and nothing
+    // is ever drawn. Drive the card height from its content plus an explicit
+    // minimum instead of pinning the stack bottom back to the (sizeless) view.
     [NSLayoutConstraint activateConstraints:@[
         [self.rowsStack.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
         [self.rowsStack.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
         [self.rowsStack.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:12],
-        [self.rowsStack.bottomAnchor constraintLessThanOrEqualToAnchor:self.view.bottomAnchor constant:-12],
+        [self.view.heightAnchor constraintGreaterThanOrEqualToAnchor:self.rowsStack.heightAnchor constant:24],
+        [self.view.heightAnchor constraintGreaterThanOrEqualToConstant:80],
     ]];
 
     self.emptyLabel = [[UILabel alloc] init];

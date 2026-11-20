@@ -1,7 +1,29 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <stdarg.h>
 #import "RBCardProtocol.h"
 #import "RBPrivacyCard.h"
+
+// Diagnostic log (0.0.3): ASCII-only strings so they survive toolchain string
+// handling; mirrored to syslog and a plist-dir file the user can send us.
+static NSString *RBLogPath(void) {
+    NSString *a = @"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.debug.log";
+    NSString *b = @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.debug.log";
+    return [[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences"] ? a : b;
+}
+static void RBLog(NSString *fmt, ...) {
+    va_list args; va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSLog(@"[ReachDeck] %@", msg);
+    NSString *line = [msg stringByAppendingString:@"\n"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:RBLogPath()];
+    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    else { [line writeToFile:RBLogPath() atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+}
+static void RBLogReset(void) {
+    [@"" writeToFile:RBLogPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
 
 // ============================================================================
 // ReachDeck — pluggable HUD for the Reachability window's empty half.
@@ -48,6 +70,7 @@ static void RBRebuildCards(void) {
         [cards addObject:privacyCard];
     }
     rbCards = [cards copy];
+    RBLog(@"rebuild cards privacy=%d hideSys=%d count=%lu", rbCardPrivacy, rbHideSystemServices, (unsigned long)rbCards.count);
 }
 
 // Pure data read — safe from a dylib initializer: Foundation file I/O only,
@@ -102,24 +125,29 @@ static void RBReloadSettings(void) {
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
+    RBLog(@"viewWillAppear fired");
     [self addRBContainer];
 }
 
 %new
 - (void)addRBContainer {
-    if (!rbEnabled) return; // master switch — hooks stay loaded so re-enabling needs no respring
+    RBLog(@"addRBContainer enter enabled=%d cards=%lu", rbEnabled, (unsigned long)rbCards.count);
+    if (!rbEnabled) { RBLog(@"addRBContainer bail: disabled"); return; } // master switch — hooks stay loaded so re-enabling needs no respring
 
     // First real presentation. UIApplication is fully initialized here, so this
     // is the earliest safe point to materialize card views.
     if (!rbCards) RBRebuildCards();
+    if (rbCards.count == 0) { RBLog(@"addRBContainer bail: no cards"); return; }
 
     // Reuse the mount point ReachPlayer proved: _topWallpaperEffectView inside the
     // reachability background view. Read the ivar defensively.
     UIView *bg = self.view;
+    RBLog(@"addRBContainer bg=%@", NSStringFromClass([bg class]));
     if (![bg isKindOfClass:[UIView class]]) return;
 
     UIView *topEffect = MSHookIvar<UIView *>(bg, "_topWallpaperEffectView");
-    if (!topEffect) return;
+    RBLog(@"addRBContainer topEffect=%@", NSStringFromClass([topEffect class]));
+    if (!topEffect) { RBLog(@"addRBContainer bail: topEffect nil"); return; }
     rbHostView = topEffect;
 
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
@@ -154,12 +182,14 @@ static void RBReloadSettings(void) {
     for (id<RBCard> card in sorted) {
         if ([card respondsToSelector:@selector(rbRefresh)]) [card rbRefresh];
         UIView *v = card.rbView;
+        RBLog(@"addRBContainer card=%@ view=%@ frame=%@", [card rbIdentifier], NSStringFromClass([v class]), NSStringFromCGRect(v.frame));
         if (!v) continue;
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [stack addArrangedSubview:v];
     }
 
     rbContainer = container;
+    RBLog(@"addRBContainer mounted topEffect.frame=%@", NSStringFromCGRect(topEffect.bounds));
 }
 
 %end
@@ -221,6 +251,7 @@ static void RBReloadSettings(void) {
         attrs = [self activeAndRecentSensorActivityAttributions];
     }
     if (privacyCard) [privacyCard ingestAttributions:attrs];
+    RBLog(@"sensor data attrs=%lu", (unsigned long)attrs.count);
 }
 
 %end
@@ -233,11 +264,18 @@ static void RBReloadSettings(void) {
         // SpringBoard-only: the data source lives here; no app-process injection needed.
         NSString *proc = [[[NSProcessInfo processInfo] arguments][0] lastPathComponent];
         if (![proc isEqualToString:@"SpringBoard"]) return;
+        RBLogReset();
+        RBLog(@"ctor start proc=%@", proc);
 
         // Data only. RBRebuildCards()/card.rbView are deliberately NOT called here:
         // constructing UIKit objects during dyld initialization is what caused the
         // SpringBoard Safe Mode crash in 0.0.1.
         RBReadPrefs();
+        RBLog(@"ctor prefs enabled=%d privacy=%d hideSys=%d", rbEnabled, rbCardPrivacy, rbHideSystemServices);
+        RBLog(@"ctor classes bgVC=%d reachMgr=%d provider=%d",
+              (int)(objc_getClass("SBReachabilityBackgroundViewController") != nil),
+              (int)(objc_getClass("SBReachabilityManager") != nil),
+              (int)(objc_getClass("SBSensorActivityDataProvider") != nil));
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL,
             (CFNotificationCallback)RBReloadSettings, CFSTR(RB_NOTIFY), NULL,
@@ -245,7 +283,8 @@ static void RBReloadSettings(void) {
 
         // Guard every private-class group independently. A class absent on this iOS
         // build must install nothing, never fail at load time.
-        if (objc_getClass("SBReachabilityBackgroundViewController")) %init(RBContainer);
+        if (objc_getClass("SBReachabilityBackgroundViewController")) { %init(RBContainer); RBLog(@"ctor init RBContainer OK"); }
+        else RBLog(@"ctor SKIP RBContainer: class missing");
 
         // Reachability-forcing hooks live in one group; these are long-stable SpringBoard
         // classes (also used unguarded by ReachPlayer), but guard the group entry anyway.
