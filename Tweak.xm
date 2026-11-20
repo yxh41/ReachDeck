@@ -124,9 +124,19 @@ static void RBReadPrefs(void) {
 // "immediate" means: next present builds from the new config. No respring needed.
 // We never reach into the live view here — finding the reachability controller from
 // a scene graph is fragile, and the next viewWillAppear already handles remounting.
+static void RBMountInHost(UIView *host);   // fwd: settings changes must re-lay out in place
+
 static void RBReloadSettings(void) {
     RBReadPrefs();
     RBRebuildCards();
+    // A preference change must be visible on the next reachability, not the next
+    // respring -- and 0.1.0 proved the mount does NOT re-run on later appearances
+    // (bg.window is always nil inside viewWillAppear, so the old code bailed).
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!rbHostView) { RBLog(@"reload: no host yet, next appear will mount"); return; }
+        RBLog(@"reload: remount on %@ bottom=%d", NSStringFromClass([rbHostView class]), (int)rbCardAtBottom);
+        RBMountInHost(rbHostView);
+    });
 }
 
 // Where the overlay lives. Three attempts settled this:
@@ -228,26 +238,11 @@ static UIWindow *RBReachabilityWindow(UIWindowScene *scene) {
     UIView *bg = self.view;
     if (![bg isKindOfClass:[UIView class]]) { RBLog(@"addRBContainer bail: no bg view"); return; }
 
-    UIWindow *win = bg.window;
-    // The 0.0.7 log shows bg.window == nil inside viewWillAppear: the controller's
-    // view is not attached to its window yet. Picking a host at that moment means
-    // guessing the scene, so wait for the real attachment instead.
-    if (!win) {
-        RBLog(@"addRBContainer: bg has no window yet -> retry in 0.35s");
-        __weak SBReachabilityBackgroundViewController *weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            SBReachabilityBackgroundViewController *s = weakSelf;
-            if (!s) return;
-            if (rbContainer) { RBLog(@"retry: already mounted, skip"); return; }
-            [s addRBContainer];
-        });
-        return;
-    }
     UIView *topEffect = MSHookIvar<UIView *>(bg, "_topWallpaperEffectView");
     UIView *wallContainer = MSHookIvar<UIView *>(bg, "_wallpaperContainerView");
     RBLog(@"addRBContainer bg=%@ frame=%@ alpha=%.2f hidden=%d super=%@ win=%@",
           NSStringFromClass([bg class]), NSStringFromCGRect(bg.frame), bg.alpha, (int)bg.hidden,
-          NSStringFromClass([bg.superview class]), NSStringFromClass([win class]));
+          NSStringFromClass([bg.superview class]), NSStringFromClass([bg.window class]));
     RBLog(@"addRBContainer topEffect=%@ frame=%@ alpha=%.2f hidden=%d win=%d wallContainer=%@",
           NSStringFromClass([topEffect class]),
           topEffect ? NSStringFromCGRect(topEffect.frame) : @"(nil)",
@@ -260,21 +255,27 @@ static UIWindow *RBReachabilityWindow(UIWindowScene *scene) {
               NSStringFromClass([sub class]), sub.alpha, (int)sub.hidden, NSStringFromCGRect(sub.frame));
     }
 
+    // Host lookup does NOT depend on bg being attached to its window: inside
+    // viewWillAppear it never is on this build, and requiring it is what made every
+    // later appearance bail out and leave the first layout (and the old position)
+    // frozen. SBReachabilityWindow is found straight from the scene instead.
+    UIWindowScene *scene = RBSceneFor(bg.window);
+    UIWindow *rWin = RBReachabilityWindow(scene);
+    UIView *host = rWin ?: (UIView *)(bg.window ?: bg);
+    RBLog(@"addRBContainer host=%@ isWindow=%d reachWin=%@ scene=%@",
+          NSStringFromClass([host class]), (int)[host isKindOfClass:[UIWindow class]],
+          NSStringFromClass([rWin class]), NSStringFromClass([scene class]));
+    rbHostView = host;
+    RBMountInHost(host);
+}
+
+// Mount the card stack into an explicit host. Kept as a C function (not a method)
+// because two callers need it: the appearance hook and the settings listener.
+static void RBMountInHost(UIView *host) {
+    if (!host) { RBLog(@"mount bail: nil host"); return; }
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 
-    // MOUNT CHANGE (0.1.0): mount inside SBReachabilityWindow — the surface
-    // reachability itself paints on, alive only while reachability is up. The card
-    // therefore appears and disappears with reachability by construction; no
-    // lifecycle hook, no residue over the Home Screen.
-    UIWindowScene *scene = RBSceneFor(win);
-    UIWindow *rWin = RBReachabilityWindow(scene);
-    UIView *host = rWin ?: bg;
-    rbHostView = host;
     BOOL hostIsWindow = [host isKindOfClass:[UIWindow class]];
-    RBLog(@"addRBContainer host=%@ isWindow=%d reachWin=%@ scene=%@",
-          NSStringFromClass([host class]), (int)hostIsWindow,
-          NSStringFromClass([rWin class]), NSStringFromClass([scene class]));
-
     UIView *container = [[UIView alloc] initWithFrame:host.bounds];
     container.translatesAutoresizingMaskIntoConstraints = NO;
     container.backgroundColor = [UIColor clearColor];
@@ -337,7 +338,6 @@ static UIWindow *RBReachabilityWindow(UIWindowScene *scene) {
     // only evidence that the card is actually drawn, so this is logged, not assumed.
     __weak UIView *wContainer = container;
     __weak UIView *wCard = rbCardView;
-    UIWindow *wWin = win;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIView *c = wContainer, *cv = wCard;
         if (!c) { RBLog(@"postMount container gone"); return; }
@@ -346,19 +346,6 @@ static UIWindow *RBReachabilityWindow(UIWindowScene *scene) {
               NSStringFromCGRect([c convertRect:c.bounds toView:nil]),
               c.alpha, (int)c.hidden, NSStringFromClass([c.superview class]));
         [c.superview bringSubviewToFront:c];
-        if (!c.window && wWin) {
-            RBLog(@"postMount container not in a window -> remount on window %@", NSStringFromClass([wWin class]));
-            [c removeFromSuperview];
-            c.translatesAutoresizingMaskIntoConstraints = NO;
-            [wWin addSubview:c];
-            [wWin bringSubviewToFront:c];
-            [NSLayoutConstraint activateConstraints:@[
-                [c.leadingAnchor constraintEqualToAnchor:wWin.leadingAnchor],
-                [c.trailingAnchor constraintEqualToAnchor:wWin.trailingAnchor],
-                [c.topAnchor constraintEqualToAnchor:wWin.topAnchor],
-                [c.bottomAnchor constraintEqualToAnchor:wWin.bottomAnchor],
-            ]];
-        }
         if (cv) {
             UIView *stackView = cv.superview;
             RBLog(@"postMount card frame=%@ inWindow=%@ alpha=%.2f hidden=%d window=%d",
@@ -383,6 +370,7 @@ static UIWindow *RBReachabilityWindow(UIWindowScene *scene) {
         }
     });
 }
+
 
 %end
 %end
