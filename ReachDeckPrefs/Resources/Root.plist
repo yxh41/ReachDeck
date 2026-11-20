@@ -10,15 +10,15 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>GENERAL</string>
+			<string>常规</string>
 			<key>footerText</key>
-			<string>Cards appear in the Reachability window when you pull the screen down.</string>
+			<string>划出便捷访问时，在屏幕上显示卡片。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
-			<string>Enable ReachDeck</string>
+			<string>启用 ReachDeck</string>
 			<key>key</key>
 			<string>enabled</string>
 			<key>default</key>
@@ -30,15 +30,15 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>PRIVACY CARD</string>
+			<string>隐私卡片</string>
 			<key>footerText</key>
-			<string>Shows which app is currently using the camera or microphone.</string>
+			<string>显示当前正在使用相机或麦克风的应用。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
-			<string>Privacy Card</string>
+			<string>显示隐私卡片</string>
 			<key>key</key>
 			<string>cardPrivacy</string>
 			<key>default</key>
@@ -50,7 +50,7 @@
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
-			<string>Hide system services</string>
+			<string>隐藏系统服务</string>
 			<key>key</key>
 			<string>hideSystemServices</string>
 			<key>default</key>
@@ -62,17 +62,17 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>POSITION</string>
+			<string>显示位置</string>
 			<key>footerText</key>
-			<string>Where the cards sit inside the Reachability area. Switch this if the cards land on top of the Home Screen icons instead of the empty band, or the other way round.</string>
+			<string>卡片默认放在便捷访问区域下方。若看不到卡片，打开下方开关试试顶部。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
-			<string>Anchor cards to bottom</string>
+			<string>固定在顶部</string>
 			<key>key</key>
-			<string>cardAtBottom</string>
+			<string>cardAtTop</string>
 			<key>default</key>
 			<false/>
 			<key>defaults</key>

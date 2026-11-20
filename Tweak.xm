@@ -90,7 +90,7 @@ static RBPrivacyCard *privacyCard = nil;
 static BOOL rbEnabled = YES;
 static BOOL rbCardPrivacy = YES;
 static BOOL rbHideSystemServices = NO;
-static BOOL rbCardAtBottom = NO;          // 0.1.0: user-chosen position inside the band
+static BOOL rbCardAtBottom = YES;         // 0.2.1: derived from cardAtTop (default off => bottom)
 static NSArray<id<RBCard>> *rbCards = nil;
 static UIView *rbContainer = nil;        // container mounted inside _topWallpaperEffectView
 
@@ -115,7 +115,10 @@ static void RBReadPrefs(void) {
     rbEnabled = d[@"enabled"] ? [d[@"enabled"] boolValue] : YES;
     rbCardPrivacy = d[@"cardPrivacy"] ? [d[@"cardPrivacy"] boolValue] : YES;
     rbHideSystemServices = d[@"hideSystemServices"] ? [d[@"hideSystemServices"] boolValue] : NO;
-    rbCardAtBottom = d[@"cardAtBottom"] ? [d[@"cardAtBottom"] boolValue] : NO;
+    // 0.2.1: the UI switch is "cardAtTop" (off = bottom, the visible band on this
+    // device). Honour the old cardAtBottom key too for users upgrading from 0.1.x.
+    rbCardAtBottom = d[@"cardAtTop"] ? ![d[@"cardAtTop"] boolValue]
+                   : (d[@"cardAtBottom"] ? [d[@"cardAtBottom"] boolValue] : YES);
 }
 
 // Darwin callback. The Reachability view only exists while the window is up, so

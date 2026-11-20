@@ -5,14 +5,9 @@
 // We deliberately do NOT declare a hardcoded sensor enum: its numeric values are not
 // stable across iOS versions. Instead we read the semantic property and fall back to
 // the attribution's description. This is the "don't guess the API" rule in code form.
-@protocol RBAttribution <NSObject>
-- (NSString *)bundleIdentifier;
-- (NSString *)displayName;
-- (NSString *)activeEntityBundleIdentifier;
-- (long long)sensor;
-- (BOOL)isSystemService;
-- (BOOL)usedRecently;
-@end
+// NOTE: do NOT use conformsToProtocol with a locally declared protocol here:
+// SBSensorActivityAttribution never declares conformance to it (0.2.1 fix).
+
 
 @interface RBPrivacyCard ()
 @property (nonatomic, strong) UIView *view;
@@ -86,28 +81,47 @@
     self.lastAttributions = attributions;
     NSMutableArray *out = [NSMutableArray array];
     for (id obj in attributions) {
-        if (![obj conformsToProtocol:@protocol(RBAttribution)]) continue;
+        // 0.2.1 FIX: the old check was `conformsToProtocol:@protocol(RBAttribution)`.
+        // SBSensorActivityAttribution never declares conformance to OUR private
+        // protocol, so every entry was skipped -- the log showed attrs=1/2 while the
+        // card still said "no app". Check the actual methods instead.
+        if (![obj respondsToSelector:@selector(displayName)] &&
+            ![obj respondsToSelector:@selector(bundleIdentifier)] &&
+            ![obj respondsToSelector:@selector(activeEntityBundleIdentifier)]) {
+            NSLog(@"[ReachDeck] attribution skip class=%@ (no name/bundle selectors)", NSStringFromClass([obj class]));
+            continue;
+        }
 
-        id<RBAttribution> a = (id<RBAttribution>)obj;
-        NSString *bundle = a.bundleIdentifier ?: a.activeEntityBundleIdentifier ?: @"";
-        NSString *name = a.displayName ?: bundle;
-        if (name.length == 0) continue;
+        NSString *bundle = nil, *name = nil;
+        if ([obj respondsToSelector:@selector(bundleIdentifier)]) bundle = [obj performSelector:@selector(bundleIdentifier)];
+        if (!bundle && [obj respondsToSelector:@selector(activeEntityBundleIdentifier)])
+            bundle = [obj performSelector:@selector(activeEntityBundleIdentifier)];
+        if ([obj respondsToSelector:@selector(displayName)]) name = [obj performSelector:@selector(displayName)];
+        if (!name) name = bundle;
+        if (name.length == 0) {
+            NSLog(@"[ReachDeck] attribution skip class=%@ empty name/bundle", NSStringFromClass([obj class]));
+            continue;
+        }
 
-        // System services are real attributions but usually not what "which app is
-        // listening" means. Mark them; optionally filter per preference.
-        BOOL system = a.isSystemService;
+        BOOL system = NO;
+        if ([obj respondsToSelector:@selector(isSystemService)]) {
+            id sysVal = [obj valueForKey:@"isSystemService"];   // KVC boxes scalars
+            system = [sysVal isKindOfClass:[NSNumber class]] ? [sysVal boolValue] : NO;
+        }
         if (self.hideSystemServices && system) continue;
 
-        // sensor value semantics: 1 == camera, 2 == microphone on the builds examined.
-        // Rather than trust the raw number, derive kind from the class of data we were
-        // handed: activeCameraAndMicrophoneActivityAttributions mixes both, so use the
-        // numeric hint ONLY as a hint and keep the raw value for the log.
-        long long sensor = a.sensor;
+        long long sensor = -1;
+        if ([obj respondsToSelector:@selector(sensor)]) {
+            id sensorVal = [obj valueForKey:@"sensor"];         // KVC boxes scalars
+            if ([sensorVal isKindOfClass:[NSNumber class]]) sensor = [sensorVal longLongValue];
+        }
         NSString *kind = (sensor == 1) ? @"camera" : (sensor == 2) ? @"microphone" : @"sensor";
 
-        [out addObject:@{ @"name": name, @"bundle": bundle, @"kind": kind,
+        NSLog(@"[ReachDeck] attribution OK name=%@ bundle=%@ sensor=%lld system=%d", name, bundle, sensor, (int)system);
+        [out addObject:@{ @"name": name, @"bundle": bundle ?: @"", @"kind": kind,
                           @"system": @(system), @"raw": @(sensor) }];
     }
+    NSLog(@"[ReachDeck] ingest rows=%lu from attrs=%lu", (unsigned long)out.count, (unsigned long)attributions.count);
     self.rows = [out copy];
     [self renderRows];
 }
