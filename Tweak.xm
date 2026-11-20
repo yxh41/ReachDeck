@@ -184,32 +184,48 @@ static void RBReloadSettings(void) {
     if (!rbCards) RBRebuildCards();
     if (rbCards.count == 0) { RBLog(@"addRBContainer bail: no cards"); return; }
 
-    // Reuse the mount point ReachPlayer proved: _topWallpaperEffectView inside the
-    // reachability background view. Read the ivar defensively.
+    // Mount point: ReachPlayer proved _topWallpaperEffectView works, but on this
+    // build it may be transparent or buried under a sibling, which makes a
+    // correctly-laid-out card invisible. Verify visibility and fall back to the
+    // reachability window (the top-most surface) when it is not visible.
     UIView *bg = self.view;
     RBLog(@"addRBContainer bg=%@", NSStringFromClass([bg class]));
     if (![bg isKindOfClass:[UIView class]]) return;
 
     UIView *topEffect = MSHookIvar<UIView *>(bg, "_topWallpaperEffectView");
-    RBLog(@"addRBContainer topEffect=%@ bg.subviews=%lu", NSStringFromClass([topEffect class]), (unsigned long)bg.subviews.count);
-    if (!topEffect) {
-        // Fallback: if the ivar is gone on this build, mount on the reachability
-        // background view itself rather than silently doing nothing.
-        RBLog(@"addRBContainer fallback: mount on bg");
-        topEffect = bg;
+    UIView *wallContainer = MSHookIvar<UIView *>(bg, "_wallpaperContainerView");
+    UIWindow *win = bg.window;
+    RBLog(@"addRBContainer topEffect=%@ alpha=%.2f hidden=%d win=%@",
+          NSStringFromClass([topEffect class]), topEffect ? topEffect.alpha : -1.0,
+          topEffect ? (int)topEffect.hidden : -1, NSStringFromClass([win class]));
+    RBLog(@"addRBContainer wallContainer=%@", NSStringFromClass([wallContainer class]));
+    for (UIView *sub in bg.subviews) {
+        RBLog(@"  bgsub %@ alpha=%.2f hidden=%d frame=%@",
+              NSStringFromClass([sub class]), sub.alpha, (int)sub.hidden, NSStringFromCGRect(sub.frame));
     }
-    rbHostView = topEffect;
+
+    UIView *host = topEffect;
+    BOOL hostVisible = (topEffect != nil && !topEffect.hidden && topEffect.alpha > 0.01 && topEffect.window != nil);
+    if (!hostVisible) {
+        RBLog(@"addRBContainer topEffect not visible -> fallback to window/bg");
+        host = (UIView *)win ?: bg;
+    }
+    if (!host) { RBLog(@"addRBContainer bail: no host"); return; }
+    rbHostView = host;
+    RBLog(@"addRBContainer host=%@", NSStringFromClass([host class]));
 
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 
-    UIView *container = [[UIView alloc] initWithFrame:topEffect.bounds];
+    UIView *container = [[UIView alloc] initWithFrame:host.bounds];
     container.translatesAutoresizingMaskIntoConstraints = NO;
-    [topEffect addSubview:container];
+    // The overlay must never swallow reachability's own gestures.
+    container.userInteractionEnabled = NO;
+    [host addSubview:container];
     [NSLayoutConstraint activateConstraints:@[
-        [container.leadingAnchor constraintEqualToAnchor:topEffect.leadingAnchor],
-        [container.trailingAnchor constraintEqualToAnchor:topEffect.trailingAnchor],
-        [container.topAnchor constraintEqualToAnchor:topEffect.topAnchor],
-        [container.bottomAnchor constraintEqualToAnchor:topEffect.bottomAnchor],
+        [container.leadingAnchor constraintEqualToAnchor:host.leadingAnchor],
+        [container.trailingAnchor constraintEqualToAnchor:host.trailingAnchor],
+        [container.topAnchor constraintEqualToAnchor:host.topAnchor],
+        [container.bottomAnchor constraintEqualToAnchor:host.bottomAnchor],
     ]];
 
     // Stack the enabled cards vertically; each card owns its internal layout.
@@ -219,10 +235,12 @@ static void RBReloadSettings(void) {
     stack.alignment = UIStackViewAlignmentFill;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:stack];
+    // When mounted on the window, leave room for the status bar / dynamic island.
+    CGFloat topInset = (host == (UIView *)win) ? 64.0 : 24.0;
     [NSLayoutConstraint activateConstraints:@[
         [stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16],
         [stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
-        [stack.topAnchor constraintEqualToAnchor:container.topAnchor constant:24],
+        [stack.topAnchor constraintEqualToAnchor:container.topAnchor constant:topInset],
         [stack.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-24],
     ]];
 
@@ -239,7 +257,7 @@ static void RBReloadSettings(void) {
     }
 
     rbContainer = container;
-    RBLog(@"addRBContainer mounted host=%@ bounds=%@", NSStringFromClass([topEffect class]), NSStringFromCGRect(topEffect.bounds));
+    RBLog(@"addRBContainer mounted host=%@ bounds=%@ topInset=%.0f", NSStringFromClass([host class]), NSStringFromCGRect(host.bounds), topInset);
 }
 
 %end

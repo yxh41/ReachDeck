@@ -124,7 +124,7 @@
     root.layer.cornerRadius = 16;
     root.layer.cornerCurve = kCACornerCurveContinuous;
     root.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
-    root.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.14].CGColor;
+    root.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.24].CGColor;
     root.clipsToBounds = YES;
     // Highest hugging/compression resistance: never grow to fill spare space.
     [root setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
