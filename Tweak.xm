@@ -166,15 +166,6 @@ static UIWindow *rbOverlayWindow = nil;
 static dispatch_source_t rbPoll = nil;
 static int rbPollTicks = 0;
 
-static UIWindow *RBFindWindow(NSString *className) {
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if (![s isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)s).windows) {
-            if ([NSStringFromClass([w class]) isEqualToString:className]) return w;
-        }
-    }
-    return nil;
-}
 
 static BOOL RBShiftActive(CGFloat *outOffset) {
     UIView *bg = rbBgView;
