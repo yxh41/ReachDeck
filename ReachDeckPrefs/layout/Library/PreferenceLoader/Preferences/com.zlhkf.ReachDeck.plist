@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>entry</key>
+	<dict>
+		<key>label</key>
+		<string>ReachDeck</string>
+		<key>id</key>
+		<string>com.zlhkf.ReachDeck</string>
+		<key>mode</key>
+		<string>PSListController</string>
+		<key>bundle</key>
+		<string>com.zlhkf.ReachDeckPrefs</string>
+		<key>controller</key>
+		<string>RDRootListController</string>
+	</dict>
+</dict>
+</plist>

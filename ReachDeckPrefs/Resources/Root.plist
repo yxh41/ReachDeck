@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>title</key>
+	<string>ReachDeck</string>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>group</key>
+			<string></string>
+			<key>header</key>
+			<string>GENERAL</string>
+			<key>footer</key>
+			<string>Cards appear in the Reachability window when you pull the screen down.</string>
+			<key>items</key>
+			<array>
+				<dict>
+					<key>Cell</key>
+					<string>PSSwitchCell</string>
+					<key>default</key>
+					<true/>
+					<key>key</key>
+					<string>enabled</string>
+					<key>Label</key>
+					<string>Enable ReachDeck</string>
+					<key>defaults</key>
+					<string>com.zlhkf.ReachDeck</string>
+				</dict>
+			</array>
+		</dict>
+		<dict>
+			<key>group</key>
+			<string></string>
+			<key>header</key>
+			<string>PRIVACY CARD</string>
+			<key>footer</key>
+			<string>Shows which app is currently using the camera or microphone.</string>
+			<key>items</key>
+			<array>
+				<dict>
+					<key>Cell</key>
+					<string>PSSwitchCell</string>
+					<key>default</key>
+					<true/>
+					<key>key</key>
+					<string>cardPrivacy</string>
+					<key>Label</key>
+					<string>Privacy Card</string>
+					<key>defaults</key>
+					<string>com.zlhkf.ReachDeck</string>
+				</dict>
+				<dict>
+					<key>Cell</key>
+					<string>PSSwitchCell</string>
+					<key>default</key>
+					<false/>
+					<key>key</key>
+					<string>hideSystemServices</string>
+					<key>Label</key>
+					<string>Hide system services</string>
+					<key>defaults</key>
+					<string>com.zlhkf.ReachDeck</string>
+				</dict>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
