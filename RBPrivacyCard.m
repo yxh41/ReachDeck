@@ -88,7 +88,7 @@
         if (![obj respondsToSelector:@selector(displayName)] &&
             ![obj respondsToSelector:@selector(bundleIdentifier)] &&
             ![obj respondsToSelector:@selector(activeEntityBundleIdentifier)]) {
-            NSLog(@"[ReachDeck] attribution skip class=%@ (no name/bundle selectors)", NSStringFromClass([obj class]));
+            RBLog(@"attribution skip class=%@ (no name/bundle selectors)", NSStringFromClass([obj class]));
             continue;
         }
 
@@ -99,7 +99,7 @@
         if ([obj respondsToSelector:@selector(displayName)]) name = [obj performSelector:@selector(displayName)];
         if (!name) name = bundle;
         if (name.length == 0) {
-            NSLog(@"[ReachDeck] attribution skip class=%@ empty name/bundle", NSStringFromClass([obj class]));
+            RBLog(@"attribution skip class=%@ empty name/bundle", NSStringFromClass([obj class]));
             continue;
         }
 
@@ -115,13 +115,19 @@
             id sensorVal = [obj valueForKey:@"sensor"];         // KVC boxes scalars
             if ([sensorVal isKindOfClass:[NSNumber class]]) sensor = [sensorVal longLongValue];
         }
-        NSString *kind = (sensor == 1) ? @"camera" : (sensor == 2) ? @"microphone" : @"sensor";
+        // 0.2.2: user-visible card content is Simplified Chinese. Keep the raw
+        // sensor number in the row so icon colour never depends on a localized
+        // display string.
+        NSString *kind = @"传感器";
+        if (sensor == 1) kind = @"相机";
+        else if (sensor == 2) kind = @"麦克风";
 
-        NSLog(@"[ReachDeck] attribution OK name=%@ bundle=%@ sensor=%lld system=%d", name, bundle, sensor, (int)system);
+        RBLog(@"attribution OK name=%@ bundle=%@ sensor=%lld system=%d kind=%@",
+              name, bundle, sensor, (int)system, kind);
         [out addObject:@{ @"name": name, @"bundle": bundle ?: @"", @"kind": kind,
                           @"system": @(system), @"raw": @(sensor) }];
     }
-    NSLog(@"[ReachDeck] ingest rows=%lu from attrs=%lu", (unsigned long)out.count, (unsigned long)attributions.count);
+    RBLog(@"ingest rows=%lu from attrs=%lu", (unsigned long)out.count, (unsigned long)attributions.count);
     self.rows = [out copy];
     [self renderRows];
 }
@@ -167,7 +173,7 @@
     ]];
 
     UILabel *header = [[UILabel alloc] init];
-    header.text = @"PRIVACY";
+    header.text = @"隐私";
     header.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
     header.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
     [self.contentStack addArrangedSubview:header];
@@ -182,7 +188,7 @@
     [self.contentStack addArrangedSubview:self.rowsStack];
 
     self.emptyLabel = [[UILabel alloc] init];
-    self.emptyLabel.text = @"No app is using the camera or microphone";
+    self.emptyLabel.text = @"当前没有应用使用相机或麦克风";
     self.emptyLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.92];
     self.emptyLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
     self.emptyLabel.numberOfLines = 0;
@@ -219,7 +225,7 @@
     UIView *dot = [[UIView alloc] init];
     dot.translatesAutoresizingMaskIntoConstraints = NO;
     dot.layer.cornerRadius = 5;
-    BOOL isCamera = [row[@"kind"] isEqualToString:@"camera"];
+    BOOL isCamera = ([row[@"raw"] longLongValue] == 1);
     dot.backgroundColor = isCamera ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
     [box addSubview:dot];
 
@@ -233,7 +239,14 @@
     [box addSubview:title];
 
     UILabel *sub = [[UILabel alloc] init];
-    sub.text = [NSString stringWithFormat:@"%@ · %@", row[@"kind"], row[@"bundle"]];
+    // 0.2.2: localized kind + optional system-service tag + bundle id. The
+    // bundle id stays as a stable technical identifier; it is not user-facing
+    // copy and may be the only way to recognise a system attribution.
+    NSMutableArray *parts = [NSMutableArray arrayWithObject:(row[@"kind"] ?: @"传感器")];
+    if ([row[@"system"] boolValue]) [parts addObject:@"系统服务"];
+    NSString *bundle = row[@"bundle"];
+    if (bundle.length) [parts addObject:bundle];
+    sub.text = [parts componentsJoinedByString:@" · "];
     sub.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
     sub.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
     sub.numberOfLines = 1;

@@ -5,6 +5,11 @@
 #import <UIKit/UIKit.h>
 #import "RBCardProtocol.h"
 
+// Shared ReachDeck diagnostic logger: writes both syslog and the debug.log
+// plist-dir file, so card-side parsing evidence is visible in the same log the
+// tweak side writes. Implemented in Tweak.xm.
+extern void RBLog(NSString *fmt, ...);
+
 @interface RBPrivacyCard : NSObject <RBCard>
 
 /// Called from the tweak side when sensor activity changes. Pass the raw attribution set
