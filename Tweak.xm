@@ -127,37 +127,52 @@ static void RBReloadSettings(void) {
     RBRebuildCards();
 }
 
-// Pick where the overlay should live. 0.0.7 proved the geometry (card at
-// {16,24,358,80} in window coordinates, alpha 1, background 0.72 black) while
-// SBReachabilityBackgroundView itself reported super=(null)/win=(null) at appear
-// time, so "is the host actually on top of the screen" is the only open question.
-// Answer it from data, not assumptions: enumerate the scene's windows, log every
-// one with its level, and mount on the highest full-screen visible window. The
-// 400pt height filter deliberately skips status-bar-sized windows, whose bounds
-// would clip an 80pt card.
-static UIView *RBPickHost(UIView *bg) {
-    UIWindowScene *scene = bg.window.windowScene;
-    if (!scene) {
-        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
-        }
-    }
-    if (!scene) { RBLog(@"pickHost: no window scene, stay on bg"); return bg; }
+// Where the overlay lives. 0.0.8 answered this by enumerating the scene's windows
+// and mounting on the highest-level one — which turned out to be another tweak's
+// private window (level 1e11) that we do not control. A foreign window can re-add
+// its own content above us on any layout pass, and we can neither verify nor fix
+// that. So 0.0.9 owns its surface: one transparent UIWindow at a level just above
+// the reachability window, with interaction disabled end to end. Level, alpha and
+// z-order are then all ours, which makes "invisible while alpha is 1" impossible.
+static UIWindow *rbOverlayWindow = nil;
 
-    UIWindow *best = nil;
-    for (UIWindow *w in scene.windows) {
-        RBLog(@"  sceneWin %@ level=%.0f hidden=%d alpha=%.2f bounds=%@",
-              NSStringFromClass([w class]), w.windowLevel, (int)w.hidden, w.alpha,
-              NSStringFromCGRect(w.bounds));
-        if (w.hidden || w.alpha < 0.01) continue;
-        if (w.bounds.size.height < 400.0 || w.bounds.size.width < 300.0) continue;
-        if (!best || w.windowLevel > best.windowLevel) best = w;
+static UIWindowScene *RBSceneFor(UIWindow *hint) {
+    UIWindowScene *scene = hint.windowScene;
+    if (scene) return scene;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)s;
     }
-    if (!best) { RBLog(@"pickHost: no full-screen window, stay on bg"); return bg; }
+    return nil;
+}
 
-    RBLog(@"pickHost best=%@ level=%.0f", NSStringFromClass([best class]), best.windowLevel);
-    if (best == bg.window) return bg;   // same surface: keep the simpler mount
-    return best;
+static UIWindow *RBOverlayWindow(UIWindowScene *scene) {
+    if (!scene) return nil;
+    if (rbOverlayWindow && rbOverlayWindow.windowScene == scene) {
+        rbOverlayWindow.hidden = NO;   // unhide: viewWillDisappear hides it
+        return rbOverlayWindow;
+    }
+    if (rbOverlayWindow) {
+        rbOverlayWindow.hidden = YES;
+        rbOverlayWindow = nil;
+    }
+    UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
+    w.frame = scene.coordinateSpace.bounds;
+    // Above reachability (1114) and the alert/recording windows, below the
+    // control-centre style panels. Deliberately NOT 1e11: we do not need to fight
+    // other tweaks, we need a deterministic surface.
+    w.windowLevel = UIWindowLevelAlert + 20;
+    w.backgroundColor = [UIColor clearColor];
+    w.opaque = NO;
+    // Touches must fall through to reachability. A window whose hitTest returns
+    // nil hands the event to the next window down, so dismissal keeps working.
+    w.userInteractionEnabled = NO;
+    w.rootViewController = [[UIViewController alloc] init];
+    w.rootViewController.view.backgroundColor = [UIColor clearColor];
+    w.rootViewController.view.userInteractionEnabled = NO;
+    w.hidden = NO;             // visible without ever becoming key window
+    rbOverlayWindow = w;
+    RBLog(@"overlayWindow created level=%.0f bounds=%@", w.windowLevel, NSStringFromCGRect(w.bounds));
+    return w;
 }
 
 // ---- Private SpringBoard interfaces ----
@@ -218,6 +233,12 @@ static UIView *RBPickHost(UIView *bg) {
         rbContainer = nil;
         rbCardView = nil;
     }
+    // Hide the overlay window too: a full-screen window left visible after
+    // reachability closes is exactly the kind of residue that breaks other UIs.
+    if (rbOverlayWindow) {
+        rbOverlayWindow.hidden = YES;
+        RBLog(@"viewWillDisappear -> overlay window hidden");
+    }
 }
 
 %new
@@ -267,20 +288,22 @@ static UIView *RBPickHost(UIView *bg) {
 
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 
-    // MOUNT CHANGE (0.0.8): pick the highest full-screen visible window instead of
-    // assuming the controller's view is on top. 0.0.7 already produced a perfect
-    // card rect in window coordinates and it still did not show, so the remaining
-    // variable is which surface we are painted on.
-    UIView *host = RBPickHost(bg);
+    // MOUNT CHANGE (0.0.9): own the surface. Mount on a private overlay window
+    // instead of borrowing somebody else's, so level / alpha / z-order are all
+    // under our control. bg stays as the fallback when no scene is available.
+    UIWindowScene *scene = RBSceneFor(win);
+    UIView *host = RBOverlayWindow(scene) ?: bg;
     rbHostView = host;
     BOOL hostIsWindow = [host isKindOfClass:[UIWindow class]];
-    RBLog(@"addRBContainer host=%@ isWindow=%d", NSStringFromClass([host class]), (int)hostIsWindow);
+    RBLog(@"addRBContainer host=%@ isWindow=%d scene=%@",
+          NSStringFromClass([host class]), (int)hostIsWindow, NSStringFromClass([scene class]));
 
     UIView *container = [[UIView alloc] initWithFrame:host.bounds];
     container.translatesAutoresizingMaskIntoConstraints = NO;
     container.backgroundColor = [UIColor clearColor];
     // The overlay must never swallow reachability's own gestures.
     container.userInteractionEnabled = NO;
+    container.layer.zPosition = 10000;   // beats any sibling a window may add later
     [host addSubview:container];
     [host bringSubviewToFront:container];
     [NSLayoutConstraint activateConstraints:@[
