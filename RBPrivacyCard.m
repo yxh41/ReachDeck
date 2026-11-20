@@ -39,14 +39,27 @@
         _rbWantsPin = YES;
         _hideSystemServices = NO;
         _rows = @[];
-        [self buildView];
+        // SAFE MODE FIX (0.0.2): never touch UIKit here. A card can be created
+        // while dyld is still running tweak initializers, before UIApplication is
+        // initialized. UIView / Auto Layout calls at that point throw an
+        // uncaught NSException from UIKitCore and abort SpringBoard. Keep this
+        // object state-only; the UI is built lazily from -rbView, which is only
+        // reached after SBReachabilityBackgroundViewController viewWillAppear.
     }
     return self;
 }
 
 #pragma mark - RBCard
 
-- (UIView *)rbView { return self.view; }
+- (UIView *)rbView {
+    // Lazy UI construction: first real access happens inside addRBContainer,
+    // i.e. on the main thread with UIApplication fully up.
+    if (!self.view) {
+        [self buildView];
+        [self renderRows]; // reflect sensor data ingested before the UI existed
+    }
+    return self.view;
+}
 - (NSInteger)rbPriority { return _rbPriority; }
 - (NSString *)rbIdentifier { return _rbIdentifier; }
 - (BOOL)rbWantsPin { return _rbWantsPin; }
@@ -132,6 +145,10 @@
 }
 
 - (void)renderRows {
+    // Sensor pushes may arrive before the card is ever presented. There is no UI
+    // to update yet; -rbView will render from self.rows on first access.
+    if (!self.rowsStack) return;
+
     for (UIView *v in [self.rowsStack.arrangedSubviews copy]) {
         [self.rowsStack removeArrangedSubview:v];
         [v removeFromSuperview];

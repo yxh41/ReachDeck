@@ -18,7 +18,10 @@
 //  - Avoid every deprecated window-access API; CI compiles with -Werror.
 //  - Sensor data is read passively; we NEVER swallow _handleNewDomainData:
 //    (calling %orig unconditionally) so we cannot break the native privacy dot.
-//  - Card state is external to the view: the view is rebuilt on every appear.
+//  - SAFE MODE FIX (0.0.2): %ctor only reads plain data and installs hooks.
+//    No UIView / UIStackView / UILabel / UIColor / UIFont / Auto Layout object
+//    may be constructed before UIApplication is ready. Cards stay state-only
+//    until the first Reachability presentation builds their UI lazily.
 // ============================================================================
 
 #define RB_NOTIFY "com.zlhkf.ReachDeck.settings"
@@ -36,6 +39,7 @@ static NSArray<id<RBCard>> *rbCards = nil;
 
 // Rebuild the active card list from prefs. Cards are created once and reused; only
 // membership changes. This keeps sensor state intact across preference toggles.
+// NOTE: allocating a card is safe here (state only); its UI is built lazily.
 static void RBRebuildCards(void) {
     NSMutableArray *cards = [NSMutableArray array];
     if (rbCardPrivacy) {
@@ -46,12 +50,13 @@ static void RBRebuildCards(void) {
     rbCards = [cards copy];
 }
 
-static void RBLoadPrefs(void) {
+// Pure data read — safe from a dylib initializer: Foundation file I/O only,
+// no UIKit and no class hooks.
+static void RBReadPrefs(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:RBPlistPath];
     rbEnabled = d[@"enabled"] ? [d[@"enabled"] boolValue] : YES;
     rbCardPrivacy = d[@"cardPrivacy"] ? [d[@"cardPrivacy"] boolValue] : YES;
     rbHideSystemServices = d[@"hideSystemServices"] ? [d[@"hideSystemServices"] boolValue] : NO;
-    RBRebuildCards();
 }
 
 // Darwin callback. The Reachability view only exists while the window is up, so
@@ -59,7 +64,8 @@ static void RBLoadPrefs(void) {
 // We never reach into the live view here — finding the reachability controller from
 // a scene graph is fragile, and the next viewWillAppear already handles remounting.
 static void RBReloadSettings(void) {
-    RBLoadPrefs();
+    RBReadPrefs();
+    RBRebuildCards();
 }
 
 // ---- Private SpringBoard interfaces ----
@@ -102,6 +108,10 @@ static void RBReloadSettings(void) {
 %new
 - (void)addRBContainer {
     if (!rbEnabled) return; // master switch — hooks stay loaded so re-enabling needs no respring
+
+    // First real presentation. UIApplication is fully initialized here, so this
+    // is the earliest safe point to materialize card views.
+    if (!rbCards) RBRebuildCards();
 
     // Reuse the mount point ReachPlayer proved: _topWallpaperEffectView inside the
     // reachability background view. Read the ivar defensively.
@@ -224,7 +234,10 @@ static void RBReloadSettings(void) {
         NSString *proc = [[[NSProcessInfo processInfo] arguments][0] lastPathComponent];
         if (![proc isEqualToString:@"SpringBoard"]) return;
 
-        RBLoadPrefs(); // also builds the active card list from prefs
+        // Data only. RBRebuildCards()/card.rbView are deliberately NOT called here:
+        // constructing UIKit objects during dyld initialization is what caused the
+        // SpringBoard Safe Mode crash in 0.0.1.
+        RBReadPrefs();
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL,
             (CFNotificationCallback)RBReloadSettings, CFSTR(RB_NOTIFY), NULL,
