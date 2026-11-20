@@ -16,7 +16,7 @@
 
 @interface RBPrivacyCard ()
 @property (nonatomic, strong) UIView *view;
-@property (nonatomic, strong) UIStackView *rowsStack;
+@property (nonatomic, strong) UIStackView *contentStack;
 @property (nonatomic, strong) UILabel *emptyLabel;
 @property (nonatomic, strong) NSArray<NSDictionary *> *rows; // {name, bundle, kind}
 @property (nonatomic, assign) BOOL hideSystemServices;
@@ -114,67 +114,72 @@
 #pragma mark - view
 
 - (void)buildView {
-    self.view = [[UIView alloc] initWithFrame:CGRectZero];
-    self.view.translatesAutoresizingMaskIntoConstraints = NO;
+    // VISIBLE CARD (0.0.5): the previous card was a fully transparent view whose
+    // height got stretched to the whole reachability area by the outer stack, so
+    // it read as "nothing there". Give it a real surface and pin its height to
+    // its content (equality, not >=) so the stack cannot stretch it.
+    UIView *root = [[UIView alloc] initWithFrame:CGRectZero];
+    root.translatesAutoresizingMaskIntoConstraints = NO;
+    root.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.42];
+    root.layer.cornerRadius = 16;
+    root.layer.cornerCurve = kCACornerCurveContinuous;
+    root.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
+    root.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.14].CGColor;
+    root.clipsToBounds = YES;
+    // Highest hugging/compression resistance: never grow to fill spare space.
+    [root setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
+    [root setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
+    self.view = root;
 
-    self.rowsStack = [[UIStackView alloc] init];
-    self.rowsStack.axis = UILayoutConstraintAxisVertical;
-    self.rowsStack.spacing = 8;
-    self.rowsStack.alignment = UIStackViewAlignmentFill;
-    self.rowsStack.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:self.rowsStack];
+    self.contentStack = [[UIStackView alloc] init];
+    self.contentStack.axis = UILayoutConstraintAxisVertical;
+    self.contentStack.spacing = 8;
+    self.contentStack.alignment = UIStackViewAlignmentFill;
+    self.contentStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [root addSubview:self.contentStack];
 
-    // INVISIBLE CARD FIX (0.0.3): a plain UIView has no intrinsicContentSize,
-    // so as a UIStackView arrangedSubview its height collapses to 0 and nothing
-    // is ever drawn. Drive the card height from its content plus an explicit
-    // minimum instead of pinning the stack bottom back to the (sizeless) view.
     [NSLayoutConstraint activateConstraints:@[
-        [self.rowsStack.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
-        [self.rowsStack.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
-        [self.rowsStack.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:12],
-        [self.view.heightAnchor constraintGreaterThanOrEqualToAnchor:self.rowsStack.heightAnchor constant:24],
-        [self.view.heightAnchor constraintGreaterThanOrEqualToConstant:80],
+        [self.contentStack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:14],
+        [self.contentStack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-14],
+        [self.contentStack.topAnchor constraintEqualToAnchor:root.topAnchor constant:14],
+        // Equality: card height follows its content exactly (top 14 + content +
+        // bottom 14). A >= here is what let the outer stack stretch it before.
+        [root.heightAnchor constraintEqualToAnchor:self.contentStack.heightAnchor constant:28],
+        [self.contentStack.heightAnchor constraintGreaterThanOrEqualToConstant:52],
     ]];
 
     self.emptyLabel = [[UILabel alloc] init];
     self.emptyLabel.text = @"No app is using the camera or microphone";
-    self.emptyLabel.textColor = [UIColor secondaryLabelColor];
-    self.emptyLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
-    self.emptyLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:self.emptyLabel];
-    [NSLayoutConstraint activateConstraints:@[
-        [self.emptyLabel.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [self.emptyLabel.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
-    ]];
-    self.emptyLabel.hidden = NO;
+    self.emptyLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.88];
+    self.emptyLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    self.emptyLabel.numberOfLines = 0;
+    self.emptyLabel.textAlignment = NSTextAlignmentCenter;
 }
 
 - (void)renderRows {
     // Sensor pushes may arrive before the card is ever presented. There is no UI
     // to update yet; -rbView will render from self.rows on first access.
-    if (!self.rowsStack) return;
+    if (!self.contentStack) return;
 
-    for (UIView *v in [self.rowsStack.arrangedSubviews copy]) {
-        [self.rowsStack removeArrangedSubview:v];
+    for (UIView *v in [self.contentStack.arrangedSubviews copy]) {
+        [self.contentStack removeArrangedSubview:v];
         [v removeFromSuperview];
     }
 
     if (self.rows.count == 0) {
-        self.emptyLabel.hidden = NO;
+        [self.contentStack addArrangedSubview:self.emptyLabel];
         return;
     }
-    self.emptyLabel.hidden = YES;
 
     for (NSDictionary *row in self.rows) {
-        UIView *card = [self rowViewFor:row];
-        [self.rowsStack addArrangedSubview:card];
+        [self.contentStack addArrangedSubview:[self rowViewFor:row]];
     }
 }
 
 - (UIView *)rowViewFor:(NSDictionary *)row {
     UIView *box = [[UIView alloc] init];
     box.translatesAutoresizingMaskIntoConstraints = NO;
-    box.backgroundColor = [[UIColor secondarySystemBackgroundColor] colorWithAlphaComponent:0.7];
+    box.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
     box.layer.cornerRadius = 12;
     box.layer.cornerCurve = kCACornerCurveContinuous;
 
@@ -188,14 +193,16 @@
     UILabel *title = [[UILabel alloc] init];
     title.text = row[@"name"];
     title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-    title.textColor = [row[@"system"] boolValue] ? [UIColor secondaryLabelColor] : [UIColor labelColor];
+    title.textColor = [row[@"system"] boolValue]
+        ? [[UIColor whiteColor] colorWithAlphaComponent:0.6]
+        : [UIColor whiteColor];
     title.translatesAutoresizingMaskIntoConstraints = NO;
     [box addSubview:title];
 
     UILabel *sub = [[UILabel alloc] init];
     sub.text = [NSString stringWithFormat:@"%@ · %@", row[@"kind"], row[@"bundle"]];
     sub.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
-    sub.textColor = [UIColor tertiaryLabelColor];
+    sub.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
     sub.numberOfLines = 1;
     sub.lineBreakMode = NSLineBreakByTruncatingTail;
     sub.translatesAutoresizingMaskIntoConstraints = NO;
