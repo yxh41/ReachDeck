@@ -93,6 +93,7 @@ static UIView *rbCardView = nil;          // top card view, for post-layout diag
 static BOOL rbEnabled = YES;
 static BOOL rbCardPrivacy = YES;
 static BOOL rbHideSystemServices = NO;
+static BOOL rbCardAtBottom = NO;          // 0.1.0: user-chosen position inside the band
 static NSArray<id<RBCard>> *rbCards = nil;
 
 // Rebuild the active card list from prefs. Cards are created once and reused; only
@@ -106,7 +107,7 @@ static void RBRebuildCards(void) {
         [cards addObject:privacyCard];
     }
     rbCards = [cards copy];
-    RBLog(@"rebuild cards privacy=%d hideSys=%d count=%lu", rbCardPrivacy, rbHideSystemServices, (unsigned long)rbCards.count);
+    RBLog(@"rebuild cards privacy=%d hideSys=%d bottom=%d count=%lu", rbCardPrivacy, rbHideSystemServices, rbCardAtBottom, (unsigned long)rbCards.count);
 }
 
 // Pure data read — safe from a dylib initializer: Foundation file I/O only,
@@ -116,6 +117,7 @@ static void RBReadPrefs(void) {
     rbEnabled = d[@"enabled"] ? [d[@"enabled"] boolValue] : YES;
     rbCardPrivacy = d[@"cardPrivacy"] ? [d[@"cardPrivacy"] boolValue] : YES;
     rbHideSystemServices = d[@"hideSystemServices"] ? [d[@"hideSystemServices"] boolValue] : NO;
+    rbCardAtBottom = d[@"cardAtBottom"] ? [d[@"cardAtBottom"] boolValue] : NO;
 }
 
 // Darwin callback. The Reachability view only exists while the window is up, so
@@ -127,15 +129,14 @@ static void RBReloadSettings(void) {
     RBRebuildCards();
 }
 
-// Where the overlay lives. 0.0.8 answered this by enumerating the scene's windows
-// and mounting on the highest-level one — which turned out to be another tweak's
-// private window (level 1e11) that we do not control. A foreign window can re-add
-// its own content above us on any layout pass, and we can neither verify nor fix
-// that. So 0.0.9 owns its surface: one transparent UIWindow at a level just above
-// the reachability window, with interaction disabled end to end. Level, alpha and
-// z-order are then all ours, which makes "invisible while alpha is 1" impossible.
-static UIWindow *rbOverlayWindow = nil;
-
+// Where the overlay lives. Three attempts settled this:
+// 0.0.4/0.0.5 used _topWallpaperEffectView -> it sits at y=-749, off-screen (win=0).
+// 0.0.8 borrowed the highest-level window -> another tweak's private window (1e11).
+// 0.0.9 owned a window at UIWindowLevelAlert+20 -> correct card, but it outlived
+// reachability, because that window has no lifecycle tie to reachability at all.
+// The answer was in the 0.0.8 window dump the whole time: SBReachabilityWindow
+// (level 1114) exists exactly as long as reachability does, and it is the surface
+// reachability itself paints on. Mounting inside it makes show/hide automatic.
 static UIWindowScene *RBSceneFor(UIWindow *hint) {
     UIWindowScene *scene = hint.windowScene;
     if (scene) return scene;
@@ -145,34 +146,13 @@ static UIWindowScene *RBSceneFor(UIWindow *hint) {
     return nil;
 }
 
-static UIWindow *RBOverlayWindow(UIWindowScene *scene) {
+static UIWindow *RBReachabilityWindow(UIWindowScene *scene) {
     if (!scene) return nil;
-    if (rbOverlayWindow && rbOverlayWindow.windowScene == scene) {
-        rbOverlayWindow.hidden = NO;   // unhide: viewWillDisappear hides it
-        return rbOverlayWindow;
+    for (UIWindow *w in scene.windows) {
+        NSString *name = NSStringFromClass([w class]);
+        if ([name isEqualToString:@"SBReachabilityWindow"]) return w;
     }
-    if (rbOverlayWindow) {
-        rbOverlayWindow.hidden = YES;
-        rbOverlayWindow = nil;
-    }
-    UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
-    w.frame = scene.coordinateSpace.bounds;
-    // Above reachability (1114) and the alert/recording windows, below the
-    // control-centre style panels. Deliberately NOT 1e11: we do not need to fight
-    // other tweaks, we need a deterministic surface.
-    w.windowLevel = UIWindowLevelAlert + 20;
-    w.backgroundColor = [UIColor clearColor];
-    w.opaque = NO;
-    // Touches must fall through to reachability. A window whose hitTest returns
-    // nil hands the event to the next window down, so dismissal keeps working.
-    w.userInteractionEnabled = NO;
-    w.rootViewController = [[UIViewController alloc] init];
-    w.rootViewController.view.backgroundColor = [UIColor clearColor];
-    w.rootViewController.view.userInteractionEnabled = NO;
-    w.hidden = NO;             // visible without ever becoming key window
-    rbOverlayWindow = w;
-    RBLog(@"overlayWindow created level=%.0f bounds=%@", w.windowLevel, NSStringFromCGRect(w.bounds));
-    return w;
+    return nil;
 }
 
 // ---- Private SpringBoard interfaces ----
@@ -233,12 +213,6 @@ static UIWindow *RBOverlayWindow(UIWindowScene *scene) {
         rbContainer = nil;
         rbCardView = nil;
     }
-    // Hide the overlay window too: a full-screen window left visible after
-    // reachability closes is exactly the kind of residue that breaks other UIs.
-    if (rbOverlayWindow) {
-        rbOverlayWindow.hidden = YES;
-        RBLog(@"viewWillDisappear -> overlay window hidden");
-    }
 }
 
 %new
@@ -288,15 +262,18 @@ static UIWindow *RBOverlayWindow(UIWindowScene *scene) {
 
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 
-    // MOUNT CHANGE (0.0.9): own the surface. Mount on a private overlay window
-    // instead of borrowing somebody else's, so level / alpha / z-order are all
-    // under our control. bg stays as the fallback when no scene is available.
+    // MOUNT CHANGE (0.1.0): mount inside SBReachabilityWindow — the surface
+    // reachability itself paints on, alive only while reachability is up. The card
+    // therefore appears and disappears with reachability by construction; no
+    // lifecycle hook, no residue over the Home Screen.
     UIWindowScene *scene = RBSceneFor(win);
-    UIView *host = RBOverlayWindow(scene) ?: bg;
+    UIWindow *rWin = RBReachabilityWindow(scene);
+    UIView *host = rWin ?: bg;
     rbHostView = host;
     BOOL hostIsWindow = [host isKindOfClass:[UIWindow class]];
-    RBLog(@"addRBContainer host=%@ isWindow=%d scene=%@",
-          NSStringFromClass([host class]), (int)hostIsWindow, NSStringFromClass([scene class]));
+    RBLog(@"addRBContainer host=%@ isWindow=%d reachWin=%@ scene=%@",
+          NSStringFromClass([host class]), (int)hostIsWindow,
+          NSStringFromClass([rWin class]), NSStringFromClass([scene class]));
 
     UIView *container = [[UIView alloc] initWithFrame:host.bounds];
     container.translatesAutoresizingMaskIntoConstraints = NO;
@@ -320,15 +297,21 @@ static UIWindow *RBOverlayWindow(UIWindowScene *scene) {
     stack.alignment = UIStackViewAlignmentFill;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:stack];
-    // On a bare window there is no controller chrome, so leave room for the status
-    // bar / Dynamic Island; inside the reachability view the original 24pt is right.
-    CGFloat topInset = hostIsWindow ? 60.0 : 24.0;
-    [NSLayoutConstraint activateConstraints:@[
-        [stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16],
-        [stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
-        [stack.topAnchor constraintEqualToAnchor:container.topAnchor constant:topInset],
-        [stack.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-24],
-    ]];
+    // POSITION (0.1.0): the reachability band is not always at the top — the shift
+    // geometry differs per build — so the side is a user preference instead of a
+    // hard-coded guess, and the opposite edge stays a soft limit.
+    CGFloat topInset = hostIsWindow ? 56.0 : 24.0;
+    NSMutableArray *geo = [NSMutableArray array];
+    [geo addObject:[stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16]];
+    [geo addObject:[stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16]];
+    if (rbCardAtBottom) {
+        [geo addObject:[stack.bottomAnchor constraintEqualToAnchor:container.bottomAnchor constant:-48]];
+        [geo addObject:[stack.topAnchor constraintGreaterThanOrEqualToAnchor:container.topAnchor constant:topInset]];
+    } else {
+        [geo addObject:[stack.topAnchor constraintEqualToAnchor:container.topAnchor constant:topInset]];
+        [geo addObject:[stack.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-24]];
+    }
+    [NSLayoutConstraint activateConstraints:geo];
 
     NSArray<id<RBCard>> *sorted = [rbCards sortedArrayUsingComparator:^NSComparisonResult(id<RBCard> a, id<RBCard> b) {
         return [@(a.rbPriority) compare:@(b.rbPriority)];
@@ -346,8 +329,8 @@ static UIWindow *RBOverlayWindow(UIWindowScene *scene) {
     }
 
     rbContainer = container;
-    RBLog(@"addRBContainer mounted host=%@ isWindow=%d bounds=%@ topInset=%.0f",
-          NSStringFromClass([host class]), (int)hostIsWindow, NSStringFromCGRect(host.bounds), topInset);
+    RBLog(@"addRBContainer mounted host=%@ isWindow=%d bounds=%@ topInset=%.0f bottom=%d",
+          NSStringFromClass([host class]), (int)hostIsWindow, NSStringFromCGRect(host.bounds), topInset, (int)rbCardAtBottom);
 
     // POST-LAYOUT PROOF (0.0.7): one runloop later report real on-screen geometry.
     // "container.window != nil" plus a non-empty rect in window coordinates is the
@@ -480,7 +463,7 @@ static UIWindow *RBOverlayWindow(UIWindowScene *scene) {
         // constructing UIKit objects during dyld initialization is what caused the
         // SpringBoard Safe Mode crash in 0.0.1.
         RBReadPrefs();
-        RBLog(@"ctor prefs enabled=%d privacy=%d hideSys=%d", rbEnabled, rbCardPrivacy, rbHideSystemServices);
+        RBLog(@"ctor prefs enabled=%d privacy=%d hideSys=%d bottom=%d", rbEnabled, rbCardPrivacy, rbHideSystemServices, rbCardAtBottom);
         RBLog(@"ctor classes bgVC=%d bgView=%d reachMgr=%d provider=%d",
               (int)(objc_getClass("SBReachabilityBackgroundViewController") != nil),
               (int)(objc_getClass("SBReachabilityBackgroundView") != nil),
