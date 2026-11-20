@@ -133,7 +133,7 @@ static void RBReloadSettings(void) {
     // respring -- and 0.1.0 proved the mount does NOT re-run on later appearances
     // (bg.window is always nil inside viewWillAppear, so the old code bailed).
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!rbHostView) { RBLog(@"reload: no host yet, next appear will mount"); return; }
+        if (!rbWasShifted || !rbHostView) { RBLog(@"reload: not shifted, will apply on next rise"); return; }
         RBLog(@"reload: remount on %@ bottom=%d", NSStringFromClass([rbHostView class]), (int)rbCardAtBottom);
         RBMountInHost(rbHostView);
     });
@@ -164,6 +164,17 @@ static UIView *rbBgView = nil;
 static UIWindow *rbOverlayWindow = nil;
 static dispatch_source_t rbPoll = nil;
 static int rbPollTicks = 0;
+static BOOL rbWasShifted = NO;
+
+static UIWindow *RBFindWindow(NSString *className) {
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)s).windows) {
+            if ([NSStringFromClass([w class]) isEqualToString:className]) return w;
+        }
+    }
+    return nil;
+}
 
 static BOOL RBShiftActive(CGFloat *outOffset) {
     UIView *bg = rbBgView;
@@ -203,14 +214,30 @@ static void RBStartShiftPoll(void) {
     rbPoll = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(rbPoll, DISPATCH_TIME_NOW, (uint64_t)(0.08 * NSEC_PER_SEC), 0);
     dispatch_source_set_event_handler(rbPoll, ^{
-        if (!rbOverlayWindow || !rbContainer) return;
+        if (!rbBgView) return;
         CGFloat off = 0.0;
         BOOL up = RBShiftActive(&off);
-        if (++rbPollTicks % 50 == 0) RBLog(@"shiftPoll heartbeat up=%d offset=%.1f hidden=%d", (int)up, (double)off, (int)rbOverlayWindow.hidden);
-        if (rbOverlayWindow.hidden == up) {
-            rbOverlayWindow.hidden = !up;    // never makeKey
-            RBLog(@"shiftPoll up=%d offset=%.1f windowHidden=%d", (int)up, (double)off, (int)rbOverlayWindow.hidden);
+        if (++rbPollTicks % 50 == 0) RBLog(@"shiftPoll heartbeat up=%d offset=%.1f", (int)up, (double)off);
+        if (up && !rbWasShifted) {
+            // This is the ONLY correct mount moment: the screen has really moved.
+            // 0.0.4-0.1.1 all mounted from viewWillAppear, which fires while the
+            // reachability window is still hidden (grabber y == 0).
+            UIWindow *rWin = RBFindWindow(@"SBReachabilityWindow");
+            UIView *host = nil;
+            if (rWin && !rWin.hidden) {
+                host = rWin;
+                RBLog(@"shiftPoll RISE -> mount inside SBReachabilityWindow offset=%.1f", (double)off);
+            } else {
+                host = RBOverlayWindow(RBSceneFor(rWin.windowScene ?: rbBgView.window));
+                if (host) rbOverlayWindow.hidden = NO;
+                RBLog(@"shiftPoll RISE -> reachability window hidden, use overlay offset=%.1f", (double)off);
+            }
+            if (host) { rbHostView = host; RBMountInHost(host); }
+        } else if (!up && rbWasShifted) {
+            if (rbOverlayWindow) rbOverlayWindow.hidden = YES;
+            RBLog(@"shiftPoll FALL -> hide offset=%.1f", (double)off);
         }
+        rbWasShifted = up;
     });
     dispatch_resume(rbPoll);
     RBLog(@"shiftPoll started");
@@ -314,16 +341,13 @@ static void RBStartShiftPoll(void) {
     // viewWillAppear it never is on this build, and requiring it is what made every
     // later appearance bail out and leave the first layout (and the old position)
     // frozen. SBReachabilityWindow is found straight from the scene instead.
-    UIWindowScene *scene = RBSceneFor(bg.window);
+    // viewWillAppear is a false trigger on this build: it fires many times while
+    // the screen is NOT shifted (grabber y == 0, reachability window hidden).
+    // Arm the shift poll here and mount only when the screen really moves.
     rbBgView = bg;
-    UIWindow *rWin = RBOverlayWindow(scene);
-    UIView *host = rWin ?: (UIView *)(bg.window ?: bg);
     RBStartShiftPoll();
-    RBLog(@"addRBContainer host=%@ isWindow=%d reachWin=%@ scene=%@",
-          NSStringFromClass([host class]), (int)[host isKindOfClass:[UIWindow class]],
-          NSStringFromClass([rWin class]), NSStringFromClass([scene class]));
-    rbHostView = host;
-    RBMountInHost(host);
+    RBLog(@"addRBContainer armed: waiting for real shift (offset currently %.1f)",
+          (double)MSHookIvar<CGFloat>(bg, "_containerViewYOffset"));
 }
 
 // Mount the card stack into an explicit host. Kept as a C function (not a method)
