@@ -87,8 +87,9 @@ static void RBDumpIvars(const char *clsName) {
 #define RBPlistPath ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences"] ? @"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist" : @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist")
 
 static RBPrivacyCard *privacyCard = nil;
-static UIView *rbHostView = nil;          // the _topWallpaperEffectView we mounted into
+static UIView *rbHostView = nil;          // the view we mounted into
 static UIView *rbContainer = nil;         // our container, recreated on each appear
+static UIView *rbCardView = nil;          // top card view, for post-layout diagnostics
 static BOOL rbEnabled = YES;
 static BOOL rbCardPrivacy = YES;
 static BOOL rbHideSystemServices = NO;
@@ -174,6 +175,18 @@ static void RBReloadSettings(void) {
     }
 }
 
+- (void)viewWillDisappear:(BOOL)animated {
+    %orig;
+    // Tear the overlay down with the host. A container left behind on SpringBoard's
+    // window would be a full-screen transparent view pinned over everything.
+    if (rbContainer) {
+        RBLog(@"viewWillDisappear -> remove container");
+        [rbContainer removeFromSuperview];
+        rbContainer = nil;
+        rbCardView = nil;
+    }
+}
+
 %new
 - (void)addRBContainer {
     RBLog(@"addRBContainer enter enabled=%d cards=%lu", rbEnabled, (unsigned long)rbCards.count);
@@ -184,43 +197,45 @@ static void RBReloadSettings(void) {
     if (!rbCards) RBRebuildCards();
     if (rbCards.count == 0) { RBLog(@"addRBContainer bail: no cards"); return; }
 
-    // Mount point: ReachPlayer proved _topWallpaperEffectView works, but on this
-    // build it may be transparent or buried under a sibling, which makes a
-    // correctly-laid-out card invisible. Verify visibility and fall back to the
-    // reachability window (the top-most surface) when it is not visible.
     UIView *bg = self.view;
-    RBLog(@"addRBContainer bg=%@", NSStringFromClass([bg class]));
-    if (![bg isKindOfClass:[UIView class]]) return;
+    if (![bg isKindOfClass:[UIView class]]) { RBLog(@"addRBContainer bail: no bg view"); return; }
 
+    UIWindow *win = bg.window;
     UIView *topEffect = MSHookIvar<UIView *>(bg, "_topWallpaperEffectView");
     UIView *wallContainer = MSHookIvar<UIView *>(bg, "_wallpaperContainerView");
-    UIWindow *win = bg.window;
-    RBLog(@"addRBContainer topEffect=%@ alpha=%.2f hidden=%d win=%@",
-          NSStringFromClass([topEffect class]), topEffect ? topEffect.alpha : -1.0,
-          topEffect ? (int)topEffect.hidden : -1, NSStringFromClass([win class]));
-    RBLog(@"addRBContainer wallContainer=%@", NSStringFromClass([wallContainer class]));
+    RBLog(@"addRBContainer bg=%@ frame=%@ alpha=%.2f hidden=%d super=%@ win=%@",
+          NSStringFromClass([bg class]), NSStringFromCGRect(bg.frame), bg.alpha, (int)bg.hidden,
+          NSStringFromClass([bg.superview class]), NSStringFromClass([win class]));
+    RBLog(@"addRBContainer topEffect=%@ frame=%@ alpha=%.2f hidden=%d win=%d wallContainer=%@",
+          NSStringFromClass([topEffect class]),
+          topEffect ? NSStringFromCGRect(topEffect.frame) : @"(nil)",
+          topEffect ? topEffect.alpha : -1.0,
+          topEffect ? (int)topEffect.hidden : -1,
+          topEffect ? (int)(topEffect.window != nil) : -1,
+          NSStringFromClass([wallContainer class]));
     for (UIView *sub in bg.subviews) {
         RBLog(@"  bgsub %@ alpha=%.2f hidden=%d frame=%@",
               NSStringFromClass([sub class]), sub.alpha, (int)sub.hidden, NSStringFromCGRect(sub.frame));
     }
 
-    UIView *host = topEffect;
-    BOOL hostVisible = (topEffect != nil && !topEffect.hidden && topEffect.alpha > 0.01 && topEffect.window != nil);
-    if (!hostVisible) {
-        RBLog(@"addRBContainer topEffect not visible -> fallback to window/bg");
-        host = (UIView *)win ?: bg;
-    }
-    if (!host) { RBLog(@"addRBContainer bail: no host"); return; }
+    if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
+
+    // MOUNT CHANGE (0.0.7): mount on the controller's own view and force it above
+    // every sibling. 0.0.4/0.0.5 mounted into _topWallpaperEffectView (ReachPlayer's
+    // proven target) and produced a correctly sized 358x80 card that was still not
+    // visible — the classic symptom of host-internal layers drawing over user
+    // subviews. bg + bringSubviewToFront removes that variable entirely.
+    UIView *host = bg;
     rbHostView = host;
     RBLog(@"addRBContainer host=%@", NSStringFromClass([host class]));
 
-    if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
-
     UIView *container = [[UIView alloc] initWithFrame:host.bounds];
     container.translatesAutoresizingMaskIntoConstraints = NO;
+    container.backgroundColor = [UIColor clearColor];
     // The overlay must never swallow reachability's own gestures.
     container.userInteractionEnabled = NO;
     [host addSubview:container];
+    [host bringSubviewToFront:container];
     [NSLayoutConstraint activateConstraints:@[
         [container.leadingAnchor constraintEqualToAnchor:host.leadingAnchor],
         [container.trailingAnchor constraintEqualToAnchor:host.trailingAnchor],
@@ -235,29 +250,69 @@ static void RBReloadSettings(void) {
     stack.alignment = UIStackViewAlignmentFill;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:stack];
-    // When mounted on the window, leave room for the status bar / dynamic island.
-    CGFloat topInset = (host == (UIView *)win) ? 64.0 : 24.0;
     [NSLayoutConstraint activateConstraints:@[
         [stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16],
         [stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
-        [stack.topAnchor constraintEqualToAnchor:container.topAnchor constant:topInset],
+        [stack.topAnchor constraintEqualToAnchor:container.topAnchor constant:24],
         [stack.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-24],
     ]];
 
     NSArray<id<RBCard>> *sorted = [rbCards sortedArrayUsingComparator:^NSComparisonResult(id<RBCard> a, id<RBCard> b) {
         return [@(a.rbPriority) compare:@(b.rbPriority)];
     }];
+    rbCardView = nil;
     for (id<RBCard> card in sorted) {
         if ([card respondsToSelector:@selector(rbRefresh)]) [card rbRefresh];
         UIView *v = card.rbView;
-        RBLog(@"addRBContainer card=%@ view=%@ frame=%@", [card rbIdentifier], NSStringFromClass([v class]), NSStringFromCGRect(v.frame));
+        RBLog(@"addRBContainer card=%@ view=%@ frame=%@",
+              [card rbIdentifier], NSStringFromClass([v class]), NSStringFromCGRect(v.frame));
         if (!v) continue;
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [stack addArrangedSubview:v];
+        if (!rbCardView) rbCardView = v;
     }
 
     rbContainer = container;
-    RBLog(@"addRBContainer mounted host=%@ bounds=%@ topInset=%.0f", NSStringFromClass([host class]), NSStringFromCGRect(host.bounds), topInset);
+    RBLog(@"addRBContainer mounted host=%@ bounds=%@", NSStringFromClass([host class]), NSStringFromCGRect(host.bounds));
+
+    // POST-LAYOUT PROOF (0.0.7): one runloop later report real on-screen geometry.
+    // "container.window != nil" plus a non-empty rect in window coordinates is the
+    // only evidence that the card is actually drawn, so this is logged, not assumed.
+    __weak UIView *wContainer = container;
+    __weak UIView *wBg = bg;
+    __weak UIView *wCard = rbCardView;
+    UIWindow *wWin = win;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIView *c = wContainer, *b = wBg, *cv = wCard;
+        if (!c) { RBLog(@"postMount container gone"); return; }
+        [b bringSubviewToFront:c];
+        RBLog(@"postMount container win=%d frame=%@ inWindow=%@ alpha=%.2f hidden=%d super=%@",
+              (int)(c.window != nil), NSStringFromCGRect(c.frame),
+              NSStringFromCGRect([c convertRect:c.bounds toView:nil]),
+              c.alpha, (int)c.hidden, NSStringFromClass([c.superview class]));
+        if (!c.window && wWin) {
+            RBLog(@"postMount container not in a window -> remount on window %@", NSStringFromClass([wWin class]));
+            [c removeFromSuperview];
+            c.translatesAutoresizingMaskIntoConstraints = NO;
+            [wWin addSubview:c];
+            [wWin bringSubviewToFront:c];
+            [NSLayoutConstraint activateConstraints:@[
+                [c.leadingAnchor constraintEqualToAnchor:wWin.leadingAnchor],
+                [c.trailingAnchor constraintEqualToAnchor:wWin.trailingAnchor],
+                [c.topAnchor constraintEqualToAnchor:wWin.topAnchor],
+                [c.bottomAnchor constraintEqualToAnchor:wWin.bottomAnchor],
+            ]];
+        }
+        if (cv) {
+            UIView *stackView = cv.superview;
+            RBLog(@"postMount card frame=%@ inWindow=%@ alpha=%.2f hidden=%d window=%d",
+                  NSStringFromCGRect(cv.frame),
+                  NSStringFromCGRect([cv convertRect:cv.bounds toView:nil]),
+                  cv.alpha, (int)cv.hidden, (int)(cv.window != nil));
+            RBLog(@"postMount card stack=%@ stackFrame=%@ cardBg=%@",
+                  NSStringFromClass([stackView class]), NSStringFromCGRect(stackView.frame), cv.backgroundColor);
+        }
+    });
 }
 
 %end

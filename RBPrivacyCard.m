@@ -17,6 +17,7 @@
 @interface RBPrivacyCard ()
 @property (nonatomic, strong) UIView *view;
 @property (nonatomic, strong) UIStackView *contentStack;
+@property (nonatomic, strong) UIStackView *rowsStack;
 @property (nonatomic, strong) UILabel *emptyLabel;
 @property (nonatomic, strong) NSArray<NSDictionary *> *rows; // {name, bundle, kind}
 @property (nonatomic, assign) BOOL hideSystemServices;
@@ -118,13 +119,16 @@
     // height got stretched to the whole reachability area by the outer stack, so
     // it read as "nothing there". Give it a real surface and pin its height to
     // its content (equality, not >=) so the stack cannot stretch it.
+    // 0.0.7: raise contrast (a 0.42 black card on a dark blurred wallpaper is
+    // indistinguishable from nothing) and add an always-present title so the card
+    // is recognizable even before any sensor attribution arrives.
     UIView *root = [[UIView alloc] initWithFrame:CGRectZero];
     root.translatesAutoresizingMaskIntoConstraints = NO;
-    root.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.42];
+    root.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
     root.layer.cornerRadius = 16;
     root.layer.cornerCurve = kCACornerCurveContinuous;
     root.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
-    root.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.24].CGColor;
+    root.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.45].CGColor;
     root.clipsToBounds = YES;
     // Highest hugging/compression resistance: never grow to fill spare space.
     [root setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
@@ -148,31 +152,46 @@
         [self.contentStack.heightAnchor constraintGreaterThanOrEqualToConstant:52],
     ]];
 
+    UILabel *header = [[UILabel alloc] init];
+    header.text = @"PRIVACY";
+    header.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
+    header.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    [self.contentStack addArrangedSubview:header];
+
+    // Rows live in their own stack so renderRows() can clear/repopulate without
+    // ever removing the permanent header (a detached arranged subview cannot be
+    // re-added, which silently dropped the header in an earlier draft).
+    self.rowsStack = [[UIStackView alloc] init];
+    self.rowsStack.axis = UILayoutConstraintAxisVertical;
+    self.rowsStack.spacing = 8;
+    self.rowsStack.alignment = UIStackViewAlignmentFill;
+    [self.contentStack addArrangedSubview:self.rowsStack];
+
     self.emptyLabel = [[UILabel alloc] init];
     self.emptyLabel.text = @"No app is using the camera or microphone";
-    self.emptyLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.88];
+    self.emptyLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.92];
     self.emptyLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
     self.emptyLabel.numberOfLines = 0;
-    self.emptyLabel.textAlignment = NSTextAlignmentCenter;
+    self.emptyLabel.textAlignment = NSTextAlignmentLeft;
 }
 
 - (void)renderRows {
     // Sensor pushes may arrive before the card is ever presented. There is no UI
     // to update yet; -rbView will render from self.rows on first access.
-    if (!self.contentStack) return;
+    if (!self.rowsStack) return;
 
-    for (UIView *v in [self.contentStack.arrangedSubviews copy]) {
-        [self.contentStack removeArrangedSubview:v];
+    for (UIView *v in [self.rowsStack.arrangedSubviews copy]) {
+        [self.rowsStack removeArrangedSubview:v];
         [v removeFromSuperview];
     }
 
     if (self.rows.count == 0) {
-        [self.contentStack addArrangedSubview:self.emptyLabel];
+        [self.rowsStack addArrangedSubview:self.emptyLabel];
         return;
     }
 
     for (NSDictionary *row in self.rows) {
-        [self.contentStack addArrangedSubview:[self rowViewFor:row]];
+        [self.rowsStack addArrangedSubview:[self rowViewFor:row]];
     }
 }
 
