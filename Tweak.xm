@@ -148,15 +148,6 @@ static void RBReloadSettings(void) {
 // The answer was in the 0.0.8 window dump the whole time: SBReachabilityWindow
 // (level 1114) exists exactly as long as reachability does, and it is the surface
 // reachability itself paints on. Mounting inside it makes show/hide automatic.
-static UIWindowScene *RBSceneFor(UIWindow *hint) {
-    UIWindowScene *scene = hint.windowScene;
-    if (scene) return scene;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if ([s isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)s;
-    }
-    return nil;
-}
-
 // ---- Private SpringBoard interfaces ----
 @interface SBReachabilityManager : NSObject
 + (id)sharedInstance;
