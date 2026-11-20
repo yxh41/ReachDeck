@@ -25,10 +25,11 @@ jobs:
 
     - name: Install Theos dependencies
       run: |
-        brew install ldid xz
+        brew install ldid xz dpkg
         echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
         command -v ldid
         command -v xz
+        command -v dpkg-deb
 
     - name: Checkout
       uses: actions/checkout@v4
