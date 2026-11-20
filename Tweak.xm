@@ -94,6 +94,7 @@ static BOOL rbEnabled = YES;
 static BOOL rbCardPrivacy = YES;
 static BOOL rbHideSystemServices = NO;
 static BOOL rbCardAtBottom = NO;          // 0.1.0: user-chosen position inside the band
+static BOOL rbWasShifted = NO;            // 0.1.3: true only while the screen is really down
 static NSArray<id<RBCard>> *rbCards = nil;
 
 // Rebuild the active card list from prefs. Cards are created once and reused; only
@@ -164,7 +165,6 @@ static UIView *rbBgView = nil;
 static UIWindow *rbOverlayWindow = nil;
 static dispatch_source_t rbPoll = nil;
 static int rbPollTicks = 0;
-static BOOL rbWasShifted = NO;
 
 static UIWindow *RBFindWindow(NSString *className) {
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -179,7 +179,8 @@ static UIWindow *RBFindWindow(NSString *className) {
 static BOOL RBShiftActive(CGFloat *outOffset) {
     UIView *bg = rbBgView;
     if (!bg) return NO;
-    CGFloat off = MSHookIvar<CGFloat>(bg, "_containerViewYOffset");
+    Ivar offIvar = class_getInstanceVariable([bg class], "_containerViewYOffset");
+    CGFloat off = offIvar ? *(CGFloat *)((char *)(__bridge void *)bg + ivar_getOffset(offIvar)) : 0.0;
     CGFloat grabberY = 0.0;
     Class grabberClass = NSClassFromString(@"SBHomeGrabberView");
     for (UIView *v in bg.subviews) {
@@ -228,7 +229,7 @@ static void RBStartShiftPoll(void) {
                 host = rWin;
                 RBLog(@"shiftPoll RISE -> mount inside SBReachabilityWindow offset=%.1f", (double)off);
             } else {
-                host = RBOverlayWindow(RBSceneFor(rWin.windowScene ?: rbBgView.window));
+                host = RBOverlayWindow(RBSceneFor(rbBgView.window));
                 if (host) rbOverlayWindow.hidden = NO;
                 RBLog(@"shiftPoll RISE -> reachability window hidden, use overlay offset=%.1f", (double)off);
             }
