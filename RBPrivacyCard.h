@@ -8,7 +8,16 @@
 // Shared ReachDeck diagnostic logger: writes both syslog and the debug.log
 // plist-dir file, so card-side parsing evidence is visible in the same log the
 // tweak side writes. Implemented in Tweak.xm.
+//
+// Tweak.xm is compiled as Objective-C++ (clang++) while RBPrivacyCard.m is
+// plain Objective-C (clang), so this symbol MUST have C linkage on both sides.
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern void RBLog(NSString * _Nonnull fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+#ifdef __cplusplus
+}
+#endif
 
 @interface RBPrivacyCard : NSObject <RBCard>
 
