@@ -27,8 +27,9 @@
 
 @synthesize rbPriority = _rbPriority;
 @synthesize rbIdentifier = _rbIdentifier;
-@synthesize rbView = _rbView;
 @synthesize rbWantsPin = _rbWantsPin;
+// rbView is backed by `self.view` via the custom getter below; synthesizing an
+// ivar here triggers -Werror,-Wunused-property-ivar under -Wall.
 
 - (instancetype)init {
     self = [super init];
