@@ -1,11 +1,14 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <stdarg.h>
+#import <stdlib.h>
+#import <string.h>
 #import "RBCardProtocol.h"
 #import "RBPrivacyCard.h"
 
-// Diagnostic log (0.0.3): ASCII-only strings so they survive toolchain string
+// Diagnostic log (0.0.3+): ASCII-only strings so they survive toolchain string
 // handling; mirrored to syslog and a plist-dir file the user can send us.
+// Foundation-only — never reaches UIKit, so it stays safe inside %ctor.
 static NSString *RBLogPath(void) {
     NSString *a = @"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.debug.log";
     NSString *b = @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.debug.log";
@@ -23,6 +26,36 @@ static void RBLog(NSString *fmt, ...) {
 }
 static void RBLogReset(void) {
     [@"" writeToFile:RBLogPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+// Self-evidence helpers: dump real class names containing "Reachability" and a
+// class's ivar list. Called only from %ctor; no behavior change.
+static void RBDumpReachabilityClasses(void) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)n);
+    if (!classes) return;
+    n = objc_getClassList(classes, n);
+    NSMutableString *hits = [NSMutableString string];
+    for (int i = 0; i < n; i++) {
+        const char *nm = class_getName(classes[i]);
+        if (nm && strstr(nm, "Reachability")) [hits appendFormat:@"%s ", nm];
+    }
+    free(classes);
+    RBLog(@"reachability classes: %@", hits);
+}
+static void RBDumpIvars(const char *clsName) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) { RBLog(@"ivars %s: CLASS MISSING", clsName); return; }
+    unsigned int count = 0;
+    Ivar *ivars = class_copyIvarList(cls, &count);
+    NSMutableString *s = [NSMutableString string];
+    for (unsigned int i = 0; i < count; i++) {
+        const char *nm = ivar_getName(ivars[i]);
+        if (nm) [s appendFormat:@"%s ", nm];
+    }
+    free(ivars);
+    RBLog(@"ivars %s: %@", clsName, s);
 }
 
 // ============================================================================
@@ -48,8 +81,10 @@ static void RBLogReset(void) {
 
 #define RB_NOTIFY "com.zlhkf.ReachDeck.settings"
 
-// Keep byte-for-byte identical to the prefs side. roothide/rootless fall back to /var/jb.
-#define RBPlistPath ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist"] ? @"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist" : @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist")
+// Check the DIRECTORY, not the file: on a fresh install the plist does not exist
+// yet, and probing the file would wrongly fall through to /var/jb (which is not
+// the roothide jbroot and does not exist), silently losing every setting write.
+#define RBPlistPath ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences"] ? @"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist" : @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist")
 
 static RBPrivacyCard *privacyCard = nil;
 static UIView *rbHostView = nil;          // the _topWallpaperEffectView we mounted into
@@ -129,6 +164,16 @@ static void RBReloadSettings(void) {
     [self addRBContainer];
 }
 
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    // Secondary trigger: never rely on a single presentation callback. If the
+    // container is still absent here, mount now. Idempotent by construction.
+    if (!rbContainer) {
+        RBLog(@"viewDidAppear fired, mounting (no container yet)");
+        [self addRBContainer];
+    }
+}
+
 %new
 - (void)addRBContainer {
     RBLog(@"addRBContainer enter enabled=%d cards=%lu", rbEnabled, (unsigned long)rbCards.count);
@@ -146,8 +191,13 @@ static void RBReloadSettings(void) {
     if (![bg isKindOfClass:[UIView class]]) return;
 
     UIView *topEffect = MSHookIvar<UIView *>(bg, "_topWallpaperEffectView");
-    RBLog(@"addRBContainer topEffect=%@", NSStringFromClass([topEffect class]));
-    if (!topEffect) { RBLog(@"addRBContainer bail: topEffect nil"); return; }
+    RBLog(@"addRBContainer topEffect=%@ bg.subviews=%lu", NSStringFromClass([topEffect class]), (unsigned long)bg.subviews.count);
+    if (!topEffect) {
+        // Fallback: if the ivar is gone on this build, mount on the reachability
+        // background view itself rather than silently doing nothing.
+        RBLog(@"addRBContainer fallback: mount on bg");
+        topEffect = bg;
+    }
     rbHostView = topEffect;
 
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
@@ -189,7 +239,7 @@ static void RBReloadSettings(void) {
     }
 
     rbContainer = container;
-    RBLog(@"addRBContainer mounted topEffect.frame=%@", NSStringFromCGRect(topEffect.bounds));
+    RBLog(@"addRBContainer mounted host=%@ bounds=%@", NSStringFromClass([topEffect class]), NSStringFromCGRect(topEffect.bounds));
 }
 
 %end
@@ -272,14 +322,19 @@ static void RBReloadSettings(void) {
         // SpringBoard Safe Mode crash in 0.0.1.
         RBReadPrefs();
         RBLog(@"ctor prefs enabled=%d privacy=%d hideSys=%d", rbEnabled, rbCardPrivacy, rbHideSystemServices);
-        RBLog(@"ctor classes bgVC=%d reachMgr=%d provider=%d",
+        RBLog(@"ctor classes bgVC=%d bgView=%d reachMgr=%d provider=%d",
               (int)(objc_getClass("SBReachabilityBackgroundViewController") != nil),
+              (int)(objc_getClass("SBReachabilityBackgroundView") != nil),
               (int)(objc_getClass("SBReachabilityManager") != nil),
               (int)(objc_getClass("SBSensorActivityDataProvider") != nil));
+        RBDumpReachabilityClasses();
+        RBDumpIvars("SBReachabilityBackgroundView");
+
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(), NULL,
             (CFNotificationCallback)RBReloadSettings, CFSTR(RB_NOTIFY), NULL,
             CFNotificationSuspensionBehaviorCoalesce);
+        RBLog(@"ctor observer registered notify=%s", RB_NOTIFY);
 
         // Guard every private-class group independently. A class absent on this iOS
         // build must install nothing, never fail at load time.
@@ -293,10 +348,12 @@ static void RBReloadSettings(void) {
             objc_getClass("SBApplication") ||
             objc_getClass("SBAppSwitcherController") ||
             objc_getClass("SBIconController") ||
-            objc_getClass("SpringBoard")) %init(RBReachability);
+            objc_getClass("SpringBoard")) { %init(RBReachability); RBLog(@"ctor init RBReachability OK"); }
 
         // The privacy provider is the one class measured present on iOS 16.4.1.
         // Guard it too so a hypothetical future rename is inert rather than fatal.
-        if (objc_getClass("SBSensorActivityDataProvider")) %init(RBSensor);
+        if (objc_getClass("SBSensorActivityDataProvider")) { %init(RBSensor); RBLog(@"ctor init RBSensor OK"); }
+
+        RBLog(@"ctor done");
     }
 }

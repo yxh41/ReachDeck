@@ -2,9 +2,11 @@
 
 #define RD_NOTIFY "com.zlhkf.ReachDeck.settings"
 
-// rootful / rootless / roothide: prefer the path that actually exists, exactly as
-// the tweak side does. Keep the two files byte-for-byte identical in logic.
-#define RDPlistPath ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist"] ? @"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist" : @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist")
+// rootful / rootless / roothide: probe the DIRECTORY, not the file. On a fresh
+// install the plist does not exist yet; probing the file would fall through to
+// /var/jb (not the roothide jbroot, so it does not exist) and every write would
+// be silently lost. Keep the two files byte-for-byte identical in logic.
+#define RDPlistPath ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences"] ? @"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist" : @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist")
 
 @implementation RDBaseListController
 
