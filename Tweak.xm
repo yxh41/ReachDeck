@@ -14,7 +14,7 @@ static NSString *RBLogPath(void) {
     NSString *b = @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.debug.log";
     return [[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences"] ? a : b;
 }
-void RBLog(NSString *fmt, ...) {
+void RBLog(NSString * _Nonnull fmt, ...) {
     va_list args; va_start(args, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
     va_end(args);
