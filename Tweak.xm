@@ -87,15 +87,12 @@ static void RBDumpIvars(const char *clsName) {
 #define RBPlistPath ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences"] ? @"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist" : @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist")
 
 static RBPrivacyCard *privacyCard = nil;
-static UIView *rbHostView = nil;          // the view we mounted into
-static UIView *rbContainer = nil;         // our container, recreated on each appear
-static UIView *rbCardView = nil;          // top card view, for post-layout diagnostics
 static BOOL rbEnabled = YES;
 static BOOL rbCardPrivacy = YES;
 static BOOL rbHideSystemServices = NO;
 static BOOL rbCardAtBottom = NO;          // 0.1.0: user-chosen position inside the band
-static BOOL rbWasShifted = NO;            // 0.1.3: true only while the screen is really down
 static NSArray<id<RBCard>> *rbCards = nil;
+static UIView *rbContainer = nil;        // container mounted inside _topWallpaperEffectView
 
 // Rebuild the active card list from prefs. Cards are created once and reused; only
 // membership changes. This keeps sensor state intact across preference toggles.
@@ -125,18 +122,21 @@ static void RBReadPrefs(void) {
 // "immediate" means: next present builds from the new config. No respring needed.
 // We never reach into the live view here — finding the reachability controller from
 // a scene graph is fragile, and the next viewWillAppear already handles remounting.
-static void RBMountInHost(UIView *host);   // fwd: settings changes must re-lay out in place
+
+static UIView *rbTopEffect = nil;
+static id rbLiveController = nil;
 
 static void RBReloadSettings(void) {
     RBReadPrefs();
     RBRebuildCards();
-    // A preference change must be visible on the next reachability, not the next
-    // respring -- and 0.1.0 proved the mount does NOT re-run on later appearances
-    // (bg.window is always nil inside viewWillAppear, so the old code bailed).
+    // Rebuild in place while reachability is up; otherwise the next appear does it.
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!rbWasShifted || !rbHostView) { RBLog(@"reload: not shifted, will apply on next rise"); return; }
-        RBLog(@"reload: remount on %@ bottom=%d", NSStringFromClass([rbHostView class]), (int)rbCardAtBottom);
-        RBMountInHost(rbHostView);
+        if (rbLiveController && rbTopEffect) {
+            RBLog(@"reload: remount on %@ bottom=%d", NSStringFromClass([rbTopEffect class]), (int)rbCardAtBottom);
+            [rbLiveController performSelector:@selector(addRBContainer)];
+        } else {
+            RBLog(@"reload: no active reachability, apply on next appear");
+        }
     });
 }
 
@@ -157,84 +157,11 @@ static UIWindowScene *RBSceneFor(UIWindow *hint) {
     return nil;
 }
 
-// 0.1.2: the reachability window's hidden flag is NOT a usable signal -- it is
-// hidden on most of the repeated viewWillAppear callbacks. The reliable signal is
-// the screen shift itself: _containerViewYOffset (and SBHomeGrabberView.origin.y)
-// goes to about -337pt while reachability is up and 0 when it is down.
-static UIView *rbBgView = nil;
-static UIWindow *rbOverlayWindow = nil;
-static dispatch_source_t rbPoll = nil;
-static int rbPollTicks = 0;
-
-
-static BOOL RBShiftActive(CGFloat *outOffset) {
-    UIView *bg = rbBgView;
-    if (!bg) return NO;
-    // _containerViewYOffset is a TRANSIENT animation value: 0.1.3b logged
-    // 337.7 on the rise and 0.0 eighty milliseconds later, which produced a
-    // false FALL. SBHomeGrabberView.frame.origin.y is stable: -337.67 while
-    // reachability is up, 0 when it is down. Use that as the sole signal.
-    CGFloat grabberY = 0.0;
-    Class grabberClass = NSClassFromString(@"SBHomeGrabberView");
-    for (UIView *v in bg.subviews) {
-        if (grabberClass && [v isKindOfClass:grabberClass]) { grabberY = v.frame.origin.y; break; }
-    }
-    if (outOffset) *outOffset = grabberY;
-    return grabberY < -40.0;
-}
-
-static UIWindow *RBOverlayWindow(UIWindowScene *scene) {
-    if (!scene) return nil;
-    if (rbOverlayWindow && rbOverlayWindow.windowScene == scene) return rbOverlayWindow;
-    if (rbOverlayWindow) { rbOverlayWindow.hidden = YES; rbOverlayWindow = nil; }
-    UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
-    w.frame = scene.coordinateSpace.bounds;
-    w.windowLevel = UIWindowLevelAlert + 20;
-    w.backgroundColor = [UIColor clearColor];
-    w.opaque = NO;
-    // Touches fall through to reachability, so dismissing still works.
-    w.userInteractionEnabled = NO;
-    w.rootViewController = [[UIViewController alloc] init];
-    w.rootViewController.view.backgroundColor = [UIColor clearColor];
-    w.rootViewController.view.userInteractionEnabled = NO;
-    w.hidden = YES;   // shown only while the screen is actually shifted
-    rbOverlayWindow = w;
-    RBLog(@"overlayWindow created level=%.0f bounds=%@", w.windowLevel, NSStringFromCGRect(w.bounds));
-    return w;
-}
-
-static void RBStartShiftPoll(void) {
-    if (rbPoll) return;
-    rbPoll = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(rbPoll, DISPATCH_TIME_NOW, (uint64_t)(0.08 * NSEC_PER_SEC), 0);
-    dispatch_source_set_event_handler(rbPoll, ^{
-        if (!rbBgView) return;
-        CGFloat grabberY = 0.0;
-        BOOL up = RBShiftActive(&grabberY);
-        if (++rbPollTicks % 25 == 0) RBLog(@"reachPoll up=%d grabberY=%.1f", (int)up, (double)grabberY);
-        if (up && !rbWasShifted) {
-            // Our own window is the only surface whose level and z-order we
-            // control; SBReachabilityWindow was hidden on some of these edges.
-            UIWindow *host = RBOverlayWindow(RBSceneFor(rbBgView.window));
-            if (!host) { RBLog(@"reachPoll RISE but no window scene"); return; }
-            rbHostView = host;
-            RBMountInHost(host);
-            rbOverlayWindow.hidden = NO;   // never makeKey
-            RBLog(@"reachPoll RISE -> mounted, grabberY=%.1f windowHidden=%d", (double)grabberY, (int)rbOverlayWindow.hidden);
-        } else if (!up && rbWasShifted) {
-            if (rbOverlayWindow) rbOverlayWindow.hidden = YES;
-            RBLog(@"reachPoll FALL -> hidden, grabberY=%.1f", (double)grabberY);
-        }
-        rbWasShifted = up;
-    });
-    dispatch_resume(rbPoll);
-    RBLog(@"reachPoll started (stable signal: SBHomeGrabberView.y)");
-}
-
 // ---- Private SpringBoard interfaces ----
 @interface SBReachabilityManager : NSObject
 + (id)sharedInstance;
 - (void)toggleReachability;
+- (void)_notifyObserversReachabilityYOffsetDidChange;
 @end
 
 @interface SBReachabilitySettings : NSObject
@@ -249,8 +176,7 @@ static void RBStartShiftPoll(void) {
 - (void)addRBContainer;
 @end
 
-// SBSensorActivityDataProvider — present on iOS 16.4.1. We only *read* it.
-// Declared with the exact selectors we call; no ivar access (Logos forward-decl rule).
+// SBSensorActivityDataProvider — read-only, exact selectors we call.
 @interface SBSensorActivityDataProvider : NSObject
 - (NSSet *)activeCameraAndMicrophoneActivityAttributions;
 - (NSSet *)activeAndRecentSensorActivityAttributions;
@@ -266,186 +192,103 @@ static void RBStartShiftPoll(void) {
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     RBLog(@"viewWillAppear fired");
+    rbLiveController = self;
+    // THE missing step in 0.0.4-0.1.4, copied verbatim from ReachPlayer 2.6:
+    // without this notification _topWallpaperEffectView stays at y == -749
+    // (off-screen), so a correctly laid out card inside it is never visible.
+    SBReachabilityManager *mgr = [%c(SBReachabilityManager) sharedInstance];
+    if ([mgr respondsToSelector:@selector(_notifyObserversReachabilityYOffsetDidChange)]) {
+        [mgr _notifyObserversReachabilityYOffsetDidChange];
+        RBLog(@"viewWillAppear notified Y offset change");
+    } else {
+        RBLog(@"viewWillAppear manager lacks _notifyObserversReachabilityYOffsetDidChange");
+    }
     [self addRBContainer];
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    // Secondary trigger: never rely on a single presentation callback. If the
-    // container is still absent here, mount now. Idempotent by construction.
-    if (!rbContainer) {
-        RBLog(@"viewDidAppear fired, mounting (no container yet)");
-        [self addRBContainer];
-    }
+    if (!rbContainer) { RBLog(@"viewDidAppear: remount"); [self addRBContainer]; }
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     %orig;
-    // Tear the overlay down with the host. A container left behind on SpringBoard's
-    // window would be a full-screen transparent view pinned over everything.
-    if (rbContainer) {
-        RBLog(@"viewWillDisappear -> remove container");
-        [rbContainer removeFromSuperview];
-        rbContainer = nil;
-        rbCardView = nil;
-    }
-    if (rbOverlayWindow) {
-        rbOverlayWindow.hidden = YES;
-        RBLog(@"viewWillDisappear -> overlay hidden");
-    }
+    rbLiveController = nil;
+    rbTopEffect = nil;
+    if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 }
 
 %new
 - (void)addRBContainer {
     RBLog(@"addRBContainer enter enabled=%d cards=%lu", rbEnabled, (unsigned long)rbCards.count);
-    if (!rbEnabled) { RBLog(@"addRBContainer bail: disabled"); return; } // master switch — hooks stay loaded so re-enabling needs no respring
-
-    // First real presentation. UIApplication is fully initialized here, so this
-    // is the earliest safe point to materialize card views.
+    if (!rbEnabled) { RBLog(@"addRBContainer bail: disabled"); return; }
     if (!rbCards) RBRebuildCards();
     if (rbCards.count == 0) { RBLog(@"addRBContainer bail: no cards"); return; }
 
     UIView *bg = self.view;
-    if (![bg isKindOfClass:[UIView class]]) { RBLog(@"addRBContainer bail: no bg view"); return; }
+    if (![bg isKindOfClass:[UIView class]]) { RBLog(@"addRBContainer bail: no bg"); return; }
 
+    // Exact mount point from ReachPlayer 2.6: _topWallpaperEffectView. It is the
+    // surface that fills the exposed band; bg / windows / self-made windows are not.
     UIView *topEffect = MSHookIvar<UIView *>(bg, "_topWallpaperEffectView");
-    UIView *wallContainer = MSHookIvar<UIView *>(bg, "_wallpaperContainerView");
-    RBLog(@"addRBContainer bg=%@ frame=%@ alpha=%.2f hidden=%d super=%@ win=%@",
-          NSStringFromClass([bg class]), NSStringFromCGRect(bg.frame), bg.alpha, (int)bg.hidden,
-          NSStringFromClass([bg.superview class]), NSStringFromClass([bg.window class]));
-    RBLog(@"addRBContainer topEffect=%@ frame=%@ alpha=%.2f hidden=%d win=%d wallContainer=%@",
+    RBLog(@"addRBContainer topEffect=%@ frame=%@ bounds=%@ win=%d",
           NSStringFromClass([topEffect class]),
           topEffect ? NSStringFromCGRect(topEffect.frame) : @"(nil)",
-          topEffect ? topEffect.alpha : -1.0,
-          topEffect ? (int)topEffect.hidden : -1,
-          topEffect ? (int)(topEffect.window != nil) : -1,
-          NSStringFromClass([wallContainer class]));
-    for (UIView *sub in bg.subviews) {
-        RBLog(@"  bgsub %@ alpha=%.2f hidden=%d frame=%@",
-              NSStringFromClass([sub class]), sub.alpha, (int)sub.hidden, NSStringFromCGRect(sub.frame));
-    }
+          topEffect ? NSStringFromCGRect(topEffect.bounds) : @"(nil)",
+          (int)(topEffect.window != nil));
+    if (!topEffect) { RBLog(@"addRBContainer bail: no topEffect"); return; }
+    rbTopEffect = topEffect;
 
-    // Host lookup does NOT depend on bg being attached to its window: inside
-    // viewWillAppear it never is on this build, and requiring it is what made every
-    // later appearance bail out and leave the first layout (and the old position)
-    // frozen. SBReachabilityWindow is found straight from the scene instead.
-    // viewWillAppear is a false trigger on this build: it fires many times while
-    // the screen is NOT shifted (grabber y == 0, reachability window hidden).
-    // Arm the shift poll here and mount only when the screen really moves.
-    rbBgView = bg;
-    RBStartShiftPoll();
-    RBLog(@"addRBContainer armed: waiting for real shift (offset currently %.1f)",
-          (double)MSHookIvar<CGFloat>(bg, "_containerViewYOffset"));
-}
-
-// Mount the card stack into an explicit host. Kept as a C function (not a method)
-// because two callers need it: the appearance hook and the settings listener.
-static void RBMountInHost(UIView *host) {
-    if (!host) { RBLog(@"mount bail: nil host"); return; }
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 
-    BOOL hostIsWindow = [host isKindOfClass:[UIWindow class]];
-    UIView *container = [[UIView alloc] initWithFrame:host.bounds];
-    container.translatesAutoresizingMaskIntoConstraints = NO;
+    // ReachPlayer: frame = host.bounds + four equal edge constraints.
+    UIView *container = [[UIView alloc] initWithFrame:topEffect.bounds];
     container.backgroundColor = [UIColor clearColor];
-    // The overlay must never swallow reachability's own gestures.
-    container.userInteractionEnabled = NO;
-    container.layer.zPosition = 10000;   // beats any sibling a window may add later
-    [host addSubview:container];
-    [host bringSubviewToFront:container];
+    container.userInteractionEnabled = NO;   // never swallow reachability gestures
+    [topEffect addSubview:container];
+    container.translatesAutoresizingMaskIntoConstraints = NO;
     [NSLayoutConstraint activateConstraints:@[
-        [container.leadingAnchor constraintEqualToAnchor:host.leadingAnchor],
-        [container.trailingAnchor constraintEqualToAnchor:host.trailingAnchor],
-        [container.topAnchor constraintEqualToAnchor:host.topAnchor],
-        [container.bottomAnchor constraintEqualToAnchor:host.bottomAnchor],
+        [container.topAnchor constraintEqualToAnchor:topEffect.topAnchor],
+        [container.bottomAnchor constraintEqualToAnchor:topEffect.bottomAnchor],
+        [container.leadingAnchor constraintEqualToAnchor:topEffect.leadingAnchor],
+        [container.trailingAnchor constraintEqualToAnchor:topEffect.trailingAnchor],
     ]];
 
-    // Stack the enabled cards vertically; each card owns its internal layout.
+    // Content is centred like ReachPlayer (centerX/centerY), not pinned to an edge
+    // of a view the system keeps moving around.
     UIStackView *stack = [[UIStackView alloc] init];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
     stack.alignment = UIStackViewAlignmentFill;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:stack];
-    // POSITION (0.1.0): the reachability band is not always at the top — the shift
-    // geometry differs per build — so the side is a user preference instead of a
-    // hard-coded guess, and the opposite edge stays a soft limit.
-    CGFloat topInset = hostIsWindow ? 150.0 : 24.0;   // exposed band is ~337pt; 150 puts the 80pt card in its middle
-    NSMutableArray *geo = [NSMutableArray array];
-    [geo addObject:[stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16]];
-    [geo addObject:[stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16]];
-    if (rbCardAtBottom) {
-        [geo addObject:[stack.bottomAnchor constraintEqualToAnchor:container.bottomAnchor constant:-48]];
-        [geo addObject:[stack.topAnchor constraintGreaterThanOrEqualToAnchor:container.topAnchor constant:topInset]];
-    } else {
-        [geo addObject:[stack.topAnchor constraintEqualToAnchor:container.topAnchor constant:topInset]];
-        [geo addObject:[stack.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-24]];
-    }
-    [NSLayoutConstraint activateConstraints:geo];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.centerXAnchor constraintEqualToAnchor:container.centerXAnchor],
+        [stack.centerYAnchor constraintEqualToAnchor:container.centerYAnchor constant:(rbCardAtBottom ? 140.0 : -110.0)],
+        [stack.widthAnchor constraintEqualToAnchor:container.widthAnchor constant:-32],
+    ]];
 
     NSArray<id<RBCard>> *sorted = [rbCards sortedArrayUsingComparator:^NSComparisonResult(id<RBCard> a, id<RBCard> b) {
         return [@(a.rbPriority) compare:@(b.rbPriority)];
     }];
-    rbCardView = nil;
     for (id<RBCard> card in sorted) {
         if ([card respondsToSelector:@selector(rbRefresh)]) [card rbRefresh];
         UIView *v = card.rbView;
-        RBLog(@"addRBContainer card=%@ view=%@ frame=%@",
-              [card rbIdentifier], NSStringFromClass([v class]), NSStringFromCGRect(v.frame));
         if (!v) continue;
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [stack addArrangedSubview:v];
-        if (!rbCardView) rbCardView = v;
+        RBLog(@"addRBContainer card=%@ frame=%@", [card rbIdentifier], NSStringFromCGRect(v.frame));
     }
 
     rbContainer = container;
-    RBLog(@"addRBContainer mounted host=%@ isWindow=%d bounds=%@ topInset=%.0f bottom=%d",
-          NSStringFromClass([host class]), (int)hostIsWindow, NSStringFromCGRect(host.bounds), topInset, (int)rbCardAtBottom);
-
-    // POST-LAYOUT PROOF (0.0.7): one runloop later report real on-screen geometry.
-    // "container.window != nil" plus a non-empty rect in window coordinates is the
-    // only evidence that the card is actually drawn, so this is logged, not assumed.
-    __weak UIView *wContainer = container;
-    __weak UIView *wCard = rbCardView;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIView *c = wContainer, *cv = wCard;
-        if (!c) { RBLog(@"postMount container gone"); return; }
-        RBLog(@"postMount container win=%d frame=%@ inWindow=%@ alpha=%.2f hidden=%d super=%@",
-              (int)(c.window != nil), NSStringFromCGRect(c.frame),
-              NSStringFromCGRect([c convertRect:c.bounds toView:nil]),
-              c.alpha, (int)c.hidden, NSStringFromClass([c.superview class]));
-        [c.superview bringSubviewToFront:c];
-        if (cv) {
-            UIView *stackView = cv.superview;
-            RBLog(@"postMount card frame=%@ inWindow=%@ alpha=%.2f hidden=%d window=%d",
-                  NSStringFromCGRect(cv.frame),
-                  NSStringFromCGRect([cv convertRect:cv.bounds toView:nil]),
-                  cv.alpha, (int)cv.hidden, (int)(cv.window != nil));
-            RBLog(@"postMount card stack=%@ stackFrame=%@ cardBg=%@",
-                  NSStringFromClass([stackView class]), NSStringFromCGRect(stackView.frame), cv.backgroundColor);
-        }
-        // Ancestor chain (0.0.8): a single hidden or alpha-0 ancestor makes a
-        // perfectly laid out card invisible, and that is the one thing the previous
-        // logs could not rule out. Walk to the window and print every hop.
-        int depth = 0;
-        for (UIView *a = c.superview; a && depth < 12; a = a.superview, depth++) {
-            RBLog(@"  ancestor[%d] %@ alpha=%.2f hidden=%d frame=%@",
-                  depth, NSStringFromClass([a class]), a.alpha, (int)a.hidden, NSStringFromCGRect(a.frame));
-        }
-        if (c.window) {
-            RBLog(@"postMount window=%@ level=%.0f bounds=%@",
-                  NSStringFromClass([c.window class]), c.window.windowLevel,
-                  NSStringFromCGRect(c.window.bounds));
-        }
-    });
+    [topEffect bringSubviewToFront:container];
+    RBLog(@"addRBContainer mounted host=%@ container=%@ inWindow=%@ bottom=%d",
+          NSStringFromClass([topEffect class]), NSStringFromCGRect(container.frame),
+          NSStringFromCGRect([container convertRect:container.bounds toView:nil]), (int)rbCardAtBottom);
 }
 
-
 %end
 %end
-
-// ============================================================================
-#pragma mark - Reachability forcing (from ReachPlayer, proven on 13-16.4)
 
 %group RBReachability
 
