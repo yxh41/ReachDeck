@@ -14,9 +14,11 @@
 @property (nonatomic, strong) UIStackView *contentStack;
 @property (nonatomic, strong) UIStackView *rowsStack;
 @property (nonatomic, strong) UILabel *emptyLabel;
-@property (nonatomic, strong) NSArray<NSDictionary *> *rows; // {name, bundle, kind}
+@property (nonatomic, strong) NSArray<NSDictionary *> *rows; // visible rows after merge/sort/cap
 @property (nonatomic, assign) BOOL hideSystemServices;
 @property (nonatomic, strong) NSSet *lastAttributions;
+@property (nonatomic, strong) NSSet *lastActiveAttributions;
+@property (nonatomic, assign) NSUInteger hiddenCount;
 @end
 
 @implementation RBPrivacyCard
@@ -74,12 +76,18 @@
     _hideSystemServices = hide;
     // Re-derive from the last raw set so the toggle takes effect without waiting for
     // the next sensor update.
-    [self ingestAttributions:self.lastAttributions];
+    [self ingestAttributions:self.lastAttributions activeAttributions:self.lastActiveAttributions];
 }
 
-- (void)ingestAttributions:(NSSet *)attributions {
+- (void)ingestAttributions:(NSSet *)attributions
+         activeAttributions:(NSSet *)activeAttributions {
     self.lastAttributions = attributions;
-    NSMutableArray *out = [NSMutableArray array];
+    self.lastActiveAttributions = activeAttributions;
+
+    // 0.2.3 P0: merge by bundle/name, classify active vs recent, then sort.
+    NSMutableDictionary *merged = [NSMutableDictionary dictionary];
+    NSMutableArray *order = [NSMutableArray array];
+
     for (id obj in attributions) {
         // 0.2.1 FIX: the old check was `conformsToProtocol:@protocol(RBAttribution)`.
         // SBSensorActivityAttribution never declares conformance to OUR private
@@ -108,27 +116,95 @@
             id sysVal = [obj valueForKey:@"isSystemService"];   // KVC boxes scalars
             system = [sysVal isKindOfClass:[NSNumber class]] ? [sysVal boolValue] : NO;
         }
-        if (self.hideSystemServices && system) continue;
+        if (self.hideSystemServices && system) {
+            RBLog(@"attribution skip system class=%@ name=%@", NSStringFromClass([obj class]), name);
+            continue;
+        }
 
         long long sensor = -1;
         if ([obj respondsToSelector:@selector(sensor)]) {
             id sensorVal = [obj valueForKey:@"sensor"];         // KVC boxes scalars
             if ([sensorVal isKindOfClass:[NSNumber class]]) sensor = [sensorVal longLongValue];
         }
-        // 0.2.2: user-visible card content is Simplified Chinese. Keep the raw
-        // sensor number in the row so icon colour never depends on a localized
-        // display string.
         NSString *kind = @"传感器";
         if (sensor == 1) kind = @"相机";
         else if (sensor == 2) kind = @"麦克风";
 
-        RBLog(@"attribution OK name=%@ bundle=%@ sensor=%lld system=%d kind=%@",
-              name, bundle, sensor, (int)system, kind);
-        [out addObject:@{ @"name": name, @"bundle": bundle ?: @"", @"kind": kind,
-                          @"system": @(system), @"raw": @(sensor) }];
+        BOOL active = activeAttributions ? [activeAttributions containsObject:obj] : NO;
+        BOOL recent = NO;
+        if (!active) {
+            if (activeAttributions) {
+                // The object came from the active+recent source but not the active set.
+                recent = YES;
+            } else if ([obj respondsToSelector:@selector(usedRecently)]) {
+                id recentVal = [obj valueForKey:@"usedRecently"];
+                recent = [recentVal isKindOfClass:[NSNumber class]] && [recentVal boolValue];
+            }
+        }
+
+        RBLog(@"attribution OK name=%@ bundle=%@ sensor=%lld system=%d active=%d kind=%@",
+              name, bundle, sensor, (int)system, (int)active, kind);
+
+        NSString *key = bundle.length ? bundle : name;
+        NSMutableDictionary *row = merged[key];
+        if (!row) {
+            NSMutableArray *kinds = [NSMutableArray arrayWithObject:kind];
+            NSMutableArray *raws = [NSMutableArray arrayWithObject:@(sensor)];
+            row = [NSMutableDictionary dictionaryWithDictionary:@{
+                @"name": name, @"bundle": bundle ?: @"", @"key": key,
+                @"kinds": kinds, @"raws": raws,
+                @"system": @(system), @"active": @(active), @"recent": @(recent)
+            }];
+            merged[key] = row;
+            [order addObject:key];
+        } else {
+            NSMutableArray *kinds = row[@"kinds"];
+            if (![kinds containsObject:kind]) [kinds addObject:kind];
+            NSMutableArray *raws = row[@"raws"];
+            NSNumber *rawNumber = @(sensor);
+            if (![raws containsObject:rawNumber]) [raws addObject:rawNumber];
+            row[@"active"] = @([row[@"active"] boolValue] || active);
+            row[@"recent"] = @([row[@"recent"] boolValue] || recent);
+            // If a system attribution and a user app share a key, keep the user app.
+            row[@"system"] = @([row[@"system"] boolValue] && system);
+            NSString *oldName = row[@"name"];
+            if (oldName.length < name.length) row[@"name"] = name;
+        }
     }
-    RBLog(@"ingest rows=%lu from attrs=%lu", (unsigned long)out.count, (unsigned long)attributions.count);
-    self.rows = [out copy];
+
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *key in order) {
+        NSMutableDictionary *row = merged[key];
+        NSArray *kinds = row[@"kinds"];
+        NSArray *raws = row[@"raws"];
+        long long primarySensor = [raws.firstObject longLongValue];
+        [out addObject:@{
+            @"name": row[@"name"], @"bundle": row[@"bundle"], @"key": key,
+            @"kind": [kinds componentsJoinedByString:@" + "],
+            @"raw": @(primarySensor),
+            @"system": row[@"system"], @"active": row[@"active"], @"recent": row[@"recent"]
+        }];
+    }
+
+    // Stable order: active first, then camera before microphone, then name.
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        BOOL activeA = [a[@"active"] boolValue];
+        BOOL activeB = [b[@"active"] boolValue];
+        if (activeA != activeB) return activeA ? NSOrderedAscending : NSOrderedDescending;
+        long long rawA = [a[@"raw"] longLongValue];
+        long long rawB = [b[@"raw"] longLongValue];
+        if (rawA != rawB) return rawA < rawB ? NSOrderedAscending : NSOrderedDescending;
+        return [a[@"name"] compare:b[@"name"]
+                           options:(NSCaseInsensitiveSearch | NSNumericSearch)];
+    }];
+
+    NSUInteger maxRows = 3;
+    NSUInteger total = out.count;
+    NSArray *visible = total > maxRows ? [out subarrayWithRange:NSMakeRange(0, maxRows)] : out;
+    self.hiddenCount = total - visible.count;
+    self.rows = [visible copy];
+    RBLog(@"ingest rows=%lu from attrs=%lu hidden=%lu",
+          (unsigned long)visible.count, (unsigned long)attributions.count, (unsigned long)self.hiddenCount);
     [self renderRows];
 }
 
@@ -213,6 +289,15 @@
     for (NSDictionary *row in self.rows) {
         [self.rowsStack addArrangedSubview:[self rowViewFor:row]];
     }
+
+    if (self.hiddenCount > 0) {
+        UILabel *more = [[UILabel alloc] init];
+        more.text = [NSString stringWithFormat:@"还有 %lu 项", (unsigned long)self.hiddenCount];
+        more.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.6];
+        more.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+        more.textAlignment = NSTextAlignmentLeft;
+        [self.rowsStack addArrangedSubview:more];
+    }
 }
 
 - (UIView *)rowViewFor:(NSDictionary *)row {
@@ -239,10 +324,14 @@
     [box addSubview:title];
 
     UILabel *sub = [[UILabel alloc] init];
-    // 0.2.2: localized kind + optional system-service tag + bundle id. The
-    // bundle id stays as a stable technical identifier; it is not user-facing
-    // copy and may be the only way to recognise a system attribution.
-    NSMutableArray *parts = [NSMutableArray arrayWithObject:(row[@"kind"] ?: @"传感器")];
+    // 0.2.3: state first (active/recent), then localized kind(s), optional
+    // system-service tag and bundle id. The bundle id stays as a stable
+    // technical identifier; it is the only way to recognise a system attribution.
+    NSString *state = [row[@"active"] boolValue]
+        ? @"正在使用"
+        : ([row[@"recent"] boolValue] ? @"最近使用" : @"传感器");
+    NSMutableArray *parts = [NSMutableArray arrayWithObject:state];
+    [parts addObject:(row[@"kind"] ?: @"传感器")];
     if ([row[@"system"] boolValue]) [parts addObject:@"系统服务"];
     NSString *bundle = row[@"bundle"];
     if (bundle.length) [parts addObject:bundle];

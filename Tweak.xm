@@ -332,15 +332,20 @@ static void RBReloadSettings(void) {
     // ALWAYS call orig first — never suppress. This keeps the native dot intact.
     %orig;
 
-    NSSet *attrs = nil;
+    // 0.2.3: read both sources. "active" is the ground truth for 正在使用;
+    // "all" (active+recent) is the display source so recently used apps can be
+    // shown as 最近使用 instead of being silently dropped or mislabelled.
+    NSSet *active = nil;
     if ([self respondsToSelector:@selector(activeCameraAndMicrophoneActivityAttributions)]) {
-        attrs = [self activeCameraAndMicrophoneActivityAttributions];
+        active = [self activeCameraAndMicrophoneActivityAttributions];
     }
-    if (!attrs && [self respondsToSelector:@selector(activeAndRecentSensorActivityAttributions)]) {
-        attrs = [self activeAndRecentSensorActivityAttributions];
+    NSSet *all = nil;
+    if ([self respondsToSelector:@selector(activeAndRecentSensorActivityAttributions)]) {
+        all = [self activeAndRecentSensorActivityAttributions];
     }
-    if (privacyCard) [privacyCard ingestAttributions:attrs];
-    RBLog(@"sensor data attrs=%lu", (unsigned long)attrs.count);
+    NSSet *attrs = all ?: active;
+    if (privacyCard) [privacyCard ingestAttributions:attrs activeAttributions:active];
+    RBLog(@"sensor data active=%lu all=%lu", (unsigned long)active.count, (unsigned long)all.count);
 }
 
 %end

@@ -21,9 +21,11 @@ extern void RBLog(NSString * _Nonnull fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 
 @interface RBPrivacyCard : NSObject <RBCard>
 
-/// Called from the tweak side when sensor activity changes. Pass the raw attribution set
-/// (a NSSet of SBSensorActivityAttribution) or nil to clear.
-- (void)ingestAttributions:(nullable NSSet *)attributions;
+/// Called from the tweak side when sensor activity changes.
+/// attributions = active + recent sources; activeAttributions = active only.
+/// Passing nil clears the card.
+- (void)ingestAttributions:(nullable NSSet *)attributions
+         activeAttributions:(nullable NSSet *)activeAttributions;
 
 /// When YES, system-service attributions (no bundle / isSystemService) are filtered out.
 - (void)setHideSystemServices:(BOOL)hide;
