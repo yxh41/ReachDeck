@@ -179,15 +179,17 @@ static UIWindow *RBFindWindow(NSString *className) {
 static BOOL RBShiftActive(CGFloat *outOffset) {
     UIView *bg = rbBgView;
     if (!bg) return NO;
-    Ivar offIvar = class_getInstanceVariable([bg class], "_containerViewYOffset");
-    CGFloat off = offIvar ? *(CGFloat *)((char *)(__bridge void *)bg + ivar_getOffset(offIvar)) : 0.0;
+    // _containerViewYOffset is a TRANSIENT animation value: 0.1.3b logged
+    // 337.7 on the rise and 0.0 eighty milliseconds later, which produced a
+    // false FALL. SBHomeGrabberView.frame.origin.y is stable: -337.67 while
+    // reachability is up, 0 when it is down. Use that as the sole signal.
     CGFloat grabberY = 0.0;
     Class grabberClass = NSClassFromString(@"SBHomeGrabberView");
     for (UIView *v in bg.subviews) {
         if (grabberClass && [v isKindOfClass:grabberClass]) { grabberY = v.frame.origin.y; break; }
     }
-    if (outOffset) *outOffset = off;
-    return (off > 40.0 || off < -40.0 || grabberY < -40.0);
+    if (outOffset) *outOffset = grabberY;
+    return grabberY < -40.0;
 }
 
 static UIWindow *RBOverlayWindow(UIWindowScene *scene) {
@@ -216,32 +218,26 @@ static void RBStartShiftPoll(void) {
     dispatch_source_set_timer(rbPoll, DISPATCH_TIME_NOW, (uint64_t)(0.08 * NSEC_PER_SEC), 0);
     dispatch_source_set_event_handler(rbPoll, ^{
         if (!rbBgView) return;
-        CGFloat off = 0.0;
-        BOOL up = RBShiftActive(&off);
-        if (++rbPollTicks % 50 == 0) RBLog(@"shiftPoll heartbeat up=%d offset=%.1f", (int)up, (double)off);
+        CGFloat grabberY = 0.0;
+        BOOL up = RBShiftActive(&grabberY);
+        if (++rbPollTicks % 25 == 0) RBLog(@"reachPoll up=%d grabberY=%.1f", (int)up, (double)grabberY);
         if (up && !rbWasShifted) {
-            // This is the ONLY correct mount moment: the screen has really moved.
-            // 0.0.4-0.1.1 all mounted from viewWillAppear, which fires while the
-            // reachability window is still hidden (grabber y == 0).
-            UIWindow *rWin = RBFindWindow(@"SBReachabilityWindow");
-            UIView *host = nil;
-            if (rWin && !rWin.hidden) {
-                host = rWin;
-                RBLog(@"shiftPoll RISE -> mount inside SBReachabilityWindow offset=%.1f", (double)off);
-            } else {
-                host = RBOverlayWindow(RBSceneFor(rbBgView.window));
-                if (host) rbOverlayWindow.hidden = NO;
-                RBLog(@"shiftPoll RISE -> reachability window hidden, use overlay offset=%.1f", (double)off);
-            }
-            if (host) { rbHostView = host; RBMountInHost(host); }
+            // Our own window is the only surface whose level and z-order we
+            // control; SBReachabilityWindow was hidden on some of these edges.
+            UIWindow *host = RBOverlayWindow(RBSceneFor(rbBgView.window));
+            if (!host) { RBLog(@"reachPoll RISE but no window scene"); return; }
+            rbHostView = host;
+            RBMountInHost(host);
+            rbOverlayWindow.hidden = NO;   // never makeKey
+            RBLog(@"reachPoll RISE -> mounted, grabberY=%.1f windowHidden=%d", (double)grabberY, (int)rbOverlayWindow.hidden);
         } else if (!up && rbWasShifted) {
             if (rbOverlayWindow) rbOverlayWindow.hidden = YES;
-            RBLog(@"shiftPoll FALL -> hide offset=%.1f", (double)off);
+            RBLog(@"reachPoll FALL -> hidden, grabberY=%.1f", (double)grabberY);
         }
         rbWasShifted = up;
     });
     dispatch_resume(rbPoll);
-    RBLog(@"shiftPoll started");
+    RBLog(@"reachPoll started (stable signal: SBHomeGrabberView.y)");
 }
 
 // ---- Private SpringBoard interfaces ----
@@ -383,7 +379,7 @@ static void RBMountInHost(UIView *host) {
     // POSITION (0.1.0): the reachability band is not always at the top — the shift
     // geometry differs per build — so the side is a user preference instead of a
     // hard-coded guess, and the opposite edge stays a soft limit.
-    CGFloat topInset = hostIsWindow ? 56.0 : 24.0;
+    CGFloat topInset = hostIsWindow ? 150.0 : 24.0;   // exposed band is ~337pt; 150 puts the 80pt card in its middle
     NSMutableArray *geo = [NSMutableArray array];
     [geo addObject:[stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16]];
     [geo addObject:[stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16]];
