@@ -220,8 +220,9 @@ static char kRBRowAssociationKey;
 #pragma mark - row actions
 
 - (void)rbOpenApp:(UITapGestureRecognizer *)gesture {
+    RBLog(@"row tap fired");
     NSString *bundle = objc_getAssociatedObject(gesture, &kRBRowAssociationKey);
-    if (bundle.length == 0) return;
+    if (bundle.length == 0) { RBLog(@"row tap skipped: no bundle"); return; }
     Class cls = objc_getClass("LSApplicationWorkspace");
     if (!cls) { RBLog(@"open app skipped: no LSApplicationWorkspace"); return; }
     LSApplicationWorkspace *ws = (LSApplicationWorkspace *)[cls performSelector:@selector(defaultWorkspace)];
@@ -235,8 +236,9 @@ static char kRBRowAssociationKey;
 
 - (void)rbCopyBundle:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateBegan) return;
+    RBLog(@"row longpress fired");
     NSString *bundle = objc_getAssociatedObject(gesture, &kRBRowAssociationKey);
-    if (bundle.length == 0) return;
+    if (bundle.length == 0) { RBLog(@"row longpress skipped: no bundle"); return; }
     [UIPasteboard generalPasteboard].string = bundle;
     RBLog(@"copy bundle=%@", bundle);
 }

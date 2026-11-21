@@ -169,6 +169,9 @@ static void RBReloadSettings(void) {
 @interface SBReachabilityBackgroundView : UIView
 @end
 
+@interface SBReachabilityWindow : UIWindow
+@end
+
 @interface SBReachabilityBackgroundViewController : UIViewController
 - (void)addRBContainer;
 @end
@@ -251,6 +254,9 @@ static void RBReloadSettings(void) {
           (int)(topEffect.window != nil));
     if (!topEffect) { RBLog(@"addRBContainer bail: no topEffect"); return; }
     rbTopEffect = topEffect;
+    // The wallpaper effect host is normally non-interactive; without this the
+    // window hitTest bridge below cannot reach our card rows.
+    topEffect.userInteractionEnabled = YES;
 
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 
@@ -368,6 +374,34 @@ static void RBReloadSettings(void) {
 %end
 
 // ============================================================================
+#pragma mark - Touch bridge
+
+// ReachPlayer hook: SBReachabilityWindow does not route touches in the exposed
+// band to _topWallpaperEffectView by itself. Bridge only when the inner hitTest
+// lands on one of OUR tagged rows; every other touch keeps the original result,
+// so Reachability gestures are untouched.
+%group RBHitTest
+
+%hook SBReachabilityWindow
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *candidate = %orig;
+    if (!rbTopEffect || !rbContainer || !candidate) return candidate;
+    if ([candidate isDescendantOfView:rbContainer]) return candidate;
+
+    CGPoint local = [rbTopEffect convertPoint:point fromView:self];
+    UIView *inner = [rbTopEffect hitTest:local withEvent:event];
+    if (inner && [inner isDescendantOfView:rbContainer]) {
+        RBLog(@"hitTest forwarded to %@", NSStringFromClass([inner class]));
+        return inner;
+    }
+    return candidate;
+}
+
+%end
+%end
+
+// ============================================================================
 
 %ctor {
     @autoreleasepool {
@@ -400,6 +434,9 @@ static void RBReloadSettings(void) {
         // build must install nothing, never fail at load time.
         if (objc_getClass("SBReachabilityBackgroundViewController")) { %init(RBContainer); RBLog(@"ctor init RBContainer OK"); }
         else RBLog(@"ctor SKIP RBContainer: class missing");
+
+        if (objc_getClass("SBReachabilityWindow")) { %init(RBHitTest); RBLog(@"ctor init RBHitTest OK"); }
+        else RBLog(@"ctor SKIP RBHitTest: class missing");
 
         // Reachability-forcing hooks live in one group; these are long-stable SpringBoard
         // classes (also used unguarded by ReachPlayer), but guard the group entry anyway.
