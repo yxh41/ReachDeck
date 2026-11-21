@@ -97,6 +97,7 @@ static BOOL rbCardAtBottom = YES;         // 0.2.1: derived from cardAtTop (defa
 static NSArray<id<RBCard>> *rbCards = nil;
 static UIView *rbContainer = nil;        // container mounted inside _topWallpaperEffectView
 static NSUInteger rbHitTestLogCount = 0; // bounded self-evidence for the touch bridge
+static UIView *rbStickyRow = nil;        // ReachPlayer emptyView trick: keep down/up on one view
 
 // Rebuild the active card list from prefs. Cards are created once and reused; only
 // membership changes. This keeps sensor state intact across preference toggles.
@@ -389,11 +390,23 @@ static void RBReloadSettings(void) {
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *candidate = %orig;
     if (!rbTopEffect || !rbContainer) return candidate;
+
+    // 0.2.7 FIX: ReachPlayer's emptyView trick. During the reachability slide the
+    // window coordinate system moves (logs show down at y=-178 on our row, then
+    // the matching up at y=0 on SBReachabilityBackgroundView). UIKit cancels a
+    // gesture when down/up hit different views. Alternate a sticky row so the
+    // next hitTest reuses the view chosen on the previous call.
+    if (rbStickyRow && [rbStickyRow isDescendantOfView:rbContainer]) {
+        UIView *sticky = rbStickyRow;
+        rbStickyRow = nil;
+        RBLog(@"hitTest reuse sticky=%@", NSStringFromClass([sticky class]));
+        return sticky;
+    }
+    rbStickyRow = nil;
+
     if (candidate && [candidate isDescendantOfView:rbContainer]) return candidate;
 
-    // 0.2.6 FIX: %orig is usually nil in the exposed band (exactly the case
-    // ReachPlayer handles when arg1.y <= 0). Never bail on nil before bridging.
-    if (rbHitTestLogCount < 4) {
+    if (rbHitTestLogCount < 6) {
         RBLog(@"hitTest bridge call point=%@ candidate=%@",
               NSStringFromCGPoint(point), candidate ? NSStringFromClass([candidate class]) : @"nil");
         rbHitTestLogCount++;
@@ -402,6 +415,7 @@ static void RBReloadSettings(void) {
     CGPoint local = [rbTopEffect convertPoint:point fromView:self];
     UIView *inner = [rbTopEffect hitTest:local withEvent:event];
     if (inner && [inner isDescendantOfView:rbContainer]) {
+        rbStickyRow = inner;
         RBLog(@"hitTest forwarded to %@", NSStringFromClass([inner class]));
         return inner;
     }

@@ -28,6 +28,7 @@ static char kRBRowAssociationKey;
 @property (nonatomic, strong) NSSet *lastAttributions;
 @property (nonatomic, strong) NSSet *lastActiveAttributions;
 @property (nonatomic, assign) NSUInteger hiddenCount;
+@property (nonatomic, copy) NSString *lastRenderSignature;
 @end
 
 @implementation RBPrivacyCard
@@ -310,6 +311,20 @@ static char kRBRowAssociationKey;
     // Sensor pushes may arrive before the card is ever presented. There is no UI
     // to update yet; -rbView will render from self.rows on first access.
     if (!self.rowsStack) return;
+
+    // 0.2.7: the provider pushes on EVERY domain update (the logs show many per
+    // second). Rebuilding all rows each time destroys the row view mid-touch and
+    // kills its gesture recognizers. Rebuild only when the rendered content
+    // actually changes.
+    NSMutableString *sig = [NSMutableString string];
+    [sig appendFormat:@"h=%lu|", (unsigned long)self.hiddenCount];
+    for (NSDictionary *row in self.rows) {
+        [sig appendFormat:@"%@:%@:%@:%@:%@|",
+            row[@"key"] ?: @"", row[@"kind"] ?: @"",
+            row[@"active"] ?: @"", row[@"recent"] ?: @"", row[@"bundle"] ?: @""];
+    }
+    if (self.lastRenderSignature && [self.lastRenderSignature isEqualToString:sig]) return;
+    self.lastRenderSignature = sig;
 
     for (UIView *v in [self.rowsStack.arrangedSubviews copy]) {
         [self.rowsStack removeArrangedSubview:v];
