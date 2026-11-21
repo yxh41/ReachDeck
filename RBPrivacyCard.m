@@ -1,5 +1,6 @@
 #import "RBPrivacyCard.h"
 #import <objc/runtime.h>
+#import <objc/message.h>   // objc_msgSend for the BOOL-returning reachabilityModeActive
 
 // Private but stable SpringBoard-side launcher; guarded by objc_getClass and
 // respondsToSelector: before use.
