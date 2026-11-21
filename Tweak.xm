@@ -103,6 +103,7 @@ static BOOL rbCardAtBottom = YES;         // 0.2.1: derived from cardAtTop (defa
 // 0.2.19 style: defaults reproduce the pre-style look exactly.
 static CGFloat rbStyleOpacity = 0.72;
 static CGFloat rbStyleCorner = 16;
+static CGFloat rbStyleBorder = 1;         // 0.2.20: white border width (0..3)
 static BOOL rbStyleCompact = NO;
 static NSArray<id<RBCard>> *rbCards = nil;
 static UIView *rbContainer = nil;        // container mounted inside _topWallpaperEffectView
@@ -117,7 +118,7 @@ static void RBRebuildCards(void) {
     if (rbCardPrivacy) {
         if (!privacyCard) privacyCard = [[RBPrivacyCard alloc] init];
         [privacyCard setHideSystemServices:rbHideSystemServices];
-        [privacyCard setStyleOpacity:rbStyleOpacity corner:rbStyleCorner compact:rbStyleCompact];
+        [privacyCard setStyleOpacity:rbStyleOpacity corner:rbStyleCorner border:rbStyleBorder compact:rbStyleCompact];
         [cards addObject:privacyCard];
     }
     rbCards = [cards copy];
@@ -135,11 +136,16 @@ static void RBReadPrefs(void) {
     // device). Honour the old cardAtBottom key too for users upgrading from 0.1.x.
     rbCardAtBottom = d[@"cardAtTop"] ? ![d[@"cardAtTop"] boolValue]
                    : (d[@"cardAtBottom"] ? [d[@"cardAtBottom"] boolValue] : YES);
-    // 0.2.19: slider values are stored as NSNumber; clamp defensively here too.
-    CGFloat op = d[@"cardOpacity"] ? [d[@"cardOpacity"] floatValue] : 0.72;
-    rbStyleOpacity = op < 0.2 ? 0.2 : (op > 1.0 ? 1.0 : op);
+    // 0.2.20: opacity slider now stores an INTEGER percentage (20..100). A value
+    // <= 1.0 is the legacy 0.2.19 fractional format (0.72) -- migrate by treating
+    // it as already-normalized. This keeps existing users' appearance identical.
+    CGFloat op = d[@"cardOpacity"] ? [d[@"cardOpacity"] floatValue] : 72;
+    CGFloat opFrac = (op <= 1.0) ? op : (op / 100.0);
+    rbStyleOpacity = opFrac < 0.2 ? 0.2 : (opFrac > 1.0 ? 1.0 : opFrac);
     CGFloat cr = d[@"cardCorner"] ? [d[@"cardCorner"] floatValue] : 16;
     rbStyleCorner = cr < 0 ? 0 : (cr > 24 ? 24 : cr);
+    CGFloat bd = d[@"cardBorder"] ? [d[@"cardBorder"] floatValue] : 1;
+    rbStyleBorder = bd < 0 ? 0 : (bd > 3 ? 3 : bd);
     rbStyleCompact = d[@"cardCompact"] ? [d[@"cardCompact"] boolValue] : NO;
 }
 

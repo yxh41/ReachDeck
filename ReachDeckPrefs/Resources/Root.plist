@@ -88,45 +88,81 @@
 		</dict>
 		<dict>
 			<key>cell</key>
-			<string>PSSliderCell</string>
+			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>背景不透明度</string>
+			<string>背景不透明度（数值越大越不透明，默认 72）</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
 			<key>key</key>
 			<string>cardOpacity</string>
 			<key>defaults</key>
 			<string>com.zlhkf.ReachDeck</string>
 			<key>default</key>
-			<real>0.72</real>
+			<integer>72</integer>
 			<key>min</key>
-			<real>0.2</real>
+			<integer>20</integer>
 			<key>max</key>
-			<real>1</real>
+			<integer>100</integer>
 			<key>showValue</key>
 			<true/>
 		</dict>
 		<dict>
 			<key>cell</key>
-			<string>PSSliderCell</string>
+			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>圆角大小</string>
+			<string>圆角大小（数值越大越圆润，默认 16）</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
 			<key>key</key>
 			<string>cardCorner</string>
 			<key>defaults</key>
 			<string>com.zlhkf.ReachDeck</string>
 			<key>default</key>
-			<real>16</real>
+			<integer>16</integer>
 			<key>min</key>
-			<real>0</real>
+			<integer>0</integer>
 			<key>max</key>
-			<real>24</real>
+			<integer>24</integer>
 			<key>showValue</key>
 			<true/>
 		</dict>
 		<dict>
 			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>白色描边宽度（0 为无描边，默认 1）</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>key</key>
+			<string>cardBorder</string>
+			<key>defaults</key>
+			<string>com.zlhkf.ReachDeck</string>
+			<key>default</key>
+			<integer>1</integer>
+			<key>min</key>
+			<integer>0</integer>
+			<key>max</key>
+			<integer>3</integer>
+			<key>showValue</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>布局</string>
+		</dict>
+		<dict>
+			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
-			<string>紧凑布局</string>
+			<string>紧凑布局（更小的间距与字号）</string>
 			<key>key</key>
 			<string>cardCompact</string>
 			<key>default</key>

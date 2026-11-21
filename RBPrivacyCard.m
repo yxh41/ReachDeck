@@ -35,6 +35,7 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
 // 0.2.19 style
 @property (nonatomic, assign) CGFloat styleOpacity;
 @property (nonatomic, assign) CGFloat styleCorner;
+@property (nonatomic, assign) CGFloat styleBorder;
 @property (nonatomic, assign) BOOL styleCompact;
 - (void)performLaunchForBundle:(NSString *)bundle;
 - (void)rbLaunchPulse:(NSTimer *)timer;
@@ -58,6 +59,7 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
         // 0.2.19 defaults match the pre-style look, so upgrading changes nothing.
         _styleOpacity = 0.72;
         _styleCorner = 16;
+        _styleBorder = 1;
         _styleCompact = NO;
         _rows = @[];
         // SAFE MODE FIX (0.0.2): never touch UIKit here. A card can be created
@@ -102,19 +104,23 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     [self ingestAttributions:self.lastAttributions activeAttributions:self.lastActiveAttributions];
 }
 
-- (void)setStyleOpacity:(CGFloat)opacity corner:(CGFloat)corner compact:(BOOL)compact {
+- (void)setStyleOpacity:(CGFloat)opacity corner:(CGFloat)corner border:(CGFloat)border compact:(BOOL)compact {
     // Clamp defensively: a malformed plist must not produce an invisible or
     // absurdly shaped card.
     if (opacity < 0.2) opacity = 0.2;
     if (opacity > 1.0) opacity = 1.0;
     if (corner < 0) corner = 0;
     if (corner > 24) corner = 24;
-    if (_styleOpacity == opacity && _styleCorner == corner && _styleCompact == compact) return;
+    if (border < 0) border = 0;
+    if (border > 3) border = 3;
+    if (_styleOpacity == opacity && _styleCorner == corner &&
+        _styleBorder == border && _styleCompact == compact) return;
     _styleOpacity = opacity;
     _styleCorner = corner;
+    _styleBorder = border;
     _styleCompact = compact;
-    RBLog(@"style apply opacity=%.2f corner=%.0f compact=%d",
-          opacity, corner, (int)compact);
+    RBLog(@"style apply opacity=%.2f corner=%.0f border=%.0f compact=%d",
+          opacity, corner, border, (int)compact);
     // Tear down the built UI. -rbView rebuilds lazily from these new values on the
     // next mount; -ingestAttributions keeps the row data, so no sensor state is lost.
     self.view = nil;
@@ -519,8 +525,9 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     root.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:_styleOpacity];
     root.layer.cornerRadius = _styleCorner;
     root.layer.cornerCurve = kCACornerCurveContinuous;
-    root.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
-    root.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.45].CGColor;
+    // 0.2.20: border width is user-adjustable (0..3 pt). 0 hides the white ring.
+    root.layer.borderWidth = _styleBorder;
+    root.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.75].CGColor;
     root.clipsToBounds = YES;
     // Highest hugging/compression resistance: never grow to fill spare space.
     [root setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
