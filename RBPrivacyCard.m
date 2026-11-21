@@ -256,7 +256,7 @@ static char kRBRowAssociationKey;
     // then the old external path. ok=0 on LS was always a caller-validation
     // false negative -- the app does launch, just slowly.
 
-    BOOL launched = NO;
+    BOOL activateTried = NO;
 
     // SBApplication instance from SBApplicationController (verified in Kayoko source).
     Class appCtrlCls = objc_getClass("SBApplicationController");
@@ -290,7 +290,10 @@ static char kRBRowAssociationKey;
                 [inv setArgument:&zero atIndex:i];      // fromIcon/location/settings/actions
             }
             [inv invoke];
-            launched = YES;
+            activateTried = YES;
+            // 0.2.14: DO NOT short-circuit here. Field log showed activate5 runs
+            // (argc=7) but does NOT bring the app forward -- setting launched=YES
+            // skipped the LS path that actually worked in 0.2.7~0.2.12. Fire both.
             RBLog(@"open via SBUIController activate5 bundle=%@ sbApp=%d argc=%lu",
                   bundle, (int)(sbApp != nil), (unsigned long)[sig numberOfArguments]);
         } else {
@@ -302,31 +305,17 @@ static char kRBRowAssociationKey;
               (int)(uiCtrl && [uiCtrl respondsToSelector:activateSel]));
     }
 
-    // Path B: LSApplicationWorkspace openApplicationWithBundleIdentifier:configuration:completionHandler:
-    if (!launched) {
-        Class lsCls = objc_getClass("LSApplicationWorkspace");
-        id ls = (lsCls && [lsCls respondsToSelector:@selector(defaultWorkspace)])
-            ? [lsCls performSelector:@selector(defaultWorkspace)] : nil;
-        SEL asyncSel = sel_registerName("openApplicationWithBundleIdentifier:configuration:completionHandler:");
-        if (ls && [ls respondsToSelector:asyncSel]) {
-            id nilArg = nil;
-            void (^completion)(BOOL, NSError *) = ^(BOOL success, NSError *err) {
-                RBLog(@"open LS async completion ok=%d err=%@", (int)success, err);
-            };
-            ((void (*)(id, SEL, id, id, id))objc_msgSend)(ls, asyncSel, bundle, nilArg, completion);
-            launched = YES;
-            RBLog(@"open via LS async bundle=%@", bundle);
-        }
-    }
-
-    // Path C: last resort -- old external LSApplicationWorkspace path.
-    if (!launched) {
-        Class lsCls = objc_getClass("LSApplicationWorkspace");
-        LSApplicationWorkspace *ls = (LSApplicationWorkspace *)[lsCls performSelector:@selector(defaultWorkspace)];
-        if ([ls respondsToSelector:@selector(openApplicationWithBundleID:)]) {
-            BOOL ok = [ls openApplicationWithBundleID:bundle];
-            RBLog(@"open app fallback LS bundle=%@ ok=%d", bundle, (int)ok);
-        }
+    // Path B: LSApplicationWorkspace openApplicationWithBundleID: -- the ONLY
+    // path that verifiably launched the app in 0.2.7~0.2.12. 0.2.13's mistake was
+    // skipping it whenever activate5 "succeeded" (it didn't actually work).
+    // Fire it UNCONDITIONALLY now: activate5 (fast switch-to) and LS (reliable
+    // launch) both run; whichever takes effect wins. ok=0 from LS is a known
+    // caller-validation false negative -- the app did launch on every prior build.
+    Class lsCls = objc_getClass("LSApplicationWorkspace");
+    LSApplicationWorkspace *ls = (LSApplicationWorkspace *)[lsCls performSelector:@selector(defaultWorkspace)];
+    if ([ls respondsToSelector:@selector(openApplicationWithBundleID:)]) {
+        BOOL ok = [ls openApplicationWithBundleID:bundle];
+        RBLog(@"open app LS bundle=%@ ok=%d activateTried=%d", bundle, (int)ok, (int)activateTried);
     }
 }
 
