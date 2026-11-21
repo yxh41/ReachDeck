@@ -10,6 +10,8 @@
 @end
 
 static char kRBRowAssociationKey;
+static NSInteger rbPulseCount = 0;              // 0.2.17 diagnostic pulse counter
+static NSTimer *rbPulseTimer = nil;            // keep only one pulse series alive
 
 // ---- Private SpringBoard interfaces (runtime-verified from iOS 17/18 headers) ----
 // We deliberately do NOT declare a hardcoded sensor enum: its numeric values are not
@@ -31,6 +33,7 @@ static char kRBRowAssociationKey;
 @property (nonatomic, assign) NSUInteger hiddenCount;
 @property (nonatomic, copy) NSString *lastRenderSignature;
 - (void)performLaunchForBundle:(NSString *)bundle;
+- (void)rbLaunchPulse:(NSTimer *)timer;
 @end
 
 @implementation RBPrivacyCard
@@ -414,31 +417,38 @@ static char kRBRowAssociationKey;
     //   state active at +0.5s but UI appears at +5s -> app COLD START (not fixable
     //      from a tweak; it is the app's own launch/first-frame cost)
     //   state stays inactive          -> none of the activation calls worked
-    __block int pulse = 0;
-    __block id pulseApp = [sbApp retain];   // MRC: block capture does not retain
-    __block void (^pulseBlock)(void);
-    pulseBlock = ^{
-        NSString *st = @"?";
-        NSArray *keys = @[@"activationState", @"isActive", @"activated"];
-        for (NSString *k in keys) {
-            @try {
-                id v = [pulseApp valueForKey:k];
-                if (v) { st = [NSString stringWithFormat:@"%@=%@", k, v]; break; }
-            } @catch (NSException *ex) {
-                st = [NSString stringWithFormat:@"%@-threw", k];
-            }
+    if (rbPulseTimer) { [rbPulseTimer invalidate]; rbPulseTimer = nil; }
+    rbPulseCount = 0;
+    NSDictionary *info = @{@"bundle": bundle, @"app": (sbApp ?: NSNull.null)};
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                     target:self
+                                                   selector:@selector(rbLaunchPulse:)
+                                                   userInfo:info
+                                                    repeats:YES];
+    rbPulseTimer = timer;
+    [timer fire];
+}
+
+// 0.2.17 diagnostic: one pulse per 0.5s, up to 12, then invalidate.
+- (void)rbLaunchPulse:(NSTimer *)timer {
+    NSDictionary *info = timer.userInfo;
+    NSString *bundle = info[@"bundle"];
+    id app = info[@"app"];
+    if (app == NSNull.null) app = nil;
+    NSInteger n = ++rbPulseCount;
+
+    NSString *st = @"?";
+    NSArray *keys = @[@"activationState", @"isActive", @"activated"];
+    for (NSString *k in keys) {
+        @try {
+            id v = [app valueForKey:k];
+            if (v) { st = [NSString stringWithFormat:@"%@=%@", k, v]; break; }
+        } @catch (NSException *ex) {
+            st = [NSString stringWithFormat:@"%@-threw", k];
         }
-        RBLog(@"launch pulse #%d bundle=%@ state=%@", pulse, bundle, st);
-        pulse++;
-        if (pulse <= 12) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), pulseBlock);
-        } else {
-            [pulseApp release];
-            pulseApp = nil;
-        }
-    };
-    pulseBlock();
+    }
+    RBLog(@"launch pulse #%ld bundle=%@ state=%@", (long)n, bundle, st);
+    if (n >= 12) { [timer invalidate]; rbPulseCount = 0; rbPulseTimer = nil; }
 }
 
 - (void)rbCopyBundle:(UILongPressGestureRecognizer *)gesture {
