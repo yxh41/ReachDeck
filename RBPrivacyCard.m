@@ -11,6 +11,9 @@
 
 static char kRBRowAssociationKey;
 static char kRBDurationKeyKey;                 // 0.2.27: rowKey on the duration label
+static char kRBLongPressRowKey;                // 0.2.29: full row dict on the long-press recognizer
+static char kRBMenuContextKey;                 // 0.2.29: row dict on the popup menu
+static NSInteger const kRBMenuTag = 0x52444232; // 'RDB2': menu/overlay allowed by hitTest bridge
 static NSInteger rbPulseCount = 0;              // 0.2.17 diagnostic pulse counter
 static NSTimer *rbPulseTimer = nil;            // keep only one pulse series alive
 static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels for self-proof
@@ -46,11 +49,20 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
 // the labels every second.
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *activeSince;
 @property (nonatomic, strong) NSTimer *durationTimer;
+// 0.2.29: long-press action menu. It lives on the card's HOST (not the clipped
+// card root) so it is never cut off and never rebuilt by renderRows.
+@property (nonatomic, strong) UIView *menuView;
+@property (nonatomic, strong) UIView *menuOverlay;
+@property (nonatomic, strong) NSMutableSet<NSString *> *sessionHiddenBundles;
 - (void)performLaunchForBundle:(NSString *)bundle;
+- (void)rbCollapseAndLaunchBundle:(NSString *)bundle;
 - (void)rbLaunchPulse:(NSTimer *)timer;
 - (void)rbShowCopiedToast:(NSString *)bundle;
 - (void)rbTickDurations:(NSTimer *)timer;
 - (NSString *)rbDurationTextForBundle:(NSString *)bundle;
+- (void)rbShowRowMenu:(UILongPressGestureRecognizer *)gesture;
+- (void)rbDismissRowMenu:(id)sender;
+- (void)rbMenuTapped:(UIButton *)button;
 @end
 
 @implementation RBPrivacyCard
@@ -75,6 +87,7 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
         _styleCompact = NO;
         _rows = @[];
         _activeSince = [NSMutableDictionary dictionary];
+        _sessionHiddenBundles = [NSMutableSet set];
         // SAFE MODE FIX (0.0.2): never touch UIKit here. A card can be created
         // while dyld is still running tweak initializers, before UIApplication is
         // initialized. UIView / Auto Layout calls at that point throw an
@@ -156,6 +169,9 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
     _styleCompact = compact;
     RBLog(@"style apply opacity=%.2f corner=%.0f border=%.0f compact=%d",
           opacity, corner, border, (int)compact);
+    // 0.2.29: the menu sits on the host, not inside self.view, so clearing the
+    // card does not remove it automatically.
+    [self rbDismissRowMenu:nil];
     // Tear down the built UI. -rbView rebuilds lazily from these new values on the
     // next mount; -ingestAttributions keeps the row data, so no sensor state is lost.
     self.view = nil;
@@ -229,24 +245,32 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
             }
         }
 
+        NSString *key = bundle.length ? bundle : name;
+
+        // 0.2.29: "本次隐藏此应用" only affects this card instance/session.
+        // It is checked before duration recording so a hidden app cannot keep
+        // a stale timer alive.
+        if (key.length && [self.sessionHiddenBundles containsObject:key]) {
+            RBLog(@"attribution skip session hidden key=%@", key);
+            continue;
+        }
+
         // 0.2.28: track when this app was FIRST seen in the provider feed. The
         // private SBSensorActivityAttribution carries no timestamp we can rely
         // on, so the card records its own first-seen time and ticks a label.
-        NSString *sinceKey = bundle.length ? bundle : name;
-        if (sinceKey.length && !self.activeSince[sinceKey]) {
+        if (key.length && !self.activeSince[key]) {
             // 0.2.28: record on FIRST SEEN regardless of active. The active
             // set from activeCameraAndMicrophoneActivityAttributions is often
             // empty in the reachability window even while a row is shown, so
             // gating on active made the duration never appear. We keep the
             // first-seen time; the label counts up from here.
-            self.activeSince[sinceKey] = [NSDate date];
-            RBLog(@"duration start key=%@ active=%d", sinceKey, (int)active);
+            self.activeSince[key] = [NSDate date];
+            RBLog(@"duration start key=%@ active=%d", key, (int)active);
         }
 
         RBLog(@"attribution OK name=%@ bundle=%@ sensor=%lld system=%d active=%d kind=%@",
               name, bundle, sensor, (int)system, (int)active, kind);
 
-        NSString *key = bundle.length ? bundle : name;
         NSMutableDictionary *row = merged[key];
         if (!row) {
             NSMutableArray *kinds = [NSMutableArray arrayWithObject:kind];
@@ -315,7 +339,12 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
     RBLog(@"row tap fired");
     NSString *bundle = objc_getAssociatedObject(gesture, &kRBRowAssociationKey);
     if (bundle.length == 0) { RBLog(@"row tap skipped: no bundle"); return; }
+    [self rbCollapseAndLaunchBundle:bundle];
+}
 
+// 0.2.29: shared by row tap and the menu's "打开这个 App" action. Keeps the
+// proven 0.2.18 async-launch path in one place instead of duplicating it.
+- (void)rbCollapseAndLaunchBundle:(NSString *)bundle {
     // 0.2.15 root cause of "app only opens after reachability ends":
     // deactivateReachability flips reachabilityModeActive to 0 almost instantly
     // (0.2.10 probe: active=0 at +0.1s), but the SBReachabilityWindow teardown is
@@ -546,20 +575,150 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
     if (n >= 12) { [timer invalidate]; rbPulseCount = 0; rbPulseTimer = nil; }
 }
 
-- (void)rbCopyBundle:(UILongPressGestureRecognizer *)gesture {
+// 0.2.29: long press now opens a compact action menu. It is added to the card's
+// HOST (container/stack), not to the clipped card root, so it is never cut off
+// and never rebuilt by renderRows. RDB2 tag lets the hitTest bridge accept it.
+- (void)rbShowRowMenu:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateBegan) return;
     RBLog(@"row longpress fired");
-    NSString *bundle = objc_getAssociatedObject(gesture, &kRBRowAssociationKey);
-    if (bundle.length == 0) { RBLog(@"row longpress skipped: no bundle"); return; }
-    [UIPasteboard generalPasteboard].string = bundle;
-    RBLog(@"copy bundle=%@", bundle);
-    [self rbShowCopiedToast:bundle];
+
+    NSDictionary *row = objc_getAssociatedObject(gesture, &kRBLongPressRowKey);
+    NSString *bundle = row[@"bundle"] ?: @"";
+    NSString *name = row[@"name"] ?: @"";
+    if (row.count == 0) { RBLog(@"row menu skipped: no row context"); return; }
+
+    [self rbDismissRowMenu:nil];
+
+    UIView *host = self.view.superview ?: self.view;
+    if (!host) { RBLog(@"row menu skipped: no host"); return; }
+
+    CGFloat itemH = 28.0;
+    NSArray *titles = @[@"复制 Bundle ID", @"复制应用名称", @"打开这个 App",
+                        @"复制状态摘要", @"本次隐藏此应用"];
+    CGFloat menuW = 188.0;
+    CGFloat menuH = titles.count * itemH + 12.0;
+    CGRect anchor = [gesture.view convertRect:gesture.view.bounds toView:host];
+    CGFloat x = CGRectGetMidX(anchor) - menuW / 2.0;
+    x = MAX(8.0, MIN(x, CGRectGetWidth(host.bounds) - menuW - 8.0));
+    CGFloat y = CGRectGetMaxY(anchor) + 4.0;
+    if (y + menuH > CGRectGetHeight(host.bounds) - 8.0) {
+        y = CGRectGetMinY(anchor) - menuH - 4.0;
+    }
+    y = MAX(8.0, MIN(y, CGRectGetHeight(host.bounds) - menuH - 8.0));
+
+    UIView *overlay = [[UIView alloc] initWithFrame:host.bounds];
+    overlay.backgroundColor = [UIColor clearColor];
+    overlay.tag = kRBMenuTag;
+    overlay.userInteractionEnabled = YES;
+    UITapGestureRecognizer *outside =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rbDismissRowMenu:)];
+    [overlay addGestureRecognizer:outside];
+
+    UIView *menu = [[UIView alloc] initWithFrame:CGRectMake(x, y, menuW, menuH)];
+    menu.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.96];
+    menu.layer.cornerRadius = 12;
+    menu.layer.cornerCurve = kCACornerCurveContinuous;
+    menu.layer.borderWidth = 1;
+    menu.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18].CGColor;
+    menu.clipsToBounds = YES;
+    menu.tag = kRBMenuTag;
+    menu.userInteractionEnabled = YES;
+    objc_setAssociatedObject(menu, &kRBMenuContextKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    for (NSUInteger i = 0; i < titles.count; i++) {
+        UIButton *item = [UIButton buttonWithType:UIButtonTypeCustom];
+        item.frame = CGRectMake(6, 6 + i * itemH, menuW - 12, itemH - 2);
+        item.tag = (NSInteger)i;
+        [item setTitle:titles[i] forState:UIControlStateNormal];
+        [item setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        [item setTitleColor:[[UIColor whiteColor] colorWithAlphaComponent:0.55]
+                   forState:UIControlStateHighlighted];
+        item.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+        item.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+        item.contentEdgeInsets = UIEdgeInsetsMake(0, 10, 0, 0);
+        [item addTarget:self action:@selector(rbMenuTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [menu addSubview:item];
+    }
+
+    [host addSubview:overlay];
+    [host addSubview:menu];
+    self.menuOverlay = overlay;
+    self.menuView = menu;
+    RBLog(@"row menu show key=%@ items=%lu", bundle.length ? bundle : name,
+          (unsigned long)titles.count);
 }
 
-// 0.2.25: short visual confirmation of the long-press copy. The toast is added
+- (void)rbDismissRowMenu:(id)sender {
+    (void)sender;
+    if (!self.menuView && !self.menuOverlay) return;
+    [self.menuView removeFromSuperview];
+    [self.menuOverlay removeFromSuperview];
+    self.menuView = nil;
+    self.menuOverlay = nil;
+    RBLog(@"row menu dismiss");
+}
+
+- (void)rbMenuTapped:(UIButton *)button {
+    NSDictionary *row = objc_getAssociatedObject(button.superview, &kRBMenuContextKey);
+    if (row.count == 0) { [self rbDismissRowMenu:nil]; return; }
+    NSString *bundle = row[@"bundle"] ?: @"";
+    NSString *name = row[@"name"] ?: @"";
+    NSString *key = bundle.length ? bundle : name;
+    NSInteger idx = button.tag;
+    RBLog(@"row menu action=%ld key=%@", (long)idx, key);
+    [self rbDismissRowMenu:nil];
+
+    switch (idx) {
+        case 0: {
+            if (bundle.length == 0) break;
+            [UIPasteboard generalPasteboard].string = bundle;
+            RBLog(@"copy bundle=%@", bundle);
+            [self rbShowCopiedToast:bundle];
+            break;
+        }
+        case 1: {
+            if (name.length == 0) break;
+            [UIPasteboard generalPasteboard].string = name;
+            RBLog(@"copy app name=%@", name);
+            [self rbShowCopiedToast:name];
+            break;
+        }
+        case 2: {
+            if (bundle.length == 0) break;
+            [self rbCollapseAndLaunchBundle:bundle];
+            break;
+        }
+        case 3: {
+            NSString *state = [row[@"active"] boolValue]
+                ? @"正在使用"
+                : ([row[@"recent"] boolValue] ? @"最近使用" : @"传感器");
+            NSString *duration = [self rbDurationTextForBundle:key];
+            NSString *summary = [NSString stringWithFormat:@"%@ · %@ · %@ · %@ · %@",
+                                 name, row[@"kind"] ?: @"传感器", state,
+                                 duration.length ? duration : @"无时长", bundle];
+            [UIPasteboard generalPasteboard].string = summary;
+            RBLog(@"copy summary key=%@", key);
+            [self rbShowCopiedToast:summary];
+            break;
+        }
+        case 4: {
+            if (key.length == 0) break;
+            [self.sessionHiddenBundles addObject:key];
+            [self.activeSince removeObjectForKey:key];
+            [self ingestAttributions:self.lastAttributions
+                   activeAttributions:self.lastActiveAttributions];
+            RBLog(@"session hidden key=%@", key);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// 0.2.25/0.2.29: short visual confirmation of copy actions. The toast is added
 // to the card root (which clips to the rounded card), never takes touches
 // (userInteractionEnabled = NO), so it cannot disturb the hitTest bridge that
-// only accepts the tagged row views.
+// accepts only tagged row/menu views.
 - (void)rbShowCopiedToast:(NSString *)bundle {
     UIView *root = self.view;
     if (!root) { RBLog(@"copy toast skipped: no card view"); return; }
@@ -783,7 +942,7 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
     box.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
     box.layer.cornerRadius = _styleCompact ? 9 : 12;
     box.layer.cornerCurve = kCACornerCurveContinuous;
-    box.tag = 0x52444231; // 'RDB1': the only subview the container hitTest accepts
+    box.tag = 0x52444231; // 'RDB1' row; 'RDB2' menu/overlay is also accepted
     box.userInteractionEnabled = YES;
 
     NSString *rowBundle = row[@"bundle"];
@@ -791,10 +950,11 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
         UITapGestureRecognizer *tap =
             [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rbOpenApp:)];
         UILongPressGestureRecognizer *longPress =
-            [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(rbCopyBundle:)];
+            [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(rbShowRowMenu:)];
         longPress.minimumPressDuration = 0.5;
         objc_setAssociatedObject(tap, &kRBRowAssociationKey, rowBundle, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(longPress, &kRBRowAssociationKey, rowBundle, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(longPress, &kRBLongPressRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [tap requireGestureRecognizerToFail:longPress];
         [box addGestureRecognizer:tap];
         [box addGestureRecognizer:longPress];

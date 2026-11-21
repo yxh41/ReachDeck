@@ -213,8 +213,8 @@ static void RBReloadSettings(void) {
 #pragma mark - Card container
 
 // The container spans the whole Reachability band, but only explicitly tagged
-// card rows are allowed to consume touches. Everything else returns nil so
-// Reachability gestures still pass through to SpringBoard.
+// card rows ('RDB1') and the long-press menu/overlay ('RDB2') consume touches.
+// Everything else returns nil so Reachability gestures still pass through.
 @interface RBReachDeckContainerView : UIView
 @end
 @implementation RBReachDeckContainerView
@@ -222,7 +222,8 @@ static void RBReloadSettings(void) {
     UIView *hit = [super hitTest:point withEvent:event];
     if (!hit || hit == self) return nil;
     for (UIView *v = hit; v && v != self; v = v.superview) {
-        if (v.tag == 0x52444231) return hit; // 'RDB1' = interactive card row
+        // 'RDB1' = interactive card row; 'RDB2' = 0.2.29 long-press menu/overlay.
+        if (v.tag == 0x52444231 || v.tag == 0x52444232) return hit;
     }
     return nil;
 }
