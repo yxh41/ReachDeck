@@ -182,6 +182,22 @@ static void RBReloadSettings(void) {
 // ============================================================================
 #pragma mark - Card container
 
+// The container spans the whole Reachability band, but only explicitly tagged
+// card rows are allowed to consume touches. Everything else returns nil so
+// Reachability gestures still pass through to SpringBoard.
+@interface RBReachDeckContainerView : UIView
+@end
+@implementation RBReachDeckContainerView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (!hit || hit == self) return nil;
+    for (UIView *v = hit; v && v != self; v = v.superview) {
+        if (v.tag == 0x52444231) return hit; // 'RDB1' = interactive card row
+    }
+    return nil;
+}
+@end
+
 %group RBContainer
 
 %hook SBReachabilityBackgroundViewController
@@ -239,9 +255,9 @@ static void RBReloadSettings(void) {
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 
     // ReachPlayer: frame = host.bounds + four equal edge constraints.
-    UIView *container = [[UIView alloc] initWithFrame:topEffect.bounds];
+    RBReachDeckContainerView *container = [[RBReachDeckContainerView alloc] initWithFrame:topEffect.bounds];
     container.backgroundColor = [UIColor clearColor];
-    container.userInteractionEnabled = NO;   // never swallow reachability gestures
+    container.userInteractionEnabled = YES;  // custom hitTest only accepts tagged rows
     [topEffect addSubview:container];
     container.translatesAutoresizingMaskIntoConstraints = NO;
     [NSLayoutConstraint activateConstraints:@[

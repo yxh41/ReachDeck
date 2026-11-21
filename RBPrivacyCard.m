@@ -1,6 +1,15 @@
 #import "RBPrivacyCard.h"
 #import <objc/runtime.h>
 
+// Private but stable SpringBoard-side launcher; guarded by objc_getClass and
+// respondsToSelector: before use.
+@interface LSApplicationWorkspace : NSObject
++ (instancetype)defaultWorkspace;
+- (BOOL)openApplicationWithBundleID:(NSString *)bundleID;
+@end
+
+static char kRBRowAssociationKey;
+
 // ---- Private SpringBoard interfaces (runtime-verified from iOS 17/18 headers) ----
 // We deliberately do NOT declare a hardcoded sensor enum: its numeric values are not
 // stable across iOS versions. Instead we read the semantic property and fall back to
@@ -208,6 +217,30 @@
     [self renderRows];
 }
 
+#pragma mark - row actions
+
+- (void)rbOpenApp:(UITapGestureRecognizer *)gesture {
+    NSString *bundle = objc_getAssociatedObject(gesture, &kRBRowAssociationKey);
+    if (bundle.length == 0) return;
+    Class cls = objc_getClass("LSApplicationWorkspace");
+    if (!cls) { RBLog(@"open app skipped: no LSApplicationWorkspace"); return; }
+    LSApplicationWorkspace *ws = (LSApplicationWorkspace *)[cls performSelector:@selector(defaultWorkspace)];
+    if (![ws respondsToSelector:@selector(openApplicationWithBundleID:)]) {
+        RBLog(@"open app skipped: selector missing");
+        return;
+    }
+    BOOL ok = [ws openApplicationWithBundleID:bundle];
+    RBLog(@"open app bundle=%@ ok=%d", bundle, (int)ok);
+}
+
+- (void)rbCopyBundle:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+    NSString *bundle = objc_getAssociatedObject(gesture, &kRBRowAssociationKey);
+    if (bundle.length == 0) return;
+    [UIPasteboard generalPasteboard].string = bundle;
+    RBLog(@"copy bundle=%@", bundle);
+}
+
 #pragma mark - view
 
 - (void)buildView {
@@ -306,6 +339,22 @@
     box.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
     box.layer.cornerRadius = 12;
     box.layer.cornerCurve = kCACornerCurveContinuous;
+    box.tag = 0x52444231; // 'RDB1': the only subview the container hitTest accepts
+    box.userInteractionEnabled = YES;
+
+    NSString *rowBundle = row[@"bundle"];
+    if (rowBundle.length) {
+        UITapGestureRecognizer *tap =
+            [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rbOpenApp:)];
+        UILongPressGestureRecognizer *longPress =
+            [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(rbCopyBundle:)];
+        longPress.minimumPressDuration = 0.5;
+        objc_setAssociatedObject(tap, &kRBRowAssociationKey, rowBundle, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(longPress, &kRBRowAssociationKey, rowBundle, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [tap requireGestureRecognizerToFail:longPress];
+        [box addGestureRecognizer:tap];
+        [box addGestureRecognizer:longPress];
+    }
 
     UIView *dot = [[UIView alloc] init];
     dot.translatesAutoresizingMaskIntoConstraints = NO;

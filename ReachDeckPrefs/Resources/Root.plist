@@ -31,8 +31,8 @@
 			<string>PSGroupCell</string>
 			<key>label</key>
 			<string>隐私卡片</string>
-			<key>footerText</key>
-			<string>显示当前正在使用相机或麦克风的应用。</string>
+		<key>footerText</key>
+		<string>显示当前正在使用相机或麦克风的应用。轻点行打开应用，长按复制 Bundle ID。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
