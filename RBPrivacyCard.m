@@ -37,8 +37,11 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
 @property (nonatomic, assign) CGFloat styleCorner;
 @property (nonatomic, assign) CGFloat styleBorder;
 @property (nonatomic, assign) BOOL styleCompact;
+// 0.2.25: transient "copied" toast, owned by the card root view.
+@property (nonatomic, strong) UILabel *toastLabel;
 - (void)performLaunchForBundle:(NSString *)bundle;
 - (void)rbLaunchPulse:(NSTimer *)timer;
+- (void)rbShowCopiedToast:(NSString *)bundle;
 @end
 
 @implementation RBPrivacyCard
@@ -127,6 +130,7 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     self.contentStack = nil;
     self.rowsStack = nil;
     self.emptyLabel = nil;
+    self.toastLabel = nil;
     self.lastRenderSignature = nil;
 }
 
@@ -503,6 +507,63 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     if (bundle.length == 0) { RBLog(@"row longpress skipped: no bundle"); return; }
     [UIPasteboard generalPasteboard].string = bundle;
     RBLog(@"copy bundle=%@", bundle);
+    [self rbShowCopiedToast:bundle];
+}
+
+// 0.2.25: short visual confirmation of the long-press copy. The toast is added
+// to the card root (which clips to the rounded card), never takes touches
+// (userInteractionEnabled = NO), so it cannot disturb the hitTest bridge that
+// only accepts the tagged row views.
+- (void)rbShowCopiedToast:(NSString *)bundle {
+    UIView *root = self.view;
+    if (!root) { RBLog(@"copy toast skipped: no card view"); return; }
+
+    if (!self.toastLabel || self.toastLabel.superview != root) {
+        UILabel *toast = [[UILabel alloc] init];
+        toast.translatesAutoresizingMaskIntoConstraints = NO;
+        toast.textAlignment = NSTextAlignmentCenter;
+        toast.font = [UIFont systemFontOfSize:(_styleCompact ? 12 : 13) weight:UIFontWeightSemibold];
+        toast.textColor = [UIColor whiteColor];
+        toast.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.82];
+        toast.layer.cornerRadius = 10;
+        toast.layer.cornerCurve = kCACornerCurveContinuous;
+        toast.clipsToBounds = YES;
+        toast.userInteractionEnabled = NO;   // must not enter the reachability hitTest
+        toast.alpha = 0.0;
+        [root addSubview:toast];
+        CGFloat pad = _styleCompact ? 8 : 10;
+        [NSLayoutConstraint activateConstraints:@[
+            [toast.centerXAnchor constraintEqualToAnchor:root.centerXAnchor],
+            [toast.bottomAnchor constraintEqualToAnchor:root.bottomAnchor constant:-pad],
+            [toast.leadingAnchor constraintGreaterThanOrEqualToAnchor:root.leadingAnchor constant:pad],
+            [toast.trailingAnchor constraintLessThanOrEqualToAnchor:root.trailingAnchor constant:-pad],
+            [toast.heightAnchor constraintGreaterThanOrEqualToConstant:26],
+        ]];
+        self.toastLabel = toast;
+    }
+
+    // Trim the display string so a long bundle ID never overflows the card.
+    NSString *text = [NSString stringWithFormat:@"已复制 %@", bundle ?: @""];
+    if (text.length > 44) text = [[text substringToIndex:44] stringByAppendingString:@"…"];
+    self.toastLabel.text = text;
+    RBLog(@"copy toast show text=%@", text);
+
+    [UIView animateWithDuration:0.18 animations:^{
+        self.toastLabel.alpha = 1.0;
+    } completion:^(BOOL finished) {
+        (void)finished;
+        // Weak-ish capture: dispatch_after retains self only for the delay, then
+        // releases; no repeating timer / retain cycle (ARC-safe, unlike 0.2.17).
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [UIView animateWithDuration:0.35 animations:^{
+                strongSelf.toastLabel.alpha = 0.0;
+            }];
+        });
+    }];
 }
 
 #pragma mark - view
