@@ -627,7 +627,7 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
 
     for (NSUInteger i = 0; i < titles.count; i++) {
         UIButton *item = [UIButton buttonWithType:UIButtonTypeCustom];
-        item.frame = CGRectMake(6, 6 + i * itemH, menuW - 12, itemH - 2);
+        item.frame = CGRectMake(16, 6 + i * itemH, menuW - 22, itemH - 2);
         item.tag = (NSInteger)i;
         [item setTitle:titles[i] forState:UIControlStateNormal];
         [item setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -635,7 +635,8 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
                    forState:UIControlStateHighlighted];
         item.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
         item.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-        item.contentEdgeInsets = UIEdgeInsetsMake(0, 10, 0, 0);
+        // 0.2.29 buildfix: contentEdgeInsets is deprecated under iOS 15+ SDK
+        // (-Werror). The x=16 frame above gives the same 10pt inner padding.
         [item addTarget:self action:@selector(rbMenuTapped:) forControlEvents:UIControlEventTouchUpInside];
         [menu addSubview:item];
     }
