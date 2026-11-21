@@ -10,6 +10,7 @@
 @end
 
 static char kRBRowAssociationKey;
+static char kRBDurationKeyKey;                 // 0.2.27: rowKey on the duration label
 static NSInteger rbPulseCount = 0;              // 0.2.17 diagnostic pulse counter
 static NSTimer *rbPulseTimer = nil;            // keep only one pulse series alive
 
@@ -39,9 +40,15 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
 @property (nonatomic, assign) BOOL styleCompact;
 // 0.2.25: transient "copied" toast, owned by the card root view.
 @property (nonatomic, strong) UILabel *toastLabel;
+// 0.2.27: sensor usage duration. No timestamp on SBSensorActivityAttribution,
+// so record first-seen-active time per bundle and tick the labels every second.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *activeSince;
+@property (nonatomic, strong) NSTimer *durationTimer;
 - (void)performLaunchForBundle:(NSString *)bundle;
 - (void)rbLaunchPulse:(NSTimer *)timer;
 - (void)rbShowCopiedToast:(NSString *)bundle;
+- (void)rbTickDurations:(NSTimer *)timer;
+- (NSString *)rbDurationTextForBundle:(NSString *)bundle active:(BOOL)active;
 @end
 
 @implementation RBPrivacyCard
@@ -65,6 +72,7 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
         _styleBorder = 1;
         _styleCompact = NO;
         _rows = @[];
+        _activeSince = [NSMutableDictionary dictionary];
         // SAFE MODE FIX (0.0.2): never touch UIKit here. A card can be created
         // while dyld is still running tweak initializers, before UIApplication is
         // initialized. UIView / Auto Layout calls at that point throw an
@@ -75,6 +83,13 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     return self;
 }
 
+- (void)dealloc {
+    // 0.2.27: repeating NSTimer retains its target; break the cycle so the card
+    // can go away when the tweak rebuilds cards.
+    [self.durationTimer invalidate];
+    self.durationTimer = nil;
+}
+
 #pragma mark - RBCard
 
 - (UIView *)rbView {
@@ -83,6 +98,18 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     if (!self.view) {
         [self buildView];
         [self renderRows]; // reflect sensor data ingested before the UI existed
+        // 0.2.27: start the 1s duration ticker once the UI exists. Repeating
+        // timer retains self; invalidate on style rebuild / dealloc to avoid a
+        // dangling ticker (ARC-safe, unlike the 0.2.17 block attempt).
+        if (!self.durationTimer) {
+            // target/selector (not block) avoids -Warc-retain-cycles; a repeating
+            // timer legitimately retains its target, invalidated in dealloc.
+            self.durationTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                                  target:self
+                                                                selector:@selector(rbTickDurations:)
+                                                                userInfo:nil
+                                                                 repeats:YES];
+        }
     }
     return self.view;
 }
@@ -194,6 +221,18 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
             } else if ([obj respondsToSelector:@selector(usedRecently)]) {
                 id recentVal = [obj valueForKey:@"usedRecently"];
                 recent = [recentVal isKindOfClass:[NSNumber class]] && [recentVal boolValue];
+            }
+        }
+
+        // 0.2.27: track when this app FIRST became active. The private
+        // SBSensorActivityAttribution carries no timestamp we can rely on, so
+        // the card records its own first-seen time and ticks a label each second.
+        NSString *sinceKey = bundle.length ? bundle : name;
+        if (sinceKey.length) {
+            if (active) {
+                if (!self.activeSince[sinceKey]) self.activeSince[sinceKey] = [NSDate date];
+            } else {
+                [self.activeSince removeObjectForKey:sinceKey];
             }
         }
 
@@ -532,10 +571,10 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
         toast.alpha = 0.0;
         [root addSubview:toast];
         CGFloat pad = _styleCompact ? 8 : 10;
-        // 0.2.26: pin to the TOP of the card. Long-press happens on a row in the
-        // lower part of the card, so a bottom toast sat right under the finger.
+        // 0.2.27: pin to the TOP-LEFT corner, furthest from any row the finger
+        // holds down, and clear of the centred usage-duration labels.
         [NSLayoutConstraint activateConstraints:@[
-            [toast.centerXAnchor constraintEqualToAnchor:root.centerXAnchor],
+            [toast.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad],
             [toast.topAnchor constraintEqualToAnchor:root.topAnchor constant:pad],
             [toast.leadingAnchor constraintGreaterThanOrEqualToAnchor:root.leadingAnchor constant:pad],
             [toast.trailingAnchor constraintLessThanOrEqualToAnchor:root.trailingAnchor constant:-pad],
@@ -567,6 +606,50 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
             }];
         });
     }];
+}
+
+#pragma mark - usage duration
+
+// Human-readable elapsed time since the app first went active. Active rows keep
+// counting; recent/inactive rows show a static marker (no start time retained).
+- (NSString *)rbDurationTextForBundle:(NSString *)bundle active:(BOOL)active {
+    if (!active || bundle.length == 0) return @"";
+    NSDate *since = self.activeSince[bundle];
+    if (!since) return @"";
+    NSTimeInterval secs = [[NSDate date] timeIntervalSinceDate:since];
+    if (secs < 0) secs = 0;
+    long total = (long)secs;
+    if (total < 60) return [NSString stringWithFormat:@"%ld秒", total];
+    long mins = total / 60, rem = total % 60;
+    if (mins < 60) return [NSString stringWithFormat:@"%ld分%02ld秒", mins, rem];
+    long hours = mins / 60;
+    return [NSString stringWithFormat:@"%ld时%02ld分", hours, mins % 60];
+}
+
+// 1s tick: update the duration labels in place. Never touches rowsStack's
+// arranged subviews or the render signature, so a tick cannot rebuild a row
+// mid-touch (the 0.2.7 gesture-death bug).
+- (void)rbTickDurations:(NSTimer *)timer {
+    (void)timer;
+    if (!self.rowsStack) return;
+    for (UIView *box in self.rowsStack.arrangedSubviews) {
+        if (box.tag != 0x52444231) continue;
+        for (UIView *v in box.subviews) {
+            if (![v isKindOfClass:[UILabel class]]) continue;
+            NSString *key = objc_getAssociatedObject(v, &kRBDurationKeyKey);
+            if (!key) continue;
+            // Look up the CURRENT active flag from row data; a recent row must
+            // not start counting just because the ticker ran over it.
+            BOOL rowActive = NO;
+            for (NSDictionary *row in self.rows) {
+                NSString *rkey = row[@"bundle"] ?: row[@"name"];
+                if ([rkey isEqualToString:key]) { rowActive = [row[@"active"] boolValue]; break; }
+            }
+            NSString *text = [self rbDurationTextForBundle:key active:rowActive];
+            if (![text isEqualToString:((UILabel *)v).text]) ((UILabel *)v).text = text;
+            break;
+        }
+    }
 }
 
 #pragma mark - view
@@ -722,6 +805,21 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     title.translatesAutoresizingMaskIntoConstraints = NO;
     [box addSubview:title];
 
+    // 0.2.27: usage duration on the right of the title line. Not interactive
+    // (so the container hitTest bridge is untouched). Text refreshed by a
+    // 1s timer WITHOUT rebuilding the row -- rebuilding mid-touch kills taps.
+    UILabel *duration = [[UILabel alloc] init];
+    duration.font = [UIFont monospacedDigitSystemFontOfSize:(_styleCompact ? 11 : 12)
+                                                     weight:UIFontWeightSemibold];
+    duration.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.75];
+    duration.textAlignment = NSTextAlignmentRight;
+    duration.userInteractionEnabled = NO;
+    duration.translatesAutoresizingMaskIntoConstraints = NO;
+    NSString *dKey = (row[@"bundle"] ?: row[@"name"]) ?: @"";
+    duration.text = [self rbDurationTextForBundle:dKey active:[row[@"active"] boolValue]];
+    objc_setAssociatedObject(duration, &kRBDurationKeyKey, dKey, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [box addSubview:duration];
+
     UILabel *sub = [[UILabel alloc] init];
     // 0.2.3: state first (active/recent), then localized kind(s), optional
     // system-service tag and bundle id. The bundle id stays as a stable
@@ -749,8 +847,12 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
         [dot.heightAnchor constraintEqualToConstant:10],
 
         [title.leadingAnchor constraintEqualToAnchor:dot.trailingAnchor constant:10],
-        [title.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-pad],
+        [title.trailingAnchor constraintEqualToAnchor:duration.leadingAnchor constant:-8],
         [title.topAnchor constraintEqualToAnchor:box.topAnchor constant:vpad],
+
+        [duration.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-pad],
+        [duration.topAnchor constraintEqualToAnchor:box.topAnchor constant:vpad],
+        [duration.widthAnchor constraintLessThanOrEqualToConstant:72],
 
         [sub.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
         [sub.trailingAnchor constraintEqualToAnchor:title.trailingAnchor],
