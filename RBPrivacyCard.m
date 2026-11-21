@@ -13,6 +13,7 @@ static char kRBRowAssociationKey;
 static char kRBDurationKeyKey;                 // 0.2.27: rowKey on the duration label
 static NSInteger rbPulseCount = 0;              // 0.2.17 diagnostic pulse counter
 static NSTimer *rbPulseTimer = nil;            // keep only one pulse series alive
+static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels for self-proof
 
 // ---- Private SpringBoard interfaces (runtime-verified from iOS 17/18 headers) ----
 // We deliberately do NOT declare a hardcoded sensor enum: its numeric values are not
@@ -40,15 +41,16 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
 @property (nonatomic, assign) BOOL styleCompact;
 // 0.2.25: transient "copied" toast, owned by the card root view.
 @property (nonatomic, strong) UILabel *toastLabel;
-// 0.2.27: sensor usage duration. No timestamp on SBSensorActivityAttribution,
-// so record first-seen-active time per bundle and tick the labels every second.
+// 0.2.27/0.2.28: sensor usage duration. No timestamp on
+// SBSensorActivityAttribution, so record first-seen time per bundle and tick
+// the labels every second.
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *activeSince;
 @property (nonatomic, strong) NSTimer *durationTimer;
 - (void)performLaunchForBundle:(NSString *)bundle;
 - (void)rbLaunchPulse:(NSTimer *)timer;
 - (void)rbShowCopiedToast:(NSString *)bundle;
 - (void)rbTickDurations:(NSTimer *)timer;
-- (NSString *)rbDurationTextForBundle:(NSString *)bundle active:(BOOL)active;
+- (NSString *)rbDurationTextForBundle:(NSString *)bundle;
 @end
 
 @implementation RBPrivacyCard
@@ -109,6 +111,9 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
                                                                 selector:@selector(rbTickDurations:)
                                                                 userInfo:nil
                                                                  repeats:YES];
+            // Reachability/drag can put SpringBoard's main runloop in tracking
+            // mode. Common modes keeps the label ticking there too.
+            [[NSRunLoop mainRunLoop] addTimer:self.durationTimer forMode:NSRunLoopCommonModes];
         }
     }
     return self.view;
@@ -224,16 +229,18 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
             }
         }
 
-        // 0.2.27: track when this app FIRST became active. The private
-        // SBSensorActivityAttribution carries no timestamp we can rely on, so
-        // the card records its own first-seen time and ticks a label each second.
+        // 0.2.28: track when this app was FIRST seen in the provider feed. The
+        // private SBSensorActivityAttribution carries no timestamp we can rely
+        // on, so the card records its own first-seen time and ticks a label.
         NSString *sinceKey = bundle.length ? bundle : name;
-        if (sinceKey.length) {
-            if (active) {
-                if (!self.activeSince[sinceKey]) self.activeSince[sinceKey] = [NSDate date];
-            } else {
-                [self.activeSince removeObjectForKey:sinceKey];
-            }
+        if (sinceKey.length && !self.activeSince[sinceKey]) {
+            // 0.2.28: record on FIRST SEEN regardless of active. The active
+            // set from activeCameraAndMicrophoneActivityAttributions is often
+            // empty in the reachability window even while a row is shown, so
+            // gating on active made the duration never appear. We keep the
+            // first-seen time; the label counts up from here.
+            self.activeSince[sinceKey] = [NSDate date];
+            RBLog(@"duration start key=%@ active=%d", sinceKey, (int)active);
         }
 
         RBLog(@"attribution OK name=%@ bundle=%@ sensor=%lld system=%d active=%d kind=%@",
@@ -610,10 +617,12 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
 
 #pragma mark - usage duration
 
-// Human-readable elapsed time since the app first went active. Active rows keep
-// counting; recent/inactive rows show a static marker (no start time retained).
-- (NSString *)rbDurationTextForBundle:(NSString *)bundle active:(BOOL)active {
-    if (!active || bundle.length == 0) return @"";
+// 0.2.28: activeCameraAndMicrophoneActivityAttributions is frequently empty
+// even while a row is visible, so the row's `active` flag is NOT a reliable
+// gate. ingestAttributions: now records first-seen time for every rendered row;
+// any recorded bundle gets a live label regardless of that flag.
+- (NSString *)rbDurationTextForBundle:(NSString *)bundle {
+    if (bundle.length == 0) return @"";
     NSDate *since = self.activeSince[bundle];
     if (!since) return @"";
     NSTimeInterval secs = [[NSDate date] timeIntervalSinceDate:since];
@@ -638,15 +647,17 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
             if (![v isKindOfClass:[UILabel class]]) continue;
             NSString *key = objc_getAssociatedObject(v, &kRBDurationKeyKey);
             if (!key) continue;
-            // Look up the CURRENT active flag from row data; a recent row must
-            // not start counting just because the ticker ran over it.
-            BOOL rowActive = NO;
-            for (NSDictionary *row in self.rows) {
-                NSString *rkey = row[@"bundle"] ?: row[@"name"];
-                if ([rkey isEqualToString:key]) { rowActive = [row[@"active"] boolValue]; break; }
+            NSString *text = [self rbDurationTextForBundle:key];
+            UILabel *label = (UILabel *)v;
+            if (![text isEqualToString:label.text]) {
+                label.text = text;
+                // 0.2.28: first few non-empty updates prove the ticker is alive
+                // without spamming the log every second.
+                if (text.length && rbDurationShowLogged < 5) {
+                    rbDurationShowLogged++;
+                    RBLog(@"duration label key=%@ text=%@", key, text);
+                }
             }
-            NSString *text = [self rbDurationTextForBundle:key active:rowActive];
-            if (![text isEqualToString:((UILabel *)v).text]) ((UILabel *)v).text = text;
             break;
         }
     }
@@ -816,7 +827,7 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     duration.userInteractionEnabled = NO;
     duration.translatesAutoresizingMaskIntoConstraints = NO;
     NSString *dKey = (row[@"bundle"] ?: row[@"name"]) ?: @"";
-    duration.text = [self rbDurationTextForBundle:dKey active:[row[@"active"] boolValue]];
+    duration.text = [self rbDurationTextForBundle:dKey];
     objc_setAssociatedObject(duration, &kRBDurationKeyKey, dKey, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [box addSubview:duration];
 
