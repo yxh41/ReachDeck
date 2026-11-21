@@ -1,6 +1,7 @@
 #import "RBPrivacyCard.h"
 #import <objc/runtime.h>
 #import <objc/message.h>   // objc_msgSend for the BOOL-returning reachabilityModeActive
+#import <dlfcn.h>          // dlsym for SBSLaunchApplicationWithIdentifier
 
 // Private but stable SpringBoard-side launcher; guarded by objc_getClass and
 // respondsToSelector: before use.
@@ -225,55 +226,81 @@ static char kRBRowAssociationKey;
     RBLog(@"row tap fired");
     NSString *bundle = objc_getAssociatedObject(gesture, &kRBRowAssociationKey);
     if (bundle.length == 0) { RBLog(@"row tap skipped: no bundle"); return; }
-    Class cls = objc_getClass("LSApplicationWorkspace");
-    if (!cls) { RBLog(@"open app skipped: no LSApplicationWorkspace"); return; }
-    LSApplicationWorkspace *ws = (LSApplicationWorkspace *)[cls performSelector:@selector(defaultWorkspace)];
-    if (![ws respondsToSelector:@selector(openApplicationWithBundleID:)]) {
-        RBLog(@"open app skipped: selector missing");
-        return;
-    }
-    // 0.2.10: 0.2.9 used deactivateReachability (an internal method) first -- it did
-    // fire but the app still took seconds. ReachPlayer, the field-verified reference,
-    // NEVER calls deactivateReachability on-device: it always uses toggleReachability
-    // guarded by reachabilityModeActive (Tweak.xm:23/34/223). While reachability is
-    // still active SpringBoard suppresses/queues ordinary app activation, which is
-    // exactly the "ok=0 but opens seconds later" symptom. Toggle OUT first.
-    // Probe active state after the toggle so the next field log tells us whether the
-    // sheet left the mode immediately (activation race) or lingered (manager issue).
+
+    // 0.2.11 root cause (from the 0.2.10 probe): reachability was ALREADY active=0
+    // at +0.1s and stayed 0 through +2.0s, yet ok=0 and the app took seconds.
+    // So the sheet collapse is NOT the bottleneck -- the LAUNCH path is:
+    // LSApplicationWorkspace openApplicationWithBundleID: is the external
+    // LaunchServices entry point; called from inside SpringBoard it returns an
+    // unreliable NO and goes through a slow cross-process activation transaction.
+    // Switch to SpringBoard's OWN in-process launch APIs. Each path is guarded,
+    // and each logs, so one field run tells us which one actually works.
+
+    // Collapse the sheet first (proven harmless, keeps the UX "tap -> dismiss").
     Class mgrCls = objc_getClass("SBReachabilityManager");
     id mgr = mgrCls ? [mgrCls performSelector:@selector(sharedInstance)] : nil;
-    if (mgr && [mgr respondsToSelector:@selector(reachabilityModeActive)] &&
-        [mgr respondsToSelector:@selector(toggleReachability)] &&
-        ((BOOL (*)(id, SEL))objc_msgSend)(mgr, @selector(reachabilityModeActive))) {
-        [mgr performSelector:@selector(toggleReachability)];
-        RBLog(@"collapse: toggleReachability");
-    } else if (mgr && [mgr respondsToSelector:@selector(deactivateReachability)]) {
+    if (mgr && [mgr respondsToSelector:@selector(deactivateReachability)]) {
         [mgr performSelector:@selector(deactivateReachability)];
-        RBLog(@"collapse: deactivateReachability fallback");
+        RBLog(@"collapse: deactivateReachability");
+    }
+
+    BOOL launched = NO;
+
+    // Path A: SBUIController activateApplication: -- the official SpringBoard
+    // in-process activation used by the reference docs; SBApplication fetched via
+    // SBApplicationController applicationWithBundleIdentifier: (verified in the
+    // local Kayoko source). This bypasses LaunchServices entirely.
+    Class appCtrlCls = objc_getClass("SBApplicationController");
+    id appCtrl = (appCtrlCls && [appCtrlCls respondsToSelector:@selector(sharedInstance)])
+        ? [appCtrlCls performSelector:@selector(sharedInstance)] : nil;
+    id sbApp = (appCtrl && [appCtrl respondsToSelector:@selector(applicationWithBundleIdentifier:)])
+        ? [appCtrl performSelector:@selector(applicationWithBundleIdentifier:) withObject:bundle] : nil;
+    RBLog(@"sb app lookup bundle=%@ found=%d", bundle, (int)(sbApp != nil));
+
+    Class uiCtrlCls = objc_getClass("SBUIController");
+    id uiCtrl = nil;
+    if (uiCtrlCls && [uiCtrlCls respondsToSelector:@selector(sharedInstanceIfExists)]) {
+        uiCtrl = [uiCtrlCls performSelector:@selector(sharedInstanceIfExists)];
+    }
+    if (!uiCtrl && uiCtrlCls && [uiCtrlCls respondsToSelector:@selector(sharedInstance)]) {
+        uiCtrl = [uiCtrlCls performSelector:@selector(sharedInstance)];
+    }
+    if (sbApp && uiCtrl && [uiCtrl respondsToSelector:@selector(activateApplication:)]) {
+        [uiCtrl performSelector:@selector(activateApplication:) withObject:sbApp];
+        launched = YES;
+        RBLog(@"open via SBUIController activateApplication bundle=%@", bundle);
     } else {
-        RBLog(@"collapse skipped: no selector");
+        RBLog(@"open SBUIController skip app=%d ui=%d", (int)(sbApp != nil), (int)(uiCtrl != nil));
     }
 
-    // Sample reachabilityModeActive over the next 2s to prove the sheet actually
-    // left the mode. active=0 right after toggle => collapse works, slowness is
-    // LaunchServices; active stays 1 => toggle did not take, need a different exit.
-    NSArray *probeDelays = @[@0.1, @0.3, @0.6, @1.0, @2.0];
-    for (NSNumber *d in probeDelays) {
-        double delay = d.doubleValue;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            Class c = objc_getClass("SBReachabilityManager");
-            id probeMgr = c ? [c performSelector:@selector(sharedInstance)] : nil;  // process singleton
-            BOOL active = NO;
-            if (probeMgr && [probeMgr respondsToSelector:@selector(reachabilityModeActive)]) {
-                active = ((BOOL (*)(id, SEL))objc_msgSend)(probeMgr, @selector(reachabilityModeActive));
+    // Path B: SBSLaunchApplicationWithIdentifier() from SpringBoardServices.
+    // Lowest-level SB-side launcher; dlsym-guarded so a missing symbol is harmless.
+    if (!launched) {
+        void *sbs = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+        if (sbs) {
+            int (*launchFn)(CFStringRef, Boolean) = (int (*)(CFStringRef, Boolean))dlsym(sbs, "SBSLaunchApplicationWithIdentifier");
+            if (launchFn) {
+                int ret = launchFn((__bridge CFStringRef)bundle, NO);
+                launched = (ret == 0);
+                RBLog(@"open via SBSLaunch bundle=%@ ret=%d", bundle, ret);
+            } else {
+                RBLog(@"open SBSLaunch symbol missing");
             }
-            RBLog(@"collapse probe +%.1fs active=%d", delay, (int)active);
-        });
+            dlclose(sbs);
+        } else {
+            RBLog(@"open SBSLaunch dlopen failed");
+        }
     }
 
-    BOOL ok = [ws openApplicationWithBundleID:bundle];
-    RBLog(@"open app bundle=%@ ok=%d", bundle, (int)ok);
+    // Path C: last resort -- the old LSApplicationWorkspace external path.
+    if (!launched) {
+        Class lsCls = objc_getClass("LSApplicationWorkspace");
+        LSApplicationWorkspace *ws = (LSApplicationWorkspace *)[lsCls performSelector:@selector(defaultWorkspace)];
+        if ([ws respondsToSelector:@selector(openApplicationWithBundleID:)]) {
+            BOOL ok = [ws openApplicationWithBundleID:bundle];
+            RBLog(@"open app fallback LS bundle=%@ ok=%d", bundle, (int)ok);
+        }
+    }
 }
 
 - (void)rbCopyBundle:(UILongPressGestureRecognizer *)gesture {
