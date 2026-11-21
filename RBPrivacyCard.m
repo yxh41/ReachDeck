@@ -30,6 +30,7 @@ static char kRBRowAssociationKey;
 @property (nonatomic, strong) NSSet *lastActiveAttributions;
 @property (nonatomic, assign) NSUInteger hiddenCount;
 @property (nonatomic, copy) NSString *lastRenderSignature;
+- (void)performLaunchForBundle:(NSString *)bundle;
 @end
 
 @implementation RBPrivacyCard
@@ -226,6 +227,31 @@ static char kRBRowAssociationKey;
     NSString *bundle = objc_getAssociatedObject(gesture, &kRBRowAssociationKey);
     if (bundle.length == 0) { RBLog(@"row tap skipped: no bundle"); return; }
 
+    // 0.2.15 root cause of "app only opens after reachability ends":
+    // deactivateReachability flips reachabilityModeActive to 0 almost instantly
+    // (0.2.10 probe: active=0 at +0.1s), but the SBReachabilityWindow teardown is
+    // still an in-flight workspace transaction for several hundred ms. An app
+    // activation issued inside that window gets queued behind the exit
+    // transaction, so the app visibly opens only when the sheet finishes leaving.
+    // Collapse now for the UX, but defer the activation until AFTER the exit
+    // transaction has settled instead of competing with it.
+    Class mgrCls = objc_getClass("SBReachabilityManager");
+    id mgr = mgrCls ? [mgrCls performSelector:@selector(sharedInstance)] : nil;
+    if (mgr && [mgr respondsToSelector:@selector(deactivateReachability)]) {
+        [mgr performSelector:@selector(deactivateReachability)];
+        RBLog(@"collapse: deactivateReachability");
+    }
+    NSString *pending = [bundle copy];
+    RBLog(@"tap deferred launch bundle=%@ delay=0.45", bundle);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self performLaunchForBundle:pending];
+    });
+}
+
+- (void)performLaunchForBundle:(NSString *)bundle {
+    RBLog(@"deferred launch firing bundle=%@", bundle);
+
     // 0.2.11 root cause (from the 0.2.10 probe): reachability was ALREADY active=0
     // at +0.1s and stayed 0 through +2.0s, yet ok=0 and the app took seconds.
     // So the sheet collapse is NOT the bottleneck -- the LAUNCH path is:
@@ -234,14 +260,6 @@ static char kRBRowAssociationKey;
     // unreliable NO and goes through a slow cross-process activation transaction.
     // Switch to SpringBoard's OWN in-process launch APIs. Each path is guarded,
     // and each logs, so one field run tells us which one actually works.
-
-    // Collapse the sheet first (proven harmless, keeps the UX "tap -> dismiss").
-    Class mgrCls = objc_getClass("SBReachabilityManager");
-    id mgr = mgrCls ? [mgrCls performSelector:@selector(sharedInstance)] : nil;
-    if (mgr && [mgr respondsToSelector:@selector(deactivateReachability)]) {
-        [mgr performSelector:@selector(deactivateReachability)];
-        RBLog(@"collapse: deactivateReachability");
-    }
 
     // 0.2.13: the 0.2.12 method-name probe gave us the REAL iOS 16 API surface:
     //   SBWorkspace: only 19 methods, NO defaultWorkspace / openApplicationWithBundleID:
@@ -276,6 +294,25 @@ static char kRBRowAssociationKey;
     if (!uiCtrl && uiCtrlCls && [uiCtrlCls respondsToSelector:@selector(sharedInstance)]) {
         uiCtrl = [uiCtrlCls performSelector:@selector(sharedInstance)];
     }
+    // 0.2.15: try the REAL switcher activation path first. FlexiSPY hooks
+    // SBUIController activateApplicationFromSwitcher: with an SBApplication
+    // argument -- this is the in-process "switch to app" call the system uses.
+    // activate5 (Path B below) exists on iOS 16 but 0.2.14 proved on-device that
+    // it does NOT bring the app to the foreground by itself.
+    SEL switcherSel = sel_registerName("activateApplicationFromSwitcher:");
+    if (sbApp && uiCtrl && [uiCtrl respondsToSelector:switcherSel]) {
+        @try {
+            ((void (*)(id, SEL, id))objc_msgSend)(uiCtrl, switcherSel, sbApp);
+            RBLog(@"open via switcher activation bundle=%@ sbApp=%d", bundle, (int)(sbApp != nil));
+        } @catch (NSException *ex) {
+            RBLog(@"open switcher threw %@", NSStringFromClass([ex class]));
+        }
+    } else {
+        RBLog(@"open switcher skip app=%d ui=%d sel=%d",
+              (int)(sbApp != nil), (int)(uiCtrl != nil),
+              (int)(uiCtrl && [uiCtrl respondsToSelector:switcherSel]));
+    }
+
     SEL activateSel = sel_registerName("activateApplication:fromIcon:location:activationSettings:actions:");
     if (sbApp && uiCtrl && [uiCtrl respondsToSelector:activateSel]) {
         NSMethodSignature *sig = [uiCtrl methodSignatureForSelector:activateSel];
