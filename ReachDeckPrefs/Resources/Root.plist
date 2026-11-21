@@ -84,73 +84,73 @@
 			<key>label</key>
 			<string>卡片样式</string>
 			<key>footerText</key>
-			<string>调整后立即生效，下次划出便捷访问即可看到。默认值与原来一致。</string>
+			<string>调整后下次划出便捷访问即可看到。默认值与原来一致。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
-			<string>PSGroupCell</string>
+			<string>PSStaticTextCell</string>
+			<key>cellClass</key>
+			<string>RDSliderCell</string>
+			<key>height</key>
+			<real>76.0</real>
 			<key>label</key>
-			<string>背景不透明度（数值越大越不透明，默认 72）</string>
-		</dict>
-		<dict>
-			<key>cell</key>
-			<string>PSSliderCell</string>
-			<key>key</key>
+			<string>背景不透明度</string>
+			<key>preferenceKey</key>
 			<string>cardOpacity</string>
-			<key>defaults</key>
-			<string>com.zlhkf.ReachDeck</string>
-			<key>default</key>
-			<integer>72</integer>
-			<key>min</key>
-			<integer>20</integer>
-			<key>max</key>
-			<integer>100</integer>
-			<key>showValue</key>
-			<true/>
+			<key>minimumValue</key>
+			<real>20</real>
+			<key>maximumValue</key>
+			<real>100</real>
+			<key>defaultValue</key>
+			<real>72</real>
+			<key>inputStep</key>
+			<real>1</real>
+			<key>valueStyle</key>
+			<string>percent</string>
 		</dict>
 		<dict>
 			<key>cell</key>
-			<string>PSGroupCell</string>
+			<string>PSStaticTextCell</string>
+			<key>cellClass</key>
+			<string>RDSliderCell</string>
+			<key>height</key>
+			<real>76.0</real>
 			<key>label</key>
-			<string>圆角大小（数值越大越圆润，默认 16）</string>
-		</dict>
-		<dict>
-			<key>cell</key>
-			<string>PSSliderCell</string>
-			<key>key</key>
+			<string>圆角大小</string>
+			<key>preferenceKey</key>
 			<string>cardCorner</string>
-			<key>defaults</key>
-			<string>com.zlhkf.ReachDeck</string>
-			<key>default</key>
-			<integer>16</integer>
-			<key>min</key>
-			<integer>0</integer>
-			<key>max</key>
-			<integer>24</integer>
-			<key>showValue</key>
-			<true/>
+			<key>minimumValue</key>
+			<real>0</real>
+			<key>maximumValue</key>
+			<real>24</real>
+			<key>defaultValue</key>
+			<real>16</real>
+			<key>inputStep</key>
+			<real>1</real>
+			<key>valueStyle</key>
+			<string>points</string>
 		</dict>
 		<dict>
 			<key>cell</key>
-			<string>PSGroupCell</string>
+			<string>PSStaticTextCell</string>
+			<key>cellClass</key>
+			<string>RDSliderCell</string>
+			<key>height</key>
+			<real>76.0</real>
 			<key>label</key>
-			<string>白色描边宽度（0 为无描边，默认 1）</string>
-		</dict>
-		<dict>
-			<key>cell</key>
-			<string>PSSliderCell</string>
-			<key>key</key>
+			<string>白色描边宽度</string>
+			<key>preferenceKey</key>
 			<string>cardBorder</string>
-			<key>defaults</key>
-			<string>com.zlhkf.ReachDeck</string>
-			<key>default</key>
-			<integer>1</integer>
-			<key>min</key>
-			<integer>0</integer>
-			<key>max</key>
-			<integer>3</integer>
-			<key>showValue</key>
-			<true/>
+			<key>minimumValue</key>
+			<real>0</real>
+			<key>maximumValue</key>
+			<real>3</real>
+			<key>defaultValue</key>
+			<real>1</real>
+			<key>inputStep</key>
+			<real>1</real>
+			<key>valueStyle</key>
+			<string>plain</string>
 		</dict>
 		<dict>
 			<key>cell</key>
