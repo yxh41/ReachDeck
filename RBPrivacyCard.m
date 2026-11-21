@@ -232,25 +232,44 @@ static char kRBRowAssociationKey;
         RBLog(@"open app skipped: selector missing");
         return;
     }
-    // 0.2.9: the 0.2.8 field log killed the "wait for the sheet animation" theory --
-    // immediate ok=0 AND retry ok=0, yet the app does launch (user: "opens, just slow").
-    // ok=0 is just caller validation on a LaunchServices call made from SpringBoard,
-    // not a failure. The 0.6s retry only adds delay and a duplicate request, so drop it.
-    // Collapse the Reachability sheet first so the app can come forward faster.
-    // Selectors are taken from the field-verified ReachPlayer reference (Tweak.h:81-83);
-    // performSelector + respondsToSelector: guards avoid compile-time deps / iOS drift.
+    // 0.2.10: 0.2.9 used deactivateReachability (an internal method) first -- it did
+    // fire but the app still took seconds. ReachPlayer, the field-verified reference,
+    // NEVER calls deactivateReachability on-device: it always uses toggleReachability
+    // guarded by reachabilityModeActive (Tweak.xm:23/34/223). While reachability is
+    // still active SpringBoard suppresses/queues ordinary app activation, which is
+    // exactly the "ok=0 but opens seconds later" symptom. Toggle OUT first.
+    // Probe active state after the toggle so the next field log tells us whether the
+    // sheet left the mode immediately (activation race) or lingered (manager issue).
     Class mgrCls = objc_getClass("SBReachabilityManager");
     id mgr = mgrCls ? [mgrCls performSelector:@selector(sharedInstance)] : nil;
-    if ([mgr respondsToSelector:@selector(deactivateReachability)]) {
-        [mgr performSelector:@selector(deactivateReachability)];
-        RBLog(@"collapse: deactivateReachability");
-    } else if ([mgr respondsToSelector:@selector(reachabilityModeActive)] &&
-               [mgr respondsToSelector:@selector(toggleReachability)] &&
-               ((BOOL (*)(id, SEL))objc_msgSend)(mgr, @selector(reachabilityModeActive))) {
+    if (mgr && [mgr respondsToSelector:@selector(reachabilityModeActive)] &&
+        [mgr respondsToSelector:@selector(toggleReachability)] &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(mgr, @selector(reachabilityModeActive))) {
         [mgr performSelector:@selector(toggleReachability)];
         RBLog(@"collapse: toggleReachability");
+    } else if (mgr && [mgr respondsToSelector:@selector(deactivateReachability)]) {
+        [mgr performSelector:@selector(deactivateReachability)];
+        RBLog(@"collapse: deactivateReachability fallback");
     } else {
         RBLog(@"collapse skipped: no selector");
+    }
+
+    // Sample reachabilityModeActive over the next 2s to prove the sheet actually
+    // left the mode. active=0 right after toggle => collapse works, slowness is
+    // LaunchServices; active stays 1 => toggle did not take, need a different exit.
+    NSArray *probeDelays = @[@0.1, @0.3, @0.6, @1.0, @2.0];
+    for (NSNumber *d in probeDelays) {
+        double delay = d.doubleValue;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            Class c = objc_getClass("SBReachabilityManager");
+            id probeMgr = c ? [c performSelector:@selector(sharedInstance)] : nil;  // process singleton
+            BOOL active = NO;
+            if (probeMgr && [probeMgr respondsToSelector:@selector(reachabilityModeActive)]) {
+                active = ((BOOL (*)(id, SEL))objc_msgSend)(probeMgr, @selector(reachabilityModeActive));
+            }
+            RBLog(@"collapse probe +%.1fs active=%d", delay, (int)active);
+        });
     }
 
     BOOL ok = [ws openApplicationWithBundleID:bundle];
