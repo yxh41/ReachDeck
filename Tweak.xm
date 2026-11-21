@@ -96,6 +96,7 @@ static BOOL rbHideSystemServices = NO;
 static BOOL rbCardAtBottom = YES;         // 0.2.1: derived from cardAtTop (default off => bottom)
 static NSArray<id<RBCard>> *rbCards = nil;
 static UIView *rbContainer = nil;        // container mounted inside _topWallpaperEffectView
+static NSUInteger rbHitTestLogCount = 0; // bounded self-evidence for the touch bridge
 
 // Rebuild the active card list from prefs. Cards are created once and reused; only
 // membership changes. This keeps sensor state intact across preference toggles.
@@ -300,6 +301,7 @@ static void RBReloadSettings(void) {
     }
 
     rbContainer = container;
+    rbHitTestLogCount = 0;
     [topEffect bringSubviewToFront:container];
     RBLog(@"addRBContainer mounted host=%@ container=%@ inWindow=%@ bottom=%d",
           NSStringFromClass([topEffect class]), NSStringFromCGRect(container.frame),
@@ -386,8 +388,16 @@ static void RBReloadSettings(void) {
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *candidate = %orig;
-    if (!rbTopEffect || !rbContainer || !candidate) return candidate;
-    if ([candidate isDescendantOfView:rbContainer]) return candidate;
+    if (!rbTopEffect || !rbContainer) return candidate;
+    if (candidate && [candidate isDescendantOfView:rbContainer]) return candidate;
+
+    // 0.2.6 FIX: %orig is usually nil in the exposed band (exactly the case
+    // ReachPlayer handles when arg1.y <= 0). Never bail on nil before bridging.
+    if (rbHitTestLogCount < 4) {
+        RBLog(@"hitTest bridge call point=%@ candidate=%@",
+              NSStringFromCGPoint(point), candidate ? NSStringFromClass([candidate class]) : @"nil");
+        rbHitTestLogCount++;
+    }
 
     CGPoint local = [rbTopEffect convertPoint:point fromView:self];
     UIView *inner = [rbTopEffect hitTest:local withEvent:event];
