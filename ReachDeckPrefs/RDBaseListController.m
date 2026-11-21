@@ -1,5 +1,6 @@
 #import "RDBaseListController.h"
 #import <objc/runtime.h>
+#import <stdarg.h>
 
 #define RD_NOTIFY "com.zlhkf.ReachDeck.settings"
 
@@ -9,7 +10,29 @@
 // be silently lost. Keep the two files byte-for-byte identical in logic.
 #define RDPlistPath ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences"] ? @"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist" : @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.plist")
 
-static char kRDValueNormalizedKey;
+// Preferences is a separate process from SpringBoard. Write into the SAME
+// debug.log the tweak uses so the user can grab one file and see both sides.
+// Prefix every line with [Prefs] to tell them apart.
+static void RDPrefsLog(NSString * _Nonnull fmt, ...) {
+    va_list args; va_start(args, fmt);
+    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *path = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Library/Preferences"]
+        ? @"/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.debug.log"
+        : @"/var/jb/var/mobile/Library/Preferences/com.zlhkf.ReachDeck.debug.log";
+    NSString *line = [NSString stringWithFormat:@"[Prefs] %@\n", body];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
+static char kRDValueLabelKey;
+static char kRDSliderHookedKey;
 
 @implementation RDBaseListController
 
@@ -34,13 +57,20 @@ static char kRDValueNormalizedKey;
         CFSTR(RD_NOTIFY), NULL, NULL, TRUE);
 }
 
-#pragma mark - slider value label: integers, clear of the rounded corner
+#pragma mark - slider value label
 
-// Native PSSliderCell renders showValue with "%.1f" and pins it to the grouped
-// cell's right edge where the corner clips the last digit (20.0 -> "20.C").
-// We cannot subclass PSSliderCell: the roothide SDK neither ships its header
-// nor exports _OBJC_CLASS_$_PSSliderCell for linking. Instead we recognise the
-// cell at runtime by name and decorate it in place, using only public UIKit.
+// Native PSSliderCell renders showValue with "%.1f" and pins the value label to
+// the grouped cell's right edge, where the rounded corner clips the last digit.
+// Prior attempts nudged that label with a transform (-9pt, then a computed
+// shift), but at cellForRow time the cell is not laid out yet and the native
+// label can be re-laid-out/reused later, so the nudge was lost or wrong on
+// device. We cannot subclass PSSliderCell either: the roothide SDK neither ships
+// its header nor exports _OBJC_CLASS_$_PSSliderCell for linking.
+//
+// Final approach: hide the native value label and install OUR OWN label pinned
+// by Auto Layout to contentView.trailing - 16 (well clear of the corner). The
+// integer text is taken straight from slider.value on every change. Auto Layout
+// constraints survive cell reuse and re-layout, so this is stable.
 
 - (UITableViewCell *)tableView:(UITableView *)tableView
          cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -48,82 +78,95 @@ static char kRDValueNormalizedKey;
     // cellForRowAtIndexPath, so calling super is safe. willDisplayCell: is an
     // OPTIONAL delegate method the superclass chain may not implement.
     UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
-    [self rd_normalizeSliderCell:cell];
+    [self rd_setupValueLabelInCell:cell];
     return cell;
 }
 
-- (void)rd_normalizeSliderCell:(UITableViewCell *)cell {
+- (UISlider *)rd_sliderInCell:(UITableViewCell *)cell {
+    for (UIView *v in cell.contentView.subviews) {
+        if ([v isKindOfClass:[UISlider class]]) return (UISlider *)v;
+    }
+    return nil;
+}
+
+- (void)rd_setupValueLabelInCell:(UITableViewCell *)cell {
     Class sliderCellCls = NSClassFromString(@"PSSliderCell");
     if (!sliderCellCls || ![cell isKindOfClass:sliderCellCls]) return;
-
-    UISlider *slider = nil;
-    for (UIView *v in cell.contentView.subviews) {
-        if ([v isKindOfClass:[UISlider class]]) { slider = (UISlider *)v; break; }
-    }
+    UISlider *slider = [self rd_sliderInCell:cell];
     if (!slider) return;
 
-    if (!objc_getAssociatedObject(cell, &kRDValueNormalizedKey)) {
-        // The system target (added at cell init) runs first and sets "%.1f";
-        // ours runs after and rewrites the label as an integer.
+    // Hide the native (%.1f, corner-clipped) label. Identify it as any non-title
+    // UILabel whose text is purely numeric; detailTextLabel is the usual one.
+    NSCharacterSet *bad = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789.-"] invertedSet];
+    NSMutableArray *numericLabels = [NSMutableArray array];
+    UILabel *detail = cell.detailTextLabel;
+    if (detail) [numericLabels addObject:detail];
+    for (UIView *v in cell.contentView.subviews) {
+        if ([v isKindOfClass:[UILabel class]] &&
+            v != cell.textLabel &&
+            ![numericLabels containsObject:v]) {
+            [numericLabels addObject:v];
+        }
+    }
+    for (UILabel *lab in numericLabels) {
+        NSString *t = lab.text ?: @"";
+        if (t.length > 0 && [t rangeOfCharacterFromSet:bad].location == NSNotFound) {
+            lab.hidden = YES;
+        }
+    }
+
+    // Install our own persistent label once per cell (cells are reused).
+    UILabel *mine = objc_getAssociatedObject(cell, &kRDValueLabelKey);
+    if (!mine) {
+        mine = [[UILabel alloc] init];
+        mine.font = [UIFont systemFontOfSize:13.0];
+        mine.textColor = [UIColor darkGrayColor];
+        mine.textAlignment = NSTextAlignmentRight;
+        mine.translatesAutoresizingMaskIntoConstraints = NO;
+        [cell.contentView addSubview:mine];
+        // trailing -16 keeps it inside the grouped cell, clear of the corner;
+        // >= 28pt width fits 2-3 digits; centre vertically like the native one.
+        [NSLayoutConstraint activateConstraints:@[
+            [mine.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16.0],
+            [mine.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
+            [mine.widthAnchor constraintGreaterThanOrEqualToConstant:28.0],
+        ]];
+        objc_setAssociatedObject(cell, &kRDValueLabelKey, mine, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    if (!objc_getAssociatedObject(cell, &kRDSliderHookedKey)) {
+        // The system target (added at cell init) updates the now-hidden native
+        // label; ours updates our own label from slider.value afterwards.
         [slider addTarget:self
                    action:@selector(rd_sliderValueChanged:)
          forControlEvents:UIControlEventValueChanged];
-        objc_setAssociatedObject(cell, &kRDValueNormalizedKey, @YES,
+        objc_setAssociatedObject(cell, &kRDSliderHookedKey, @YES,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    [self rd_rewriteValueLabelInCell:cell];
+    [self rd_updateValueLabelInCell:cell];
+
+    RDPrefsLog(@"cell=%@ nativeLabels=%lu value=%.1f",
+               NSStringFromClass([cell class]), (unsigned long)numericLabels.count, slider.value);
 }
 
 - (void)rd_sliderValueChanged:(UISlider *)slider {
     UIView *cv = slider.superview;
     id cell = cv.superview;
     if ([cell isKindOfClass:[UITableViewCell class]]) {
-        [self rd_rewriteValueLabelInCell:(UITableViewCell *)cell];
+        [self rd_updateValueLabelInCell:(UITableViewCell *)cell];
     }
 }
 
-- (void)rd_rewriteValueLabelInCell:(UITableViewCell *)cell {
-    NSMutableArray *cands = [NSMutableArray array];
-    UILabel *detail = cell.detailTextLabel;
-    if (detail) [cands addObject:detail];
-    for (UIView *v in cell.contentView.subviews) {
-        if ([v isKindOfClass:[UILabel class]] &&
-            v != cell.textLabel &&
-            ![cands containsObject:v]) {
-            [cands addObject:v];
-        }
-    }
-    NSCharacterSet *bad = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789.-"] invertedSet];
-    for (UILabel *lab in cands) {
-        NSString *t = lab.text ?: @"";
-        // Only touch purely numeric labels so the slider title is never moved.
-        if (t.length == 0 || [t rangeOfCharacterFromSet:bad].location != NSNotFound) continue;
-        NSString *s = [NSString stringWithFormat:@"%ld", (long)([t doubleValue] + 0.5)];
-        if (![s isEqualToString:t]) lab.text = s;
-        // Place the label a fixed safe distance from the host's right edge so the
-        // last digit never lands in the grouped cell's rounded corner. A hardcoded
-        // nudge was not enough on device (digit still clipped), and the system
-        // pins the label at a different spot on each font size / device, so derive
-        // the shift from the ACTUAL layout instead.
-        // Use center + bounds, NOT frame: frame already includes our transform, so
-        // reading it after a previous pass would double-count the shift. center
-        // and bounds are the untransformed layout values and stay stable. Anchor
-        // point of a UILabel is (0.5, 0.5), hence right edge = center.x + w/2.
-        CGFloat hostW = lab.superview.bounds.size.width;
-        if (hostW > 0.0) {
-            CGFloat naturalRight = lab.center.x + lab.bounds.size.width / 2.0;
-            CGFloat targetRight = hostW - 20.0;          // clear the corner region
-            CGFloat shift = naturalRight - targetRight;
-            if (shift < 0.0) shift = 0.0;                // never shift right
-            if (shift > 26.0) shift = 26.0;              // never crowd the slider
-            // transform applies after Auto Layout → won't fight cell constraints.
-            CGAffineTransform want = CGAffineTransformMakeTranslation(-shift, 0.0);
-            if (!CGAffineTransformEqualToTransform(lab.transform, want)) {
-                lab.transform = want;
-            }
-            NSLog(@"[ReachDeckPrefs] slider label shift=%.1f naturalRight=%.1f hostW=%.1f",
-                  shift, naturalRight, hostW);
-        }
+- (void)rd_updateValueLabelInCell:(UITableViewCell *)cell {
+    UILabel *mine = objc_getAssociatedObject(cell, &kRDValueLabelKey);
+    if (!mine) return;
+    UISlider *slider = [self rd_sliderInCell:cell];
+    if (!slider) return;
+    long iv = (long)(slider.value + 0.5);
+    NSString *s = [NSString stringWithFormat:@"%ld", iv];
+    if (![s isEqualToString:mine.text]) {
+        mine.text = s;
+        RDPrefsLog(@"value label=%@ frame=%@", s, NSStringFromCGRect(mine.frame));
     }
 }
 
