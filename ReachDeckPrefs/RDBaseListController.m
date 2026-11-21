@@ -100,11 +100,29 @@ static char kRDValueNormalizedKey;
         if (t.length == 0 || [t rangeOfCharacterFromSet:bad].location != NSNotFound) continue;
         NSString *s = [NSString stringWithFormat:@"%ld", (long)([t doubleValue] + 0.5)];
         if (![s isEqualToString:t]) lab.text = s;
-        // transform applies after Auto Layout, so it won't fight cell constraints;
-        // -9pt clears the grouped-cell rounded corner.
-        CGAffineTransform want = CGAffineTransformMakeTranslation(-9.0, 0.0);
-        if (!CGAffineTransformEqualToTransform(lab.transform, want)) {
-            lab.transform = want;
+        // Place the label a fixed safe distance from the host's right edge so the
+        // last digit never lands in the grouped cell's rounded corner. A hardcoded
+        // nudge was not enough on device (digit still clipped), and the system
+        // pins the label at a different spot on each font size / device, so derive
+        // the shift from the ACTUAL layout instead.
+        // Use center + bounds, NOT frame: frame already includes our transform, so
+        // reading it after a previous pass would double-count the shift. center
+        // and bounds are the untransformed layout values and stay stable. Anchor
+        // point of a UILabel is (0.5, 0.5), hence right edge = center.x + w/2.
+        CGFloat hostW = lab.superview.bounds.size.width;
+        if (hostW > 0.0) {
+            CGFloat naturalRight = lab.center.x + lab.bounds.size.width / 2.0;
+            CGFloat targetRight = hostW - 20.0;          // clear the corner region
+            CGFloat shift = naturalRight - targetRight;
+            if (shift < 0.0) shift = 0.0;                // never shift right
+            if (shift > 26.0) shift = 26.0;              // never crowd the slider
+            // transform applies after Auto Layout → won't fight cell constraints.
+            CGAffineTransform want = CGAffineTransformMakeTranslation(-shift, 0.0);
+            if (!CGAffineTransformEqualToTransform(lab.transform, want)) {
+                lab.transform = want;
+            }
+            NSLog(@"[ReachDeckPrefs] slider label shift=%.1f naturalRight=%.1f hostW=%.1f",
+                  shift, naturalRight, hostW);
         }
     }
 }
