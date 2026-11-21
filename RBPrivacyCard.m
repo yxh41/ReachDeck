@@ -232,7 +232,17 @@ static char kRBRowAssociationKey;
         return;
     }
     BOOL ok = [ws openApplicationWithBundleID:bundle];
-    RBLog(@"open app bundle=%@ ok=%d", bundle, (int)ok);
+    RBLog(@"open app immediate bundle=%@ ok=%d", bundle, (int)ok);
+    if (ok) return;
+
+    // 0.2.8: field logs show LaunchServices rejects the open while the
+    // Reachability sheet is still animating (ok=0 on every tap). Retry once
+    // after it settles so a single tap still launches the app.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        BOOL retry = [ws openApplicationWithBundleID:bundle];
+        RBLog(@"open app retry bundle=%@ ok=%d", bundle, (int)retry);
+    });
 }
 
 - (void)rbCopyBundle:(UILongPressGestureRecognizer *)gesture {
