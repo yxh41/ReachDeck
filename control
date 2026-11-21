@@ -1,6 +1,6 @@
 Package: com.zlhkf.reachdeck
 Name: ReachDeck
-Version: 0.2.29
+Version: 0.2.30
 Architecture: iphoneos-arm64e
 Description: Pluggable HUD cards in the Reachability window, starting with a privacy indicator showing which app is using the camera or microphone.
 Maintainer: zlhkf

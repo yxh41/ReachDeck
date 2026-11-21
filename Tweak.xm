@@ -359,6 +359,15 @@ static void RBReloadSettings(void) {
 + (BOOL)reachabilitySupported { return YES; }
 - (BOOL)reachabilityEnabled { return YES; }
 - (void)setReachabilityEnabled:(BOOL)v { %orig(YES); }
+// 0.2.30 diagnostic: prove WHO collapses reachability. If this fires right
+// after "row menu show" with no "collapse: deactivateReachability" from our
+// own launch path, the SYSTEM dismiss gesture is to blame (overlay inserted
+// mid-touch). After moving menu display to UIGestureRecognizerStateEnded it
+// should no longer fire on a bare long-press.
+- (void)deactivateReachability {
+    RBLog(@"deactivate reached (system or app launch)");
+    %orig;
+}
 %end
 
 %hook SBApplication

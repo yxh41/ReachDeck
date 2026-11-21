@@ -579,8 +579,11 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
 // HOST (container/stack), not to the clipped card root, so it is never cut off
 // and never rebuilt by renderRows. RDB2 tag lets the hitTest bridge accept it.
 - (void)rbShowRowMenu:(UILongPressGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateBegan) return;
-    RBLog(@"row longpress fired");
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        RBLog(@"row longpress fired");
+        return; // 0.2.30: show on Ended only, after the finger is lifted.
+    }
+    if (gesture.state != UIGestureRecognizerStateEnded) return;
 
     NSDictionary *row = objc_getAssociatedObject(gesture, &kRBLongPressRowKey);
     NSString *bundle = row[@"bundle"] ?: @"";
