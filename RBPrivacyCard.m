@@ -231,18 +231,29 @@ static char kRBRowAssociationKey;
         RBLog(@"open app skipped: selector missing");
         return;
     }
-    BOOL ok = [ws openApplicationWithBundleID:bundle];
-    RBLog(@"open app immediate bundle=%@ ok=%d", bundle, (int)ok);
-    if (ok) return;
+    // 0.2.9: the 0.2.8 field log killed the "wait for the sheet animation" theory --
+    // immediate ok=0 AND retry ok=0, yet the app does launch (user: "opens, just slow").
+    // ok=0 is just caller validation on a LaunchServices call made from SpringBoard,
+    // not a failure. The 0.6s retry only adds delay and a duplicate request, so drop it.
+    // Collapse the Reachability sheet first so the app can come forward faster.
+    // Selectors are taken from the field-verified ReachPlayer reference (Tweak.h:81-83);
+    // performSelector + respondsToSelector: guards avoid compile-time deps / iOS drift.
+    Class mgrCls = objc_getClass("SBReachabilityManager");
+    id mgr = mgrCls ? [mgrCls performSelector:@selector(sharedInstance)] : nil;
+    if ([mgr respondsToSelector:@selector(deactivateReachability)]) {
+        [mgr performSelector:@selector(deactivateReachability)];
+        RBLog(@"collapse: deactivateReachability");
+    } else if ([mgr respondsToSelector:@selector(reachabilityModeActive)] &&
+               [mgr respondsToSelector:@selector(toggleReachability)] &&
+               ((BOOL (*)(id, SEL))objc_msgSend)(mgr, @selector(reachabilityModeActive))) {
+        [mgr performSelector:@selector(toggleReachability)];
+        RBLog(@"collapse: toggleReachability");
+    } else {
+        RBLog(@"collapse skipped: no selector");
+    }
 
-    // 0.2.8: field logs show LaunchServices rejects the open while the
-    // Reachability sheet is still animating (ok=0 on every tap). Retry once
-    // after it settles so a single tap still launches the app.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        BOOL retry = [ws openApplicationWithBundleID:bundle];
-        RBLog(@"open app retry bundle=%@ ok=%d", bundle, (int)retry);
-    });
+    BOOL ok = [ws openApplicationWithBundleID:bundle];
+    RBLog(@"open app bundle=%@ ok=%d", bundle, (int)ok);
 }
 
 - (void)rbCopyBundle:(UILongPressGestureRecognizer *)gesture {

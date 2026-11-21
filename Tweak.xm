@@ -160,6 +160,8 @@ static void RBReloadSettings(void) {
 @interface SBReachabilityManager : NSObject
 + (id)sharedInstance;
 - (void)toggleReachability;
+- (BOOL)reachabilityModeActive;
+- (void)deactivateReachability;
 - (void)_notifyObserversReachabilityYOffsetDidChange;
 @end
 
@@ -233,6 +235,10 @@ static void RBReloadSettings(void) {
     %orig;
     rbLiveController = nil;
     rbTopEffect = nil;
+    // 0.2.9: sticky row is a retained pointer into the container. Clear it on
+    // teardown too, otherwise collapsing the sheet can leave a dangling pointer
+    // that the next hitTest message-sends (SpringBoard crash / Safe Mode).
+    rbStickyRow = nil;
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 }
 
@@ -260,6 +266,10 @@ static void RBReloadSettings(void) {
     // window hitTest bridge below cannot reach our card rows.
     topEffect.userInteractionEnabled = YES;
 
+    // 0.2.9: sticky row is a retained pointer into the container. Clear it on
+    // teardown too, otherwise collapsing the sheet can leave a dangling pointer
+    // that the next hitTest message-sends (SpringBoard crash / Safe Mode).
+    rbStickyRow = nil;
     if (rbContainer) { [rbContainer removeFromSuperview]; rbContainer = nil; }
 
     // ReachPlayer: frame = host.bounds + four equal edge constraints.
