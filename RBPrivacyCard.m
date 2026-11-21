@@ -398,16 +398,25 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     }
 
     // Path B: LSApplicationWorkspace openApplicationWithBundleID: -- the ONLY
-    // path that verifiably launched the app in 0.2.7~0.2.12. 0.2.13's mistake was
-    // skipping it whenever activate5 "succeeded" (it didn't actually work).
-    // Fire it UNCONDITIONALLY now: activate5 (fast switch-to) and LS (reliable
-    // launch) both run; whichever takes effect wins. ok=0 from LS is a known
-    // caller-validation false negative -- the app did launch on every prior build.
+    // path that verifiably launches the app. 0.2.17 field log was decisive:
+    //   +34027ms activate5 returned (19ms)
+    //   +44031ms openApplicationWithBundleID: returned  -> BLOCKED 10004ms
+    // Calling LS synchronously from inside SpringBoard self-deadlocks: the XPC
+    // activation callback must be serviced on SpringBoard's own main runloop,
+    // which is stuck waiting for this very call to return. ok=0 is the timeout,
+    // not a "false negative". That 10s main-thread stall is the entire delay --
+    // it also freezes the activate5/FBS activation transaction issued above.
+    // FIX (0.2.18): fire LS ASYNCHRONOUSLY. The XPC request still goes out, but
+    // the main thread is released immediately so the activation transaction can
+    // be serviced at once. Keep activate5/FBS on the main thread (instant).
     Class lsCls = objc_getClass("LSApplicationWorkspace");
     LSApplicationWorkspace *ls = (LSApplicationWorkspace *)[lsCls performSelector:@selector(defaultWorkspace)];
     if ([ls respondsToSelector:@selector(openApplicationWithBundleID:)]) {
-        BOOL ok = [ls openApplicationWithBundleID:bundle];
-        RBLog(@"open app LS bundle=%@ ok=%d activateTried=%d", bundle, (int)ok, (int)activateTried);
+        RBLog(@"open app LS dispatched bundle=%@ activateTried=%d", bundle, (int)activateTried);
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            BOOL ok = [ls openApplicationWithBundleID:bundle];
+            RBLog(@"open app LS returned bundle=%@ ok=%d", bundle, (int)ok);
+        });
     }
 
     // 0.2.17 DIAGNOSTIC ONLY: pulse the target app's activation state every
@@ -438,7 +447,7 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     NSInteger n = ++rbPulseCount;
 
     NSString *st = @"?";
-    NSArray *keys = @[@"activationState", @"isActive", @"activated"];
+    NSArray *keys = @[@"_activationState", @"activationState", @"isActive", @"activated"];
     for (NSString *k in keys) {
         @try {
             id v = [app valueForKey:k];
