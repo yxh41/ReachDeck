@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <objc/runtime.h>
 #import <stdarg.h>
 #import <stdlib.h>
@@ -19,8 +20,13 @@ extern "C"
 #endif
 void RBLog(NSString * _Nonnull fmt, ...) {
     va_list args; va_start(args, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:args];
     va_end(args);
+    // 0.2.17: relative ms since process start, so the 5s gap can be localized.
+    static CFAbsoluteTime t0 = 0;
+    if (t0 == 0) t0 = CFAbsoluteTimeGetCurrent();
+    long ms = (long)((CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+    NSString *msg = [NSString stringWithFormat:@"+%ldms %@", ms, body];
     NSLog(@"[ReachDeck] %@", msg);
     NSString *line = [msg stringByAppendingString:@"\n"];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:RBLogPath()];

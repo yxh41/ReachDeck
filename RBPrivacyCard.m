@@ -406,6 +406,39 @@ static char kRBRowAssociationKey;
         BOOL ok = [ls openApplicationWithBundleID:bundle];
         RBLog(@"open app LS bundle=%@ ok=%d activateTried=%d", bundle, (int)ok, (int)activateTried);
     }
+
+    // 0.2.17 DIAGNOSTIC ONLY: pulse the target app's activation state every
+    // 0.5s for 6s. All request APIs above return within the same millisecond;
+    // this reveals WHERE the reported ~5s actually goes:
+    //   state flips to active at +5s  -> SpringBoard transaction queue
+    //   state active at +0.5s but UI appears at +5s -> app COLD START (not fixable
+    //      from a tweak; it is the app's own launch/first-frame cost)
+    //   state stays inactive          -> none of the activation calls worked
+    __block int pulse = 0;
+    __block id pulseApp = [sbApp retain];   // MRC: block capture does not retain
+    __block void (^pulseBlock)(void);
+    pulseBlock = ^{
+        NSString *st = @"?";
+        NSArray *keys = @[@"activationState", @"isActive", @"activated"];
+        for (NSString *k in keys) {
+            @try {
+                id v = [pulseApp valueForKey:k];
+                if (v) { st = [NSString stringWithFormat:@"%@=%@", k, v]; break; }
+            } @catch (NSException *ex) {
+                st = [NSString stringWithFormat:@"%@-threw", k];
+            }
+        }
+        RBLog(@"launch pulse #%d bundle=%@ state=%@", pulse, bundle, st);
+        pulse++;
+        if (pulse <= 12) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), pulseBlock);
+        } else {
+            [pulseApp release];
+            pulseApp = nil;
+        }
+    };
+    pulseBlock();
 }
 
 - (void)rbCopyBundle:(UILongPressGestureRecognizer *)gesture {
