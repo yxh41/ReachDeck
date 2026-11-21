@@ -313,6 +313,58 @@ static char kRBRowAssociationKey;
               (int)(uiCtrl && [uiCtrl respondsToSelector:switcherSel]));
     }
 
+    // 0.2.16: 0.2.15 field log proved iOS 16 has NO
+    // activateApplicationFromSwitcher: on SBUIController (sel=0). Dump every
+    // activation/launch selector the REAL class exposes once, so the next run
+    // tells us exactly what is available instead of guessing again.
+    static dispatch_once_t rbProbeOnce;
+    dispatch_once(&rbProbeOnce, ^{
+        if (uiCtrl) {
+            unsigned int mcount = 0;
+            Method *mlist = class_copyMethodList([uiCtrl class], &mcount);
+            NSMutableArray *hits = [NSMutableArray array];
+            for (unsigned int i = 0; i < mcount; i++) {
+                NSString *mn = NSStringFromSelector(method_getName(mlist[i]));
+                if ([mn rangeOfString:@"activate" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [mn rangeOfString:@"launch" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [mn rangeOfString:@"openApp" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    [hits addObject:mn];
+                }
+            }
+            free(mlist);
+            RBLog(@"probe SBUIController methods=%u activation=%@",
+                  mcount, [hits componentsJoinedByString:@","]);
+        }
+    });
+
+    // 0.2.16: FBSSystemService is the FrontBoard-side in-process actuator and
+    // iOS 16 headers confirm -openApplication:options:withResult:. Try it with
+    // the bundle id (NOT an SBApplication) and an empty options dict. The result
+    // block is declared id; pass a zero-arg block -- ObjC callers ignore extra
+    // arguments, so this cannot crash whatever the real block signature is.
+    Class fbsCls = objc_getClass("FBSSystemService");
+    id fbsSvc = nil;
+    if (fbsCls && [fbsCls respondsToSelector:@selector(sharedService)]) {
+        fbsSvc = [fbsCls performSelector:@selector(sharedService)];
+    }
+    if (!fbsSvc && fbsCls && [fbsCls respondsToSelector:@selector(sharedInstance)]) {
+        fbsSvc = [fbsCls performSelector:@selector(sharedInstance)];
+    }
+    SEL fbsSel = sel_registerName("openApplication:options:withResult:");
+    if (fbsSvc && [fbsSvc respondsToSelector:fbsSel]) {
+        @try {
+            void (^noop)(void) = ^{};
+            ((void (*)(id, SEL, id, id, id))objc_msgSend)(fbsSvc, fbsSel, bundle, @{}, noop);
+            RBLog(@"open via FBSSystemService bundle=%@ svc=%d", bundle, (int)(fbsSvc != nil));
+        } @catch (NSException *ex) {
+            RBLog(@"open FBS threw %@", NSStringFromClass([ex class]));
+        }
+    } else {
+        RBLog(@"open FBS skip cls=%d svc=%d sel=%d",
+              (int)(fbsCls != nil), (int)(fbsSvc != nil),
+              (int)(fbsSvc && [fbsSvc respondsToSelector:fbsSel]));
+    }
+
     SEL activateSel = sel_registerName("activateApplication:fromIcon:location:activationSettings:actions:");
     if (sbApp && uiCtrl && [uiCtrl respondsToSelector:activateSel]) {
         NSMethodSignature *sig = [uiCtrl methodSignatureForSelector:activateSel];
