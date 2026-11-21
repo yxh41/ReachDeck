@@ -532,9 +532,11 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
         toast.alpha = 0.0;
         [root addSubview:toast];
         CGFloat pad = _styleCompact ? 8 : 10;
+        // 0.2.26: pin to the TOP of the card. Long-press happens on a row in the
+        // lower part of the card, so a bottom toast sat right under the finger.
         [NSLayoutConstraint activateConstraints:@[
             [toast.centerXAnchor constraintEqualToAnchor:root.centerXAnchor],
-            [toast.bottomAnchor constraintEqualToAnchor:root.bottomAnchor constant:-pad],
+            [toast.topAnchor constraintEqualToAnchor:root.topAnchor constant:pad],
             [toast.leadingAnchor constraintGreaterThanOrEqualToAnchor:root.leadingAnchor constant:pad],
             [toast.trailingAnchor constraintLessThanOrEqualToAnchor:root.trailingAnchor constant:-pad],
             [toast.heightAnchor constraintGreaterThanOrEqualToConstant:26],
@@ -542,9 +544,10 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
         self.toastLabel = toast;
     }
 
-    // Trim the display string so a long bundle ID never overflows the card.
-    NSString *text = [NSString stringWithFormat:@"已复制 %@", bundle ?: @""];
-    if (text.length > 44) text = [[text substringToIndex:44] stringByAppendingString:@"…"];
+    // 0.2.26: short and sweet -- the user only needs "copied", not the full
+    // bundle ID (which was long and easy to cover with a finger).
+    (void)bundle;
+    NSString *text = @"已复制";
     self.toastLabel.text = text;
     RBLog(@"copy toast show text=%@", text);
 
