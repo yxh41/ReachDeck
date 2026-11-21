@@ -100,6 +100,10 @@ static BOOL rbEnabled = YES;
 static BOOL rbCardPrivacy = YES;
 static BOOL rbHideSystemServices = NO;
 static BOOL rbCardAtBottom = YES;         // 0.2.1: derived from cardAtTop (default off => bottom)
+// 0.2.19 style: defaults reproduce the pre-style look exactly.
+static CGFloat rbStyleOpacity = 0.72;
+static CGFloat rbStyleCorner = 16;
+static BOOL rbStyleCompact = NO;
 static NSArray<id<RBCard>> *rbCards = nil;
 static UIView *rbContainer = nil;        // container mounted inside _topWallpaperEffectView
 static NSUInteger rbHitTestLogCount = 0; // bounded self-evidence for the touch bridge
@@ -113,6 +117,7 @@ static void RBRebuildCards(void) {
     if (rbCardPrivacy) {
         if (!privacyCard) privacyCard = [[RBPrivacyCard alloc] init];
         [privacyCard setHideSystemServices:rbHideSystemServices];
+        [privacyCard setStyleOpacity:rbStyleOpacity corner:rbStyleCorner compact:rbStyleCompact];
         [cards addObject:privacyCard];
     }
     rbCards = [cards copy];
@@ -130,6 +135,12 @@ static void RBReadPrefs(void) {
     // device). Honour the old cardAtBottom key too for users upgrading from 0.1.x.
     rbCardAtBottom = d[@"cardAtTop"] ? ![d[@"cardAtTop"] boolValue]
                    : (d[@"cardAtBottom"] ? [d[@"cardAtBottom"] boolValue] : YES);
+    // 0.2.19: slider values are stored as NSNumber; clamp defensively here too.
+    CGFloat op = d[@"cardOpacity"] ? [d[@"cardOpacity"] floatValue] : 0.72;
+    rbStyleOpacity = op < 0.2 ? 0.2 : (op > 1.0 ? 1.0 : op);
+    CGFloat cr = d[@"cardCorner"] ? [d[@"cardCorner"] floatValue] : 16;
+    rbStyleCorner = cr < 0 ? 0 : (cr > 24 ? 24 : cr);
+    rbStyleCompact = d[@"cardCompact"] ? [d[@"cardCompact"] boolValue] : NO;
 }
 
 // Darwin callback. The Reachability view only exists while the window is up, so

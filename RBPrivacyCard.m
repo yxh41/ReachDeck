@@ -32,6 +32,10 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
 @property (nonatomic, strong) NSSet *lastActiveAttributions;
 @property (nonatomic, assign) NSUInteger hiddenCount;
 @property (nonatomic, copy) NSString *lastRenderSignature;
+// 0.2.19 style
+@property (nonatomic, assign) CGFloat styleOpacity;
+@property (nonatomic, assign) CGFloat styleCorner;
+@property (nonatomic, assign) BOOL styleCompact;
 - (void)performLaunchForBundle:(NSString *)bundle;
 - (void)rbLaunchPulse:(NSTimer *)timer;
 @end
@@ -51,6 +55,10 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
         _rbIdentifier = @"privacy";
         _rbWantsPin = YES;
         _hideSystemServices = NO;
+        // 0.2.19 defaults match the pre-style look, so upgrading changes nothing.
+        _styleOpacity = 0.72;
+        _styleCorner = 16;
+        _styleCompact = NO;
         _rows = @[];
         // SAFE MODE FIX (0.0.2): never touch UIKit here. A card can be created
         // while dyld is still running tweak initializers, before UIApplication is
@@ -92,6 +100,28 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     // Re-derive from the last raw set so the toggle takes effect without waiting for
     // the next sensor update.
     [self ingestAttributions:self.lastAttributions activeAttributions:self.lastActiveAttributions];
+}
+
+- (void)setStyleOpacity:(CGFloat)opacity corner:(CGFloat)corner compact:(BOOL)compact {
+    // Clamp defensively: a malformed plist must not produce an invisible or
+    // absurdly shaped card.
+    if (opacity < 0.2) opacity = 0.2;
+    if (opacity > 1.0) opacity = 1.0;
+    if (corner < 0) corner = 0;
+    if (corner > 24) corner = 24;
+    if (_styleOpacity == opacity && _styleCorner == corner && _styleCompact == compact) return;
+    _styleOpacity = opacity;
+    _styleCorner = corner;
+    _styleCompact = compact;
+    RBLog(@"style apply opacity=%.2f corner=%.0f compact=%d",
+          opacity, corner, (int)compact);
+    // Tear down the built UI. -rbView rebuilds lazily from these new values on the
+    // next mount; -ingestAttributions keeps the row data, so no sensor state is lost.
+    self.view = nil;
+    self.contentStack = nil;
+    self.rowsStack = nil;
+    self.emptyLabel = nil;
+    self.lastRenderSignature = nil;
 }
 
 - (void)ingestAttributions:(NSSet *)attributions
@@ -479,10 +509,15 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     // 0.0.7: raise contrast (a 0.42 black card on a dark blurred wallpaper is
     // indistinguishable from nothing) and add an always-present title so the card
     // is recognizable even before any sensor attribution arrives.
+    // 0.2.19: all metrics derive from the style set by the user. Defaults
+    // (opacity .72 / corner 16 / not compact) reproduce the original look.
+    CGFloat pad = _styleCompact ? 10 : 14;
+    CGFloat gap = _styleCompact ? 5 : 8;
+
     UIView *root = [[UIView alloc] initWithFrame:CGRectZero];
     root.translatesAutoresizingMaskIntoConstraints = NO;
-    root.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
-    root.layer.cornerRadius = 16;
+    root.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:_styleOpacity];
+    root.layer.cornerRadius = _styleCorner;
     root.layer.cornerCurve = kCACornerCurveContinuous;
     root.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
     root.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.45].CGColor;
@@ -494,25 +529,25 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
 
     self.contentStack = [[UIStackView alloc] init];
     self.contentStack.axis = UILayoutConstraintAxisVertical;
-    self.contentStack.spacing = 8;
+    self.contentStack.spacing = gap;
     self.contentStack.alignment = UIStackViewAlignmentFill;
     self.contentStack.translatesAutoresizingMaskIntoConstraints = NO;
     [root addSubview:self.contentStack];
 
+    // Equality: card height follows its content exactly (top pad + content +
+    // bottom pad). A >= here is what let the outer stack stretch it before.
     [NSLayoutConstraint activateConstraints:@[
-        [self.contentStack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:14],
-        [self.contentStack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-14],
-        [self.contentStack.topAnchor constraintEqualToAnchor:root.topAnchor constant:14],
-        // Equality: card height follows its content exactly (top 14 + content +
-        // bottom 14). A >= here is what let the outer stack stretch it before.
-        [root.heightAnchor constraintEqualToAnchor:self.contentStack.heightAnchor constant:28],
-        [self.contentStack.heightAnchor constraintGreaterThanOrEqualToConstant:52],
+        [self.contentStack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad],
+        [self.contentStack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-pad],
+        [self.contentStack.topAnchor constraintEqualToAnchor:root.topAnchor constant:pad],
+        [root.heightAnchor constraintEqualToAnchor:self.contentStack.heightAnchor constant:pad * 2],
+        [self.contentStack.heightAnchor constraintGreaterThanOrEqualToConstant:40],
     ]];
 
     UILabel *header = [[UILabel alloc] init];
     header.text = @"隐私";
     header.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
-    header.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    header.font = [UIFont systemFontOfSize:(_styleCompact ? 10 : 11) weight:UIFontWeightSemibold];
     [self.contentStack addArrangedSubview:header];
 
     // Rows live in their own stack so renderRows() can clear/repopulate without
@@ -520,14 +555,14 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     // re-added, which silently dropped the header in an earlier draft).
     self.rowsStack = [[UIStackView alloc] init];
     self.rowsStack.axis = UILayoutConstraintAxisVertical;
-    self.rowsStack.spacing = 8;
+    self.rowsStack.spacing = gap;
     self.rowsStack.alignment = UIStackViewAlignmentFill;
     [self.contentStack addArrangedSubview:self.rowsStack];
 
     self.emptyLabel = [[UILabel alloc] init];
     self.emptyLabel.text = @"当前没有应用使用相机或麦克风";
     self.emptyLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.92];
-    self.emptyLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    self.emptyLabel.font = [UIFont systemFontOfSize:(_styleCompact ? 12 : 14) weight:UIFontWeightMedium];
     self.emptyLabel.numberOfLines = 0;
     self.emptyLabel.textAlignment = NSTextAlignmentLeft;
 }
@@ -576,10 +611,12 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
 }
 
 - (UIView *)rowViewFor:(NSDictionary *)row {
+    CGFloat pad = _styleCompact ? 9 : 12;
+    CGFloat vpad = _styleCompact ? 6 : 8;
     UIView *box = [[UIView alloc] init];
     box.translatesAutoresizingMaskIntoConstraints = NO;
     box.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
-    box.layer.cornerRadius = 12;
+    box.layer.cornerRadius = _styleCompact ? 9 : 12;
     box.layer.cornerCurve = kCACornerCurveContinuous;
     box.tag = 0x52444231; // 'RDB1': the only subview the container hitTest accepts
     box.userInteractionEnabled = YES;
@@ -607,7 +644,7 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
 
     UILabel *title = [[UILabel alloc] init];
     title.text = row[@"name"];
-    title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    title.font = [UIFont systemFontOfSize:(_styleCompact ? 13 : 15) weight:UIFontWeightSemibold];
     title.textColor = [row[@"system"] boolValue]
         ? [[UIColor whiteColor] colorWithAlphaComponent:0.6]
         : [UIColor whiteColor];
@@ -627,7 +664,7 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     NSString *bundle = row[@"bundle"];
     if (bundle.length) [parts addObject:bundle];
     sub.text = [parts componentsJoinedByString:@" · "];
-    sub.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    sub.font = [UIFont systemFontOfSize:(_styleCompact ? 10 : 11) weight:UIFontWeightRegular];
     sub.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
     sub.numberOfLines = 1;
     sub.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -635,20 +672,20 @@ static NSTimer *rbPulseTimer = nil;            // keep only one pulse series ali
     [box addSubview:sub];
 
     [NSLayoutConstraint activateConstraints:@[
-        [dot.leadingAnchor constraintEqualToAnchor:box.leadingAnchor constant:12],
+        [dot.leadingAnchor constraintEqualToAnchor:box.leadingAnchor constant:pad],
         [dot.centerYAnchor constraintEqualToAnchor:box.centerYAnchor],
         [dot.widthAnchor constraintEqualToConstant:10],
         [dot.heightAnchor constraintEqualToConstant:10],
 
         [title.leadingAnchor constraintEqualToAnchor:dot.trailingAnchor constant:10],
-        [title.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-12],
-        [title.topAnchor constraintEqualToAnchor:box.topAnchor constant:8],
+        [title.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-pad],
+        [title.topAnchor constraintEqualToAnchor:box.topAnchor constant:vpad],
 
         [sub.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
         [sub.trailingAnchor constraintEqualToAnchor:title.trailingAnchor],
         [sub.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:2],
-        [sub.bottomAnchor constraintEqualToAnchor:box.bottomAnchor constant:-8],
-        [box.heightAnchor constraintGreaterThanOrEqualToConstant:52],
+        [sub.bottomAnchor constraintEqualToAnchor:box.bottomAnchor constant:-vpad],
+        [box.heightAnchor constraintGreaterThanOrEqualToConstant:(_styleCompact ? 44 : 52)],
     ]];
     return box;
 }

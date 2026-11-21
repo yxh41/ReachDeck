@@ -30,4 +30,9 @@ extern void RBLog(NSString * _Nonnull fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 /// When YES, system-service attributions (no bundle / isSystemService) are filtered out.
 - (void)setHideSystemServices:(BOOL)hide;
 
+/// 0.2.19 visual style. Called from the tweak when settings load/change.
+/// Rebuilds the card UI on next access so changes apply without a respring.
+/// opacity 0..1 (card background alpha), corner 0..24pt, compact toggles tighter metrics.
+- (void)setStyleOpacity:(CGFloat)opacity corner:(CGFloat)corner compact:(BOOL)compact;
+
 @end
