@@ -1,7 +1,6 @@
 #import "RBPrivacyCard.h"
 #import <objc/runtime.h>
-#import <objc/message.h>   // objc_msgSend for the BOOL-returning reachabilityModeActive
-#import <dlfcn.h>          // dlsym for SBSLaunchApplicationWithIdentifier
+#import <objc/message.h>   // objc_msgSend for SBWorkspace openApplicationWithBundleID:
 
 // Private but stable SpringBoard-side launcher; guarded by objc_getClass and
 // respondsToSelector: before use.
@@ -244,60 +243,81 @@ static char kRBRowAssociationKey;
         RBLog(@"collapse: deactivateReachability");
     }
 
+    // 0.2.12: field log killed the 0.2.11 paths -- SBUIController had no
+    // activateApplication: selector on iOS 16, and SBSLaunch returned 11
+    // (launch policy denial). GitHub reference kolbicz/Cyanide (roothide,
+    // iOS 15+, same author as AppEnumGuard) launches apps from inside
+    // SpringBoard with SBWorkspace's defaultWorkspace + openApplicationWithBundleID:.
+    // That is a DIFFERENT class than LSApplicationWorkspace (the slow external
+    // path) and a different selector than activateApplication:. Use it first.
+
     BOOL launched = NO;
+    SEL openSel = sel_registerName("openApplicationWithBundleID:");
 
-    // Path A: SBUIController activateApplication: -- the official SpringBoard
-    // in-process activation used by the reference docs; SBApplication fetched via
-    // SBApplicationController applicationWithBundleIdentifier: (verified in the
-    // local Kayoko source). This bypasses LaunchServices entirely.
-    Class appCtrlCls = objc_getClass("SBApplicationController");
-    id appCtrl = (appCtrlCls && [appCtrlCls respondsToSelector:@selector(sharedInstance)])
-        ? [appCtrlCls performSelector:@selector(sharedInstance)] : nil;
-    id sbApp = (appCtrl && [appCtrl respondsToSelector:@selector(applicationWithBundleIdentifier:)])
-        ? [appCtrl performSelector:@selector(applicationWithBundleIdentifier:) withObject:bundle] : nil;
-    RBLog(@"sb app lookup bundle=%@ found=%d", bundle, (int)(sbApp != nil));
-
-    Class uiCtrlCls = objc_getClass("SBUIController");
-    id uiCtrl = nil;
-    if (uiCtrlCls && [uiCtrlCls respondsToSelector:@selector(sharedInstanceIfExists)]) {
-        uiCtrl = [uiCtrlCls performSelector:@selector(sharedInstanceIfExists)];
+    // Path A: SBWorkspace defaultWorkspace -> openApplicationWithBundleID:
+    // (Cyanide vphone_springboard_bridge.m:202-208, field-verified roothide).
+    Class wsCls = objc_getClass("SBWorkspace");
+    id ws = nil;
+    if (wsCls && [wsCls respondsToSelector:@selector(defaultWorkspace)]) {
+        ws = [wsCls performSelector:@selector(defaultWorkspace)];
     }
-    if (!uiCtrl && uiCtrlCls && [uiCtrlCls respondsToSelector:@selector(sharedInstance)]) {
-        uiCtrl = [uiCtrlCls performSelector:@selector(sharedInstance)];
+    if (!ws && wsCls && [wsCls respondsToSelector:@selector(sharedInstance)]) {
+        ws = [wsCls performSelector:@selector(sharedInstance)];
     }
-    if (sbApp && uiCtrl && [uiCtrl respondsToSelector:@selector(activateApplication:)]) {
-        [uiCtrl performSelector:@selector(activateApplication:) withObject:sbApp];
+    RBLog(@"SBWorkspace cls=%d defaultWS=%d openSel=%d",
+          (int)(wsCls != nil), (int)(ws != nil), (int)(ws && [ws respondsToSelector:openSel]));
+    if (ws && [ws respondsToSelector:openSel]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(ws, openSel, bundle);
         launched = YES;
-        RBLog(@"open via SBUIController activateApplication bundle=%@", bundle);
-    } else {
-        RBLog(@"open SBUIController skip app=%d ui=%d", (int)(sbApp != nil), (int)(uiCtrl != nil));
+        RBLog(@"open via SBWorkspace openApplicationWithBundleID bundle=%@", bundle);
     }
 
-    // Path B: SBSLaunchApplicationWithIdentifier() from SpringBoardServices.
-    // Lowest-level SB-side launcher; dlsym-guarded so a missing symbol is harmless.
+    // Path B: SBMainWorkspace (class renamed on some iOS builds).
     if (!launched) {
-        void *sbs = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
-        if (sbs) {
-            int (*launchFn)(CFStringRef, Boolean) = (int (*)(CFStringRef, Boolean))dlsym(sbs, "SBSLaunchApplicationWithIdentifier");
-            if (launchFn) {
-                int ret = launchFn((__bridge CFStringRef)bundle, NO);
-                launched = (ret == 0);
-                RBLog(@"open via SBSLaunch bundle=%@ ret=%d", bundle, ret);
-            } else {
-                RBLog(@"open SBSLaunch symbol missing");
-            }
-            dlclose(sbs);
-        } else {
-            RBLog(@"open SBSLaunch dlopen failed");
+        Class mwsCls = objc_getClass("SBMainWorkspace");
+        id mws = nil;
+        if (mwsCls && [mwsCls respondsToSelector:@selector(sharedInstance)]) {
+            mws = [mwsCls performSelector:@selector(sharedInstance)];
+        }
+        if (!mws && mwsCls && [mwsCls respondsToSelector:@selector(defaultWorkspace)]) {
+            mws = [mwsCls performSelector:@selector(defaultWorkspace)];
+        }
+        if (mws && [mws respondsToSelector:openSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(mws, openSel, bundle);
+            launched = YES;
+            RBLog(@"open via SBMainWorkspace openApplicationWithBundleID bundle=%@", bundle);
         }
     }
 
-    // Path C: last resort -- the old LSApplicationWorkspace external path.
+    // Method-name probe: dump every open/launch/activate selector on the workspace
+    // classes so ONE field run tells us the exact API this iOS build exposes.
+    // Runs only while this feature is being validated.
+    NSArray *probeClasses = @[@"SBWorkspace", @"SBMainWorkspace", @"LSApplicationWorkspace", @"SBUIController"];
+    for (NSString *clsName in probeClasses) {
+        Class c = objc_getClass(clsName.UTF8String);
+        if (!c) { RBLog(@"probe class %@ missing", clsName); continue; }
+        NSMutableArray *names = [NSMutableArray array];
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(c, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *name = NSStringFromSelector(method_getName(methods[i]));
+            if ([name rangeOfString:@"open" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                [name rangeOfString:@"launch" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                [name rangeOfString:@"activat" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                [names addObject:name];
+            }
+        }
+        free(methods);
+        [names sortUsingSelector:@selector(compare:)];
+        RBLog(@"probe %@ methods=%u matches=%@", clsName, count, [names componentsJoinedByString:@","]);
+    }
+
+    // Path C: last resort -- the old external LSApplicationWorkspace path.
     if (!launched) {
         Class lsCls = objc_getClass("LSApplicationWorkspace");
-        LSApplicationWorkspace *ws = (LSApplicationWorkspace *)[lsCls performSelector:@selector(defaultWorkspace)];
-        if ([ws respondsToSelector:@selector(openApplicationWithBundleID:)]) {
-            BOOL ok = [ws openApplicationWithBundleID:bundle];
+        LSApplicationWorkspace *ls = (LSApplicationWorkspace *)[lsCls performSelector:@selector(defaultWorkspace)];
+        if ([ls respondsToSelector:@selector(openApplicationWithBundleID:)]) {
+            BOOL ok = [ls openApplicationWithBundleID:bundle];
             RBLog(@"open app fallback LS bundle=%@ ok=%d", bundle, (int)ok);
         }
     }
