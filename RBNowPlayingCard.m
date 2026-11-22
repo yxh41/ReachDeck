@@ -9,9 +9,14 @@
 // keeps working anywhere else on the card.
 static NSInteger const kRBTransportTag = 0x52444236;
 
-// MRMediaRemoteCommand values we actually send. Toggle covers both play and
-// pause, so there is no separate play/pause bookkeeping to get out of sync.
-static int const kRBCmdTogglePlayPause = 2;
+// MRMediaRemoteCommand values we actually send.
+// 🔴 0.5.0: Play (0) and Pause (1) are sent explicitly instead of
+// TogglePlayPause (2). Real log: two toggles in a row returned ok=1 and left
+// playing=1 both times (sent 61207ms / 62977ms, read back 61620ms / 63406ms),
+// while the same command did work at 77229ms. An app that ignores the toggle
+// still reports success, so the verb itself has to be unambiguous.
+static int const kRBCmdPlay = 0;
+static int const kRBCmdPause = 1;
 static int const kRBCmdNextTrack = 4;
 static int const kRBCmdPreviousTrack = 5;
 // 24 = kMRMediaRemoteCommandSeekToPlaybackPosition. The position rides in the
@@ -471,6 +476,9 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 // that disagrees while the command is still fresh is the system answering with
 // the pre-seek position, not a refusal -- the two cases must not look alike.
 @property (nonatomic, assign) NSTimeInterval seekStartedAt;
+// 0.5.0: identifies the latest play/pause tap so the verification pass of an
+// older tap cannot overwrite the intent of a newer one.
+@property (nonatomic, assign) NSUInteger transportSeq;
 
 @property (nonatomic, assign) CGFloat styleOpacity;
 @property (nonatomic, assign) CGFloat styleCorner;
@@ -487,6 +495,7 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 - (void)rbTick;
 - (NSString *)rbTimeText:(double)seconds;
 - (void)rbSendCommand:(int)command label:(NSString *)label;
+- (void)rbSendTransportPlaying:(BOOL)want;
 - (void)rbSeekTo:(double)seconds;
 // 0.4.7: hold prev/next to nudge 15s each way; tap still changes track.
 - (BOOL)rbIsLiveBroadcast;
@@ -879,8 +888,32 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 - (void)rbPlayPauseTapped:(UIButton *)sender {
     (void)sender;
     [self rbHaptic:UIImpactFeedbackStyleLight];
-    [self rbSendCommand:kRBCmdTogglePlayPause label:@"toggle"];
+    [self rbSendTransportPlaying:!self.playing];
     [self rbScheduleDisarm];
+}
+
+// Explicit play/pause plus one verification pass. The read-back 0.4s later is
+// the only proof the app obeyed; sending the opposite verb once more is cheap
+// and turns a dead button into a working one on players that swallow commands
+// while their process is being resumed.
+- (void)rbSendTransportPlaying:(BOOL)want {
+    self.transportSeq += 1;
+    NSUInteger seq = self.transportSeq;
+    int cmd = want ? kRBCmdPlay : kRBCmdPause;
+    RBLog(@"nowplaying transport want=%d", (int)want);
+    [self rbSendCommand:cmd label:(want ? @"play" : @"pause")];
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        // A newer tap owns the button now; this check is stale.
+        if (strongSelf.transportSeq != seq) return;
+        if (strongSelf.playing == want) return;
+        RBLog(@"nowplaying transport retry want=%d got=%d", (int)want, (int)strongSelf.playing);
+        [strongSelf rbSendCommand:cmd label:@"retry"];
+    });
 }
 
 - (void)rbNextTapped:(UIButton *)sender {
