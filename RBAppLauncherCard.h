@@ -11,4 +11,9 @@
 /// Shared appearance settings; rebuilds the card UI so changes apply without a respring.
 - (void)setStyleOpacity:(CGFloat)opacity corner:(CGFloat)corner border:(CGFloat)border compact:(BOOL)compact;
 
+/// 0.5.2: a list of bundle IDs picked in Settings. When it is empty the card
+/// falls back to the dock, so an install with no configuration behaves exactly
+/// as before. At most four are shown, in the order given.
+- (void)rbSetCustomTargets:(NSArray<NSString *> *)bundleIDs;
+
 @end

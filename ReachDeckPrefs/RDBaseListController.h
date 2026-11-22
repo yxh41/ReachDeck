@@ -5,4 +5,13 @@
 #import <Preferences/PSSpecifier.h>
 
 @interface RDBaseListController : PSListController
+
+/// Whole settings dictionary as currently on disk (never nil).
++ (NSMutableDictionary *)rdSettings;
+
+/// Read-modify-write ONE key and post the Darwin notification. A nil value
+/// removes the key, which is how "no custom app list" is expressed. Building a
+/// fresh dictionary here would wipe every other switch, so this always merges.
++ (void)rdSetValue:(id)value forKey:(NSString *)key;
+
 @end

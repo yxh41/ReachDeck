@@ -10,6 +10,28 @@
 
 @implementation RDBaseListController
 
++ (NSMutableDictionary *)rdSettings {
+    NSDictionary *onDisk = [NSDictionary dictionaryWithContentsOfFile:RDPlistPath];
+    return onDisk ? [onDisk mutableCopy] : [NSMutableDictionary dictionary];
+}
+
++ (void)rdSetValue:(id)value forKey:(NSString *)key {
+    if (!key.length) return;
+    // Read-modify-write a single key. Constructing a fresh dict here would wipe the
+    // other switches whenever one is changed.
+    NSMutableDictionary *settings = [self rdSettings];
+    if (value) {
+        [settings setObject:value forKey:key];
+    } else {
+        [settings removeObjectForKey:key];
+    }
+    [settings writeToFile:RDPlistPath atomically:YES];
+
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        CFSTR(RD_NOTIFY), NULL, NULL, TRUE);
+}
+
 - (id)readPreferenceValue:(PSSpecifier *)specifier {
     NSDictionary *settings = [NSDictionary dictionaryWithContentsOfFile:RDPlistPath];
     id value = settings[specifier.properties[@"key"]];
@@ -17,18 +39,8 @@
 }
 
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
-    // Read-modify-write a single key. Constructing a fresh dict here would wipe the
-    // other switches whenever one is toggled.
-    NSMutableDictionary *settings = [NSMutableDictionary dictionary];
-    [settings addEntriesFromDictionary:[NSDictionary dictionaryWithContentsOfFile:RDPlistPath]];
-    [settings setObject:value forKey:specifier.properties[@"key"]];
-    [settings writeToFile:RDPlistPath atomically:YES];
-
+    [[self class] rdSetValue:value forKey:specifier.properties[@"key"]];
     [super setPreferenceValue:value specifier:specifier];
-
-    CFNotificationCenterPostNotification(
-        CFNotificationCenterGetDarwinNotifyCenter(),
-        CFSTR(RD_NOTIFY), NULL, NULL, TRUE);
 }
 
 @end

@@ -108,6 +108,10 @@ static BOOL rbCardPrivacy = YES;
 static BOOL rbCardClipboard = YES;
 static BOOL rbCardNowPlaying = YES;
 static BOOL rbCardDockApps = YES;
+// 0.5.2: bundle IDs picked in Settings. Empty or nil means "follow the dock",
+// which is why the dock path had to stay: an unconfigured install must keep
+// working after the upgrade without anyone opening Settings.
+static NSArray *rbCustomApps = nil;
 static BOOL rbHideSystemServices = NO;
 static BOOL rbCardAtBottom = YES;         // 0.2.1: derived from cardAtTop (default off => bottom)
 // 0.2.19 style: defaults reproduce the pre-style look exactly.
@@ -151,6 +155,7 @@ static void RBRebuildCards(void) {
     NSMutableArray *cards = [NSMutableArray array];
     if (rbCardDockApps) {
         if (!dockAppsCard) dockAppsCard = [[RBAppLauncherCard alloc] init];
+        [dockAppsCard rbSetCustomTargets:rbCustomApps];
         [cards addObject:dockAppsCard];
     }
     if (rbCardPrivacy) {
@@ -173,9 +178,9 @@ static void RBRebuildCards(void) {
         }
     }
     rbCards = [cards copy];
-    RBLog(@"rebuild cards dockapps=%d privacy=%d nowplaying=%d clipboard=%d hideSys=%d bottom=%d count=%lu",
-          rbCardDockApps, rbCardPrivacy, rbCardNowPlaying, rbCardClipboard, rbHideSystemServices,
-          rbCardAtBottom, (unsigned long)rbCards.count);
+    RBLog(@"rebuild cards dockapps=%d custom=%lu privacy=%d nowplaying=%d clipboard=%d hideSys=%d bottom=%d count=%lu",
+          rbCardDockApps, (unsigned long)rbCustomApps.count, rbCardPrivacy, rbCardNowPlaying,
+          rbCardClipboard, rbHideSystemServices, rbCardAtBottom, (unsigned long)rbCards.count);
 }
 
 // Pure data read — safe from a dylib initializer: Foundation file I/O only,
@@ -187,6 +192,11 @@ static void RBReadPrefs(void) {
     rbCardNowPlaying = d[@"cardNowPlaying"] ? [d[@"cardNowPlaying"] boolValue] : YES;
     rbCardClipboard = d[@"cardClipboard"] ? [d[@"cardClipboard"] boolValue] : YES;
     rbCardDockApps = d[@"cardDockApps"] ? [d[@"cardDockApps"] boolValue] : YES;
+    // 0.5.2: an array of bundle IDs from the app picker. Anything else (a stale
+    // string from a downgrade, a plist edited by hand) is ignored rather than
+    // passed on, so the card can never be handed a type it does not expect.
+    id customList = d[@"cardCustomApps"];
+    rbCustomApps = [customList isKindOfClass:[NSArray class]] ? [customList copy] : nil;
     rbHideSystemServices = d[@"hideSystemServices"] ? [d[@"hideSystemServices"] boolValue] : NO;
     // 0.2.1: the UI switch is "cardAtTop" (off = bottom, the visible band on this
     // device). Honour the old cardAtBottom key too for users upgrading from 0.1.x.

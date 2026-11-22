@@ -31,8 +31,8 @@
 			<string>PSGroupCell</string>
 			<key>label</key>
 			<string>隐私卡片</string>
-		<key>footerText</key>
-		<string>显示当前正在使用相机或麦克风的应用。轻点行打开应用，长按弹出操作菜单。</string>
+			<key>footerText</key>
+			<string>显示当前正在使用相机或麦克风的应用。轻点行打开应用，长按弹出操作菜单。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -63,8 +63,8 @@
 			<string>PSGroupCell</string>
 			<key>label</key>
 			<string>更多卡片</string>
-		<key>footerText</key>
-		<string>两张及以上时叠成一摞，只显示最上面一张；点按左上角的胶囊切换到下一张，右侧圆点表示当前位置。</string>
+			<key>footerText</key>
+			<string>两张及以上时叠成一摞，只显示最上面一张；点按左上角的胶囊切换到下一张，右侧圆点表示当前位置。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -78,7 +78,15 @@
 			<key>defaults</key>
 			<string>com.zlhkf.ReachDeck</string>
 			<key>footerText</key>
-			<string>显示 Dock 里的四个 App，点按直接打开。Dock 里放了什么就显示什么，排列顺序跟随 Dock。</string>
+			<string>显示 Dock 里的四个 App，点按直接打开。也可以在下面自己指定要显示哪几个。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>选择显示的 App</string>
+			<key>id</key>
+			<string>rdAppPickerLink</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -146,13 +154,13 @@
 			<key>preferenceKey</key>
 			<string>cardOpacity</string>
 			<key>minimumValue</key>
-			<real>20</real>
+			<real>20.0</real>
 			<key>maximumValue</key>
-			<real>100</real>
+			<real>100.0</real>
 			<key>defaultValue</key>
-			<real>72</real>
+			<real>72.0</real>
 			<key>inputStep</key>
-			<real>1</real>
+			<real>1.0</real>
 			<key>valueStyle</key>
 			<string>percent</string>
 		</dict>
@@ -168,13 +176,13 @@
 			<key>preferenceKey</key>
 			<string>cardCorner</string>
 			<key>minimumValue</key>
-			<real>0</real>
+			<real>0.0</real>
 			<key>maximumValue</key>
-			<real>24</real>
+			<real>24.0</real>
 			<key>defaultValue</key>
-			<real>16</real>
+			<real>16.0</real>
 			<key>inputStep</key>
-			<real>1</real>
+			<real>1.0</real>
 			<key>valueStyle</key>
 			<string>points</string>
 		</dict>
@@ -190,11 +198,11 @@
 			<key>preferenceKey</key>
 			<string>cardBorder</string>
 			<key>minimumValue</key>
-			<real>0</real>
+			<real>0.0</real>
 			<key>maximumValue</key>
-			<real>3</real>
+			<real>3.0</real>
 			<key>defaultValue</key>
-			<real>1</real>
+			<real>1.0</real>
 			<key>inputStep</key>
 			<real>0.1</real>
 			<key>valueStyle</key>

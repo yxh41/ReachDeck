@@ -53,6 +53,9 @@ static NSUInteger const kRBDockMaxTiles = 4;
 @protocol RBDockProxy <NSObject>
 - (NSData *)iconData;
 - (NSData *)iconDataForVariant:(int)variant;
+- (NSString *)localizedName;
+- (NSURL *)bundleURL;
+- (BOOL)isInstalled;
 @end
 
 @interface LSApplicationProxy : NSObject
@@ -177,6 +180,37 @@ static NSString *rbDockNameForIcon(id obj, NSString *fallback) {
     return fallback.length ? fallback : @"App";
 }
 
+// A user-picked list can name an app that has since been deleted, and
+// LSApplicationProxy answers for an unknown identifier anyway (it hands back a
+// lazy placeholder that echoes the query), so the disk is the only honest test.
+static BOOL rbDockAppOnDisk(NSString *bundleID) {
+    if (!bundleID.length) return NO;
+    Class cls = NSClassFromString(@"LSApplicationProxy");
+    if (!cls) return NO;
+    id<RBDockProxy> proxy = (id<RBDockProxy>)[(id)cls applicationProxyForIdentifier:bundleID];
+    if (!proxy) return NO;
+    if ([proxy respondsToSelector:@selector(isInstalled)] && ![proxy isInstalled]) return NO;
+    if ([proxy respondsToSelector:@selector(bundleURL)]) {
+        NSURL *url = [proxy bundleURL];
+        if ([url isKindOfClass:[NSURL class]] && url.path.length) {
+            return [[NSFileManager defaultManager] fileExistsAtPath:url.path];
+        }
+    }
+    return YES;
+}
+
+static NSString *rbDockDisplayName(NSString *bundleID) {
+    Class cls = NSClassFromString(@"LSApplicationProxy");
+    if (cls) {
+        id<RBDockProxy> proxy = (id<RBDockProxy>)[(id)cls applicationProxyForIdentifier:bundleID];
+        if (proxy && [proxy respondsToSelector:@selector(localizedName)]) {
+            NSString *name = [proxy localizedName];
+            if ([name isKindOfClass:[NSString class]] && name.length) return name;
+        }
+    }
+    return bundleID.lastPathComponent;
+}
+
 #pragma mark - launch
 
 // Identical mechanism to the media card, and for the same reason: inside
@@ -240,6 +274,7 @@ static void rbDockLaunch(NSString *bundleID) {
 @property (nonatomic, strong) NSArray<UIView *> *tiles;
 @property (nonatomic, copy) NSArray<NSString *> *targets;
 @property (nonatomic, copy) NSArray<NSString *> *names;
+@property (nonatomic, copy) NSArray<NSString *> *customTargets;
 @property (nonatomic, assign) CGFloat styleOpacity;
 @property (nonatomic, assign) CGFloat styleCorner;
 @property (nonatomic, assign) CGFloat styleBorder;
@@ -286,6 +321,22 @@ static void rbDockLaunch(NSString *bundleID) {
     [self rbReloadDock];
 }
 
+// Called from the container on every rebuild. Clearing the view is what makes the
+// change visible: the tiles hold their own labels and icons, so a rebuild is the
+// only honest way to apply a different list.
+- (void)rbSetCustomTargets:(NSArray<NSString *> *)bundleIDs {
+    NSArray<NSString *> *incoming = [bundleIDs isKindOfClass:[NSArray class]] ? bundleIDs : @[];
+    NSArray<NSString *> *current = self.customTargets ?: @[];
+    if ([incoming isEqualToArray:current]) return;
+    self.customTargets = [incoming copy];
+    RBLog(@"dock apps custom applied count=%lu", (unsigned long)incoming.count);
+    self.view = nil;
+    self.headerLabel = nil;
+    self.tilesRow = nil;
+    self.emptyLabel = nil;
+    self.tiles = nil;
+}
+
 - (void)setStyleOpacity:(CGFloat)opacity corner:(CGFloat)corner border:(CGFloat)border compact:(BOOL)compact {
     if (opacity < 0.2) opacity = 0.2;
     if (opacity > 1.0) opacity = 1.0;
@@ -311,6 +362,29 @@ static void rbDockLaunch(NSString *bundleID) {
 #pragma mark data
 
 - (void)rbReloadDock {
+    // A user-picked list wins. Empty means "follow the dock", which stays the
+    // default so an install that was never configured behaves as it always did.
+    if (self.customTargets.count) {
+        NSMutableArray<NSString *> *cbids = [NSMutableArray array];
+        NSMutableArray<NSString *> *cnames = [NSMutableArray array];
+        for (NSString *bid in self.customTargets) {
+            if (cbids.count >= kRBDockMaxTiles) break;
+            if (![bid isKindOfClass:[NSString class]] || !bid.length) continue;
+            if ([cbids containsObject:bid]) continue;
+            if (!rbDockAppOnDisk(bid)) {
+                RBLog(@"dock apps custom skip missing=%@", bid);
+                continue;
+            }
+            [cbids addObject:bid];
+            [cnames addObject:rbDockDisplayName(bid)];
+        }
+        RBLog(@"dock apps custom targets=%lu (%@)",
+              (unsigned long)cbids.count, [cbids componentsJoinedByString:@","]);
+        self.targets = cbids;
+        self.names = cnames;
+        [self applyTargets];
+        return;
+    }
     NSArray *icons = rbDockIcons();
     NSMutableArray<NSString *> *bids = [NSMutableArray array];
     NSMutableArray<NSString *> *names = [NSMutableArray array];
