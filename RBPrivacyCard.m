@@ -55,7 +55,6 @@ static RBPrivacyCard *rbActivePrivacyCard = nil; // 0.2.31: for cross-process ca
 // card root) so it is never cut off and never rebuilt by renderRows.
 @property (nonatomic, strong) UIView *menuView;
 @property (nonatomic, strong) UIView *menuOverlay;
-@property (nonatomic, strong) NSMutableSet<NSString *> *sessionHiddenBundles;
 - (void)performLaunchForBundle:(NSString *)bundle;
 - (void)rbCollapseAndLaunchBundle:(NSString *)bundle;
 - (void)rbLaunchPulse:(NSTimer *)timer;
@@ -89,7 +88,6 @@ static RBPrivacyCard *rbActivePrivacyCard = nil; // 0.2.31: for cross-process ca
         _styleCompact = NO;
         _rows = @[];
         _activeSince = [NSMutableDictionary dictionary];
-        _sessionHiddenBundles = [NSMutableSet set];
         rbActivePrivacyCard = self;
         // SAFE MODE FIX (0.0.2): never touch UIKit here. A card can be created
         // while dyld is still running tweak initializers, before UIApplication is
@@ -258,14 +256,6 @@ void RBPrivacyCancelInteraction(void) {
         }
 
         NSString *key = bundle.length ? bundle : name;
-
-        // 0.2.29: "本次隐藏此应用" only affects this card instance/session.
-        // It is checked before duration recording so a hidden app cannot keep
-        // a stale timer alive.
-        if (key.length && [self.sessionHiddenBundles containsObject:key]) {
-            RBLog(@"attribution skip session hidden key=%@", key);
-            continue;
-        }
 
         // 0.2.28: track when this app was FIRST seen in the provider feed. The
         // private SBSensorActivityAttribution carries no timestamp we can rely
@@ -623,16 +613,16 @@ void RBPrivacyCancelInteraction(void) {
 
     CGFloat itemH = 28.0;
     NSArray *titles = @[@"复制 Bundle ID", @"复制应用名称", @"打开这个 App",
-                        @"复制状态摘要", @"本次隐藏此应用"];
+                        @"复制状态摘要"];
     CGFloat menuW = 188.0;
-    CGFloat menuH = titles.count * itemH + 12.0; // 152pt
+    CGFloat menuH = titles.count * itemH + 12.0; // 124pt
 
-    // 0.2.32 ROOT CAUSE: the direct superview is the UIStackView whose bounds
-    // are only the card height (60-81pt in field log). A 152pt menu hung there
-    // puts items 4/5 (local y >= 90) OUTSIDE the host bounds -- UIKit hitTest
-    // never reaches them, so "copy summary" / "hide for session" did nothing.
-    // Climb to the first ancestor tall enough to hold the whole menu (the
-    // 844pt ReachDeck container).
+    // 0.2.32/0.2.33: the direct superview is the UIStackView whose bounds are
+    // only the card height (60-81pt in field log). Any menu taller than that
+    // puts its lower items OUTSIDE the host bounds -- UIKit hitTest never
+    // reaches them (0.2.32: "copy summary" / "hide for session" did nothing).
+    // Keep climbing to the first ancestor tall enough to hold the whole menu
+    // (the 844pt ReachDeck container); still needed for the 124pt 4-item menu.
     UIView *host = self.view.superview;
     while (host && CGRectGetHeight(host.bounds) < (menuH + 16.0) && host.superview) {
         host = host.superview;
@@ -758,15 +748,6 @@ void RBPrivacyCancelInteraction(void) {
             [UIPasteboard generalPasteboard].string = summary;
             RBLog(@"copy summary key=%@", key);
             [self rbShowCopiedToast:summary];
-            break;
-        }
-        case 4: {
-            if (key.length == 0) break;
-            [self.sessionHiddenBundles addObject:key];
-            [self.activeSince removeObjectForKey:key];
-            [self ingestAttributions:self.lastAttributions
-                   activeAttributions:self.lastActiveAttributions];
-            RBLog(@"session hidden key=%@", key);
             break;
         }
         default:
