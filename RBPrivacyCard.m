@@ -1,4 +1,5 @@
 #import "RBPrivacyCard.h"
+#import <math.h>          // 0.3.1: floor/fabs for the height-driven row cap
 #import <objc/runtime.h>
 #import <objc/message.h>   // objc_msgSend for SBWorkspace openApplicationWithBundleID:
 
@@ -16,7 +17,7 @@ static char kRBMenuContextKey;                 // 0.2.29: row dict on the popup 
 static NSInteger const kRBMenuTag = 0x52444232; // 'RDB2': menu/overlay allowed by hitTest bridge
 static NSInteger const kRBExpandTag = 0x52444233; // 'RDB3': "show all / collapse" footer
 static NSUInteger const kRBCollapsedRowLimit = 3;
-static NSUInteger const kRBExpandedRowLimit = 8;
+static NSUInteger const kRBExpandedRowLimit = 8;   // hard ceiling, not the per-mount cap
 static NSInteger rbPulseCount = 0;              // 0.2.17 diagnostic pulse counter
 static NSTimer *rbPulseTimer = nil;            // keep only one pulse series alive
 static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels for self-proof
@@ -40,6 +41,10 @@ static RBPrivacyCard *rbActivePrivacyCard = nil; // 0.2.31: for cross-process ca
 @property (nonatomic, copy) NSArray<NSDictionary *> *allRows;   // full sorted list before windowing
 @property (nonatomic, assign) NSUInteger totalCount;
 @property (nonatomic, assign) BOOL expanded;                    // "还有 N 项" expanded to all rows
+// 0.3.1: vertical room the deck can use on this presentation (0 = unknown).
+// The expanded row count is derived from it, so a tall list can never grow up
+// under the notch / Dynamic Island.
+@property (nonatomic, assign) CGFloat availableHeight;
 @property (nonatomic, assign) BOOL hideSystemServices;
 @property (nonatomic, strong) NSSet *lastAttributions;
 @property (nonatomic, strong) NSSet *lastActiveAttributions;
@@ -71,6 +76,8 @@ static RBPrivacyCard *rbActivePrivacyCard = nil; // 0.2.31: for cross-process ca
 - (void)rbDismissRowMenu:(id)sender;
 - (void)rbMenuTapped:(UIButton *)button;
 - (void)rbApplyVisibleRows;
+- (NSUInteger)rbEffectiveRowLimit;
+- (void)rbSetAvailableHeight:(CGFloat)height;
 - (void)rbExpansionTouchDown:(UIControl *)sender;
 - (void)rbExpansionTouchUp:(UIControl *)sender;
 - (void)rbExpansionTouchCancel:(UIControl *)sender;
@@ -178,14 +185,58 @@ void RBPrivacyCancelInteraction(void) {
 
 #pragma mark - data ingestion
 
+// 0.3.1: how many rows actually fit in the deck on THIS presentation.
+// Geometry is derived from the same metrics buildView() uses, so the card is
+// sized from the outside in instead of growing first and colliding with the
+// sensor housing later.
+//   height(N) = pad*2 + header + gap            (card chrome)
+//             + N*rowH + (N-1)*gap              (rows)
+//             + gap + footerH                   (expand footer, only when total > 3)
+// With the defaults that is 78 + 60*N, so N = floor((available - 78) / 60).
+- (NSUInteger)rbEffectiveRowLimit {
+    if (!self.expanded) return kRBCollapsedRowLimit;
+    if (self.availableHeight <= 0) return kRBExpandedRowLimit;
+    CGFloat pad = _styleCompact ? 10.0 : 14.0;
+    CGFloat gap = _styleCompact ? 5.0 : 8.0;
+    CGFloat rowH = _styleCompact ? 44.0 : 52.0;
+    CGFloat headerH = _styleCompact ? 13.0 : 14.0;
+    CGFloat footerH = 28.0;
+    CGFloat fixed = pad * 2 + headerH + gap + gap + footerH;
+    CGFloat room = self.availableHeight - fixed;
+    if (room <= rowH) return 1;
+    NSUInteger cap = (NSUInteger)floor(room / (rowH + gap));
+    // Never show a single lonely row: if two rows fit, show two.
+    if (cap < 2 && room >= rowH * 2 + gap) cap = 2;
+    if (cap < 1) cap = 1;
+    if (cap > kRBExpandedRowLimit) cap = kRBExpandedRowLimit;
+    return cap;
+}
+
+// 0.3.1: the host tells us the usable height on every mount. If that changes
+// the row cap we re-window and re-render; otherwise this is a no-op because the
+// sensor provider pushes here many times per second.
+- (void)rbSetAvailableHeight:(CGFloat)height {
+    if (height <= 0) return;
+    if (fabs(height - self.availableHeight) < 1.0) return;
+    NSUInteger before = [self rbEffectiveRowLimit];
+    self.availableHeight = height;
+    NSUInteger after = [self rbEffectiveRowLimit];
+    RBLog(@"privacy available height=%.0f cap %lu->%lu",
+          height, (unsigned long)before, (unsigned long)after);
+    if (before == after) return;
+    [self rbApplyVisibleRows];
+    [self renderRows];
+}
+
 // 0.2.34: derive the visible window from the full sorted list. The card stays at
-// 3 rows by default; tapping the footer expands to at most 8 rows. Keeping this
-// separate from ingestion means a sensor push while expanded preserves the state.
+// 3 rows by default; tapping the footer expands to as many rows as this mount
+// can hold (hard ceiling 8). Keeping this separate from ingestion means a sensor
+// push while expanded preserves the state.
 - (void)rbApplyVisibleRows {
     NSUInteger total = self.allRows.count;
     if (total <= kRBCollapsedRowLimit) self.expanded = NO;
     NSUInteger limit = self.expanded
-        ? MIN(total, kRBExpandedRowLimit)
+        ? MIN(total, [self rbEffectiveRowLimit])
         : MIN(total, kRBCollapsedRowLimit);
     self.totalCount = total;
     self.rows = limit > 0 ? [self.allRows subarrayWithRange:NSMakeRange(0, limit)] : @[];
@@ -1036,7 +1087,8 @@ void RBPrivacyCancelInteraction(void) {
     if (!expanded) {
         hint.text = [NSString stringWithFormat:@"还有 %lu 项", (unsigned long)self.hiddenCount];
     } else if (self.hiddenCount > 0) {
-        hint.text = [NSString stringWithFormat:@"仅显示前 %lu 项", (unsigned long)kRBExpandedRowLimit];
+        hint.text = [NSString stringWithFormat:@"仅显示前 %lu 项",
+                     (unsigned long)[self rbEffectiveRowLimit]];
     } else {
         hint.text = [NSString stringWithFormat:@"共 %lu 项", (unsigned long)self.totalCount];
     }

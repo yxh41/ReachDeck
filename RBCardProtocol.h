@@ -29,6 +29,12 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly, copy) NSString *rbRailTitle;
 /// 0.3.0: shared appearance settings applied to every card.
 - (void)setStyleOpacity:(CGFloat)opacity corner:(CGFloat)corner border:(CGFloat)border compact:(BOOL)compact;
+/// 0.3.1: vertical room the deck can actually use on this presentation, in
+/// points, already excluding the notch / Dynamic Island safe area and the
+/// bottom inset. Cards with variable content (the privacy list) cap their own
+/// rows from it so the card can never grow up under the sensor housing.
+/// 0 or negative means "unknown"; keep the card's default sizing.
+- (void)rbSetAvailableHeight:(CGFloat)height;
 
 @end
 

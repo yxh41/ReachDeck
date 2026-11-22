@@ -115,6 +115,11 @@ static UIView *rbStickyRow = nil;        // ReachPlayer emptyView trick: keep do
 static NSUInteger rbCurrentCardIndex = 0; // 0.3.0: paged deck selection
 static NSArray<id<RBCard>> *rbSortedCards = nil;
 static NSArray<UIControl *> *rbRailButtons = nil;
+// 0.3.1: geometry the deck is allowed to occupy on the current presentation.
+// Kept as statics because viewDidAppear re-measures after the reachability
+// animation settles (at viewWillAppear the host is not in a window yet).
+static UIStackView *rbStackView = nil;
+static NSLayoutConstraint *rbStackTopConstraint = nil;
 
 // Rebuild the active card list from prefs. Cards are created once and reused; only
 // membership changes. This keeps sensor state intact across preference toggles.
@@ -225,6 +230,7 @@ static void RBReloadSettings(void) {
 - (void)rbRailTouchUp:(RBReachDeckRailButton *)sender;
 - (void)rbRailTouchCancel:(RBReachDeckRailButton *)sender;
 - (void)rbUpdateRailSelection;
+- (void)rbUpdateUsableGeometry;
 @end
 
 // SBSensorActivityDataProvider — read-only, exact selectors we call.
@@ -290,6 +296,10 @@ static void RBReloadSettings(void) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     if (!rbContainer) { RBLog(@"viewDidAppear: remount"); [self addRBContainer]; }
+    // 0.3.1: first moment the host is guaranteed to be inside a window, so the
+    // safe-area conversion is meaningful. The 0.45s re-measure after mount only
+    // runs from addRBContainer, which may have fired before the animation.
+    [self rbUpdateUsableGeometry];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -304,6 +314,8 @@ static void RBReloadSettings(void) {
     rbCurrentCardIndex = 0;
     rbSortedCards = nil;
     rbRailButtons = nil;
+    rbStackView = nil;
+    rbStackTopConstraint = nil;
     rbLiveController = nil;
     rbTopEffect = nil;
     // 0.2.9: sticky row is a retained pointer into the container. Clear it on
@@ -446,12 +458,23 @@ static void RBReloadSettings(void) {
         [stack.centerYAnchor constraintEqualToAnchor:container.centerYAnchor
                                             constant:(rbCardAtBottom ? 140.0 : -110.0) - deckLift];
     stackCenterY.priority = UILayoutPriorityDefaultHigh; // 750
+    // 0.3.1: the top clamp is REQUIRED and its constant is replaced at
+    // viewDidAppear with the real safe-area line (see rbUpdateUsableGeometry).
+    // 60 is only the pre-measurement placeholder. The bottom clamp drops to 999
+    // so a card that still cannot fit overflows the band slightly instead of
+    // ever sliding up under the notch.
+    rbStackTopConstraint =
+        [stack.topAnchor constraintGreaterThanOrEqualToAnchor:container.topAnchor constant:60.0];
+    NSLayoutConstraint *stackBottom =
+        [stack.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-16];
+    stackBottom.priority = 999;
     NSMutableArray<NSLayoutConstraint *> *stackConstraints = [NSMutableArray arrayWithObjects:
         [stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16],
         stackCenterY,
-        [stack.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-16],
-        [stack.topAnchor constraintGreaterThanOrEqualToAnchor:container.topAnchor constant:60],
+        stackBottom,
+        rbStackTopConstraint,
         nil];
+    rbStackView = stack;
     if (hasRail) {
         [stackConstraints addObject:[stack.trailingAnchor constraintEqualToAnchor:rail.leadingAnchor constant:-8]];
         [stackConstraints addObject:[rail.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-8]];
@@ -483,21 +506,22 @@ static void RBReloadSettings(void) {
           NSStringFromClass([topEffect class]), NSStringFromCGRect(container.frame),
           NSStringFromCGRect([container convertRect:container.bounds toView:nil]), (int)rbCardAtBottom);
 
-    // 0.3.0 diagnostic: one post-layout dump, so a report can tell whether the
-    // band clipped a stacked deck without requiring another build round trip.
-    if (sorted.count > 1) {
-        __weak typeof(self) weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            __strong typeof(self) strongSelf = weakSelf;
-            if (!strongSelf) return;
-            RBLog(@"deck layout stack=%@ rail=%@ page=%lu mode=%@",
-                  NSStringFromCGRect(stack.frame),
-                  hasRail ? NSStringFromCGRect(rail.frame) : @"(none)",
-                  (unsigned long)rbCurrentCardIndex,
-                  showAllCards ? @"stack" : @"page");
-        });
-    }
+    // 0.3.1 diagnostic: measure the usable band immediately (works when we
+    // remount while already on screen) and once more after the presentation
+    // animation settles, so a report carries real numbers instead of guesses.
+    [self rbUpdateUsableGeometry];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf rbUpdateUsableGeometry];
+        RBLog(@"deck layout stack=%@ page=%lu cards=%lu mode=%@",
+              NSStringFromCGRect(rbStackView.frame),
+              (unsigned long)rbCurrentCardIndex,
+              (unsigned long)sorted.count,
+              showAllCards ? @"stack" : (hasRail ? @"page" : @"single"));
+    });
 }
 
 %new
@@ -513,6 +537,69 @@ static void RBReloadSettings(void) {
                 ((UIImageView *)sub).tintColor =
                     [[UIColor whiteColor] colorWithAlphaComponent:(active ? 0.95 : 0.45)];
             }
+        }
+    }
+}
+
+%new
+- (void)rbUpdateUsableGeometry {
+    // 0.3.1: the notch / Dynamic Island is a hard physical boundary, and a
+    // hardcoded inset (the old +60) is wrong on every other device. Ask the
+    // window for the real safe-area line and convert it into container space:
+    // the wallpaper host is translated during the reachability animation, and
+    // convertRect: bakes that translation in, so the result is correct even
+    // though the container itself spans the full 844pt host.
+    if (!rbContainer || !rbStackView) return;
+    UIView *win = rbContainer.window;
+    if (!win) { RBLog(@"deck usable skipped: no window"); return; }
+
+    CGRect containerInWindow = [rbContainer convertRect:rbContainer.bounds toView:nil];
+    UIEdgeInsets insets = win.safeAreaInsets;
+    // Some overlay windows report a zero safe area even on notched hardware. A
+    // zero top inset would put the card straight back under the sensor housing,
+    // so fall back to the screen class's real top inset and say so in the log.
+    CGFloat safeTop = insets.top;
+    if (safeTop <= 0.5) {
+        safeTop = (CGRectGetHeight(win.bounds) > 730.0) ? 47.0 : 20.0;
+        RBLog(@"deck usable safeTop fallback=%.0f (window reported 0)", safeTop);
+    }
+    CGFloat notchBottom = safeTop - CGRectGetMinY(containerInWindow);
+    CGFloat topLimit = notchBottom + 10.0;
+    if (topLimit < 10.0) topLimit = 10.0;
+    CGFloat maxTop = CGRectGetHeight(rbContainer.bounds) * 0.45;
+    if (topLimit > maxTop) {
+        RBLog(@"deck usable clamped topLimit=%.0f -> %.0f", topLimit, maxTop);
+        topLimit = maxTop;
+    }
+    CGFloat bottomLimit = CGRectGetHeight(rbContainer.bounds) - 16.0;
+    CGFloat avail = bottomLimit - topLimit;
+    // Stacked mode (2 cards) shows both at once, so a card that CANNOT resize
+    // gets its height reserved first and the variable-height card only receives
+    // what is left over. Unknown height falls back to the clipboard card's
+    // measured ~100pt + stack spacing.
+    CGFloat reserved = 0.0;
+    if (rbSortedCards.count == 2) {
+        for (id<RBCard> other in rbSortedCards) {
+            if (![other respondsToSelector:@selector(rbSetAvailableHeight:)]) {
+                CGFloat h = CGRectGetHeight(other.rbView.frame);
+                reserved = (h > 1.0 ? h : 100.0) + 12.0;
+                break;
+            }
+        }
+    }
+    RBLog(@"deck usable win=%@ containerInWindow=%@ safeTop=%.0f safeBottom=%.0f "
+          @"topLimit=%.0f bottomLimit=%.0f avail=%.0f reserved=%.0f stack=%@",
+          NSStringFromClass([win class]), NSStringFromCGRect(containerInWindow),
+          safeTop, insets.bottom, topLimit, bottomLimit, avail, reserved,
+          NSStringFromCGRect(rbStackView.frame));
+    if (avail < 120.0) { RBLog(@"deck usable bail: avail=%.0f", avail); return; }
+
+    rbStackTopConstraint.constant = topLimit;
+    // Tell every card how much room it really has. The privacy card re-windows
+    // its expanded row list from this instead of assuming 8 rows fit.
+    for (id<RBCard> card in rbSortedCards) {
+        if ([card respondsToSelector:@selector(rbSetAvailableHeight:)]) {
+            [card rbSetAvailableHeight:(avail - reserved)];
         }
     }
 }
