@@ -314,9 +314,10 @@ static void RBReloadSettings(void) {
 // The container spans the whole Reachability band, but only explicitly tagged
 // card rows ('RDB1'), the long-press menu/overlay ('RDB2'), the show-all /
 // collapse footer ('RDB3'), the card-stack sliver ('RDB4'), the clipboard card
-// root ('RDB5'), the now-playing transport buttons ('RDB6') and the now-playing
-// scrubber ('RDB7') consume touches. Everything else returns nil so Reachability
-// gestures still pass through.
+// root ('RDB5'), the now-playing transport buttons ('RDB6'), the now-playing
+// scrubber ('RDB7') and the empty-state "open music" button ('RDB8') consume
+// touches. Everything else returns nil so Reachability gestures still pass
+// through.
 @interface RBReachDeckContainerView : UIView
 @end
 @implementation RBReachDeckContainerView
@@ -326,11 +327,12 @@ static void RBReloadSettings(void) {
     for (UIView *v = hit; v && v != self; v = v.superview) {
         // 'RDB1' row; 'RDB2' menu/overlay; 'RDB3' expand footer;
         // 'RDB4' card-stack sliver; 'RDB5' clipboard card root;
-        // 'RDB6' now-playing transport button; 'RDB7' now-playing scrubber.
+        // 'RDB6' now-playing transport button; 'RDB7' now-playing scrubber;
+        // 'RDB8' now-playing empty-state open button.
         if (v.tag == 0x52444231 || v.tag == 0x52444232 ||
             v.tag == 0x52444233 || v.tag == 0x52444234 ||
             v.tag == 0x52444235 || v.tag == 0x52444236 ||
-            v.tag == 0x52444237) return hit;
+            v.tag == 0x52444237 || v.tag == 0x52444238) return hit;
     }
     return nil;
 }

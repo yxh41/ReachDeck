@@ -23,6 +23,11 @@ static NSString *const kRBOptionPlaybackPosition = @"kMRMediaRemoteOptionPlaybac
 // 'RDB7': the scrubber is the only view on any card that swallows a DRAG. It has
 // to be whitelisted in the container's hitTest or the touch never reaches it.
 static NSInteger const kRBScrubberTag = 0x52444237;
+// 'RDB8': the "open music" button on the empty state.
+static NSInteger const kRBOpenTag = 0x52444238;
+// Apple Music ships with the system, so this bundle id is always present -- no
+// probing, no fallbacks.
+static NSString *const kRBAppleMusicBundleID = @"com.apple.Music";
 
 // The now-playing dictionary is keyed by the identifier strings themselves, so
 // these match the exported kMRMediaRemoteNowPlayingInfo* constants without
@@ -59,6 +64,74 @@ static RBNPSendFn rbNPSendCommand(void) {
     void *h = rbMediaRemoteHandle();
     if (!h) return NULL;
     return (RBNPSendFn)dlsym(h, "MRMediaRemoteSendCommand");
+}
+
+// --- source app -------------------------------------------------------------
+//
+// "正在播放" from Music, from Spotify and from a podcast app are three very
+// different things, and until now the card said nothing about which one it was.
+
+typedef void (*RBNPGetClientFn)(dispatch_queue_t queue, void (^handler)(id client));
+
+// The client that MRMediaRemoteGetNowPlayingClient hands back is a private
+// MRNowPlayingClient instance. Declaring just the one method keeps the call
+// type-checked instead of falling back to performSelector, which loses the
+// return type and trips -Werror.
+@protocol RBNPClient <NSObject>
+- (NSString *)bundleIdentifier;
+@end
+
+static RBNPGetClientFn rbNPGetClient(void) {
+    void *h = rbMediaRemoteHandle();
+    if (!h) return NULL;
+    return (RBNPGetClientFn)dlsym(h, "MRMediaRemoteGetNowPlayingClient");
+}
+
+// LSApplicationWorkspace is how this tweak opens another app without needing an
+// entitlement or a URL-scheme whitelist. Declared as a protocol so the call is
+// type-checked -- a bare performSelector would lose the BOOL return type and
+// trips -Werror.
+@protocol RBAppLaunching <NSObject>
++ (id)defaultWorkspace;
+- (BOOL)openApplicationWithBundleID:(NSString *)bundleID;
+@end
+
+static BOOL rbOpenApp(NSString *bundleID) {
+    Class cls = NSClassFromString(@"LSApplicationWorkspace");
+    if (!cls) {
+        RBLog(@"nowplaying open app skipped: no LSApplicationWorkspace");
+        return NO;
+    }
+    // 🔴 Two casts, both load-bearing under -Werror:
+    //   - sending +defaultWorkspace to a Class-typed receiver makes the compiler
+    //     look for a CLASS method on an unrelated type, so the receiver is cast
+    //     to bare id first (at runtime a Class still dispatches to its metaclass);
+    //   - the result is then cast back to the protocol so openApplication-
+    //     WithBundleID: is type-checked and keeps its BOOL return.
+    id<RBAppLaunching> ws = (id<RBAppLaunching>)[(id)cls defaultWorkspace];
+    if (!ws) return NO;
+    BOOL ok = [ws openApplicationWithBundleID:bundleID];
+    RBLog(@"nowplaying open app %@ ok=%d", bundleID, (int)ok);
+    return ok;
+}
+
+// The app icon, not the album artwork. Artwork is the fragile corner of
+// MediaRemote on iOS 16 -- it is simply not in the info dictionary -- while the
+// launch icon is stable, and it answers the more useful question anyway.
+@interface UIImage (RBAppIcon)
++ (UIImage *)_applicationIconImageForBundleIdentifier:(NSString *)bundleID format:(int)format;
+@end
+
+static UIImage *rbAppIcon(NSString *bundleID) {
+    if (!bundleID.length) return nil;
+    // 🔴 Guarded: this is a private UIKit entry point. If a future build drops it
+    // an unguarded call would raise unrecognised-selector inside SpringBoard,
+    // which is a Safe Mode crash for the sake of a 18pt thumbnail.
+    if (![UIImage respondsToSelector:@selector(_applicationIconImageForBundleIdentifier:format:)]) {
+        RBLog(@"nowplaying app icon unavailable: selector missing");
+        return nil;
+    }
+    return [UIImage _applicationIconImageForBundleIdentifier:bundleID format:2];
 }
 
 #pragma mark - scrubber
@@ -193,6 +266,18 @@ static RBNPSendFn rbNPSendCommand(void) {
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *artistLabel;
 @property (nonatomic, strong) RBNPScrubber *scrubber;
+// Two mutually exclusive faces of the same card: the full transport layout when
+// something is playing, and a single 44pt row when nothing is. The empty state
+// used to keep the whole card mounted at ~118pt, which on a half-screen
+// Reachability panel is a lot of nothing.
+// Hidden arranged subviews collapse to zero height, so flipping these six flags
+// is the entire switch between the two faces.
+@property (nonatomic, strong) UIStackView *headerRow;
+@property (nonatomic, strong) UIStackView *titleRow;
+@property (nonatomic, strong) UIStackView *emptyRow;
+@property (nonatomic, strong) UIImageView *appIconView;
+@property (nonatomic, strong) UIButton *openButton;
+@property (nonatomic, copy) NSString *sourceBundleID;
 // True from touchDown to touchUp on the scrubber. While set the tick and every
 // fetch-driven redraw leave elapsed/time/bar alone, otherwise the 1s clock drags
 // the bar back out from under the finger.
@@ -233,6 +318,10 @@ static RBNPSendFn rbNPSendCommand(void) {
 - (void)rbScrubChanged:(RBNPScrubber *)sender;
 - (void)rbScrubEnded:(RBNPScrubber *)sender;
 - (void)rbScrubCancelled:(RBNPScrubber *)sender;
+- (void)rbFetchSourceApp;
+- (void)rbApplySourceApp:(NSString *)bundleID;
+- (void)rbOpenMusicTapped:(UIButton *)sender;
+- (void)rbHaptic:(UIImpactFeedbackStyle)style;
 - (void)rbTouchDown:(UIControl *)sender;
 - (void)rbTouchCancel:(UIControl *)sender;
 - (void)rbScheduleDisarm;
@@ -305,6 +394,11 @@ static RBNPSendFn rbNPSendCommand(void) {
     self.timeLabel = nil;
     self.titleLabel = nil;
     self.artistLabel = nil;
+    self.headerRow = nil;
+    self.titleRow = nil;
+    self.emptyRow = nil;
+    self.appIconView = nil;
+    self.openButton = nil;
     self.scrubber = nil;
     // A rebuild throws the control away mid-drag only if the style changed from
     // the settings sheet, which cannot happen while a finger is on the card --
@@ -355,6 +449,64 @@ static RBNPSendFn rbNPSendCommand(void) {
                             duration:duration elapsed:elapsed playing:playing];
         });
     });
+    // Runs alongside the info fetch: an app that has no now-playing client simply
+    // reports none and the thumbnail stays hidden.
+    [self rbFetchSourceApp];
+}
+
+- (void)rbFetchSourceApp {
+    RBNPGetClientFn getClient = rbNPGetClient();
+    if (!getClient) {
+        RBLog(@"nowplaying source skipped: no MRMediaRemoteGetNowPlayingClient");
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    getClient(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(id client) {
+        // Same rule as the info dictionary: read on MediaRemote's queue, apply
+        // on main. The client object is not touched after this block returns.
+        NSString *bundleID = nil;
+        id<RBNPClient> c = (id<RBNPClient>)client;
+        if ([c respondsToSelector:@selector(bundleIdentifier)]) {
+            NSString *b = [c bundleIdentifier];
+            if ([b isKindOfClass:[NSString class]] && b.length) bundleID = [b copy];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf rbApplySourceApp:bundleID];
+        });
+    });
+}
+
+- (void)rbApplySourceApp:(NSString *)bundleID {
+    BOOL changed = !((bundleID.length == 0 && self.sourceBundleID.length == 0) ||
+                     [bundleID isEqualToString:self.sourceBundleID]);
+    self.sourceBundleID = bundleID;
+    // The client query can land before the first rbView access; buildView
+    // re-applies whatever is stored here, so bailing now loses nothing.
+    if (!self.appIconView) return;
+    if (bundleID.length == 0) {
+        self.appIconView.image = nil;
+        self.appIconView.hidden = YES;
+        if (changed) RBLog(@"nowplaying source app=none");
+        return;
+    }
+    UIImage *icon = rbAppIcon(bundleID);
+    if (icon) {
+        self.appIconView.image = icon;
+        self.appIconView.tintColor = nil;
+    } else {
+        // Better an SF Symbol than an empty 18pt square: the card keeps its
+        // rhythm and still says "some app is playing".
+        UIImageSymbolConfiguration *cfg =
+            [UIImageSymbolConfiguration configurationWithPointSize:10 weight:UIFontWeightSemibold];
+        UIImage *glyph = [[UIImage systemImageNamed:@"music.note" withConfiguration:cfg]
+                          imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        self.appIconView.image = glyph;
+        self.appIconView.tintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.72];
+    }
+    self.appIconView.hidden = NO;
+    if (changed) RBLog(@"nowplaying source app=%@ realIcon=%d", bundleID, (int)(icon != nil));
 }
 
 - (void)rbApplyTitle:(NSString *)title artist:(NSString *)artist
@@ -420,6 +572,14 @@ static RBNPSendFn rbNPSendCommand(void) {
     self.prevButton.enabled = has;
     self.nextButton.enabled = has;
     self.transportContainer.alpha = has ? 1.0 : 0.32;
+    // 🔴 Two faces, one card. Hiding an arranged subview collapses it to zero
+    // height (and drops its spacing), so the card resizes itself -- there is no
+    // constraint to flip and no height constant to keep in sync.
+    self.headerRow.hidden = !has;
+    self.titleRow.hidden = !has;
+    self.artistLabel.hidden = !has;
+    self.transportContainer.hidden = !has;
+    self.emptyRow.hidden = has;
     NSString *symbol = self.playing ? @"pause.fill" : @"play.fill";
     UIImageSymbolConfiguration *cfg =
         [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIFontWeightSemibold];
@@ -497,18 +657,21 @@ static RBNPSendFn rbNPSendCommand(void) {
 
 - (void)rbPrevTapped:(UIButton *)sender {
     (void)sender;
+    [self rbHaptic:UIImpactFeedbackStyleLight];
     [self rbSendCommand:kRBCmdPreviousTrack label:@"prev"];
     [self rbScheduleDisarm];
 }
 
 - (void)rbPlayPauseTapped:(UIButton *)sender {
     (void)sender;
+    [self rbHaptic:UIImpactFeedbackStyleLight];
     [self rbSendCommand:kRBCmdTogglePlayPause label:@"toggle"];
     [self rbScheduleDisarm];
 }
 
 - (void)rbNextTapped:(UIButton *)sender {
     (void)sender;
+    [self rbHaptic:UIImpactFeedbackStyleLight];
     [self rbSendCommand:kRBCmdNextTrack label:@"next"];
     [self rbScheduleDisarm];
 }
@@ -553,6 +716,7 @@ static RBNPSendFn rbNPSendCommand(void) {
         return;
     }
     double target = self.duration * sender.fraction;
+    [self rbHaptic:UIImpactFeedbackStyleRigid];
     RBLog(@"nowplaying scrub end fraction=%.3f target=%.0f", sender.fraction, target);
     [self rbSeekTo:target];
     [self rbScheduleDisarm];
@@ -586,6 +750,22 @@ static RBNPSendFn rbNPSendCommand(void) {
         if (!strongSelf) return;
         [strongSelf rbFetch];
     });
+}
+
+- (void)rbHaptic:(UIImpactFeedbackStyle)style {
+    // One tick, generated on demand. The panel is a short deliberate gesture --
+    // a light tap should feel like a tap, not like a game controller.
+    UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:style];
+    [gen impactOccurred];
+}
+
+- (void)rbOpenMusicTapped:(UIButton *)sender {
+    (void)sender;
+    [self rbHaptic:UIImpactFeedbackStyleLight];
+    // The whole reason Reachability exists is that the top of the screen is out
+    // of reach; the empty card should be a way into music, not a dead end.
+    rbOpenApp(kRBAppleMusicBundleID);
+    [self rbScheduleDisarm];
 }
 
 // Same rule as the other cards: arm the dismiss suppression on touchDown,
@@ -680,6 +860,7 @@ static RBNPSendFn rbNPSendCommand(void) {
     headerRow.alignment = UIStackViewAlignmentCenter;
     headerRow.spacing = 8;
     headerRow.userInteractionEnabled = NO;
+    self.headerRow = headerRow;
 
     self.headerLabel = [[UILabel alloc] init];
     self.headerLabel.text = @"正在播放";
@@ -702,13 +883,37 @@ static RBNPSendFn rbNPSendCommand(void) {
     [headerRow addArrangedSubview:self.timeLabel];
     [stack addArrangedSubview:headerRow];
 
+    // Title row carries the source-app icon on the left. The icon needs a fixed
+    // size: inside a horizontal stack a flexible label will happily squash an
+    // image view to zero width (the same trap the deck's pill glyph hit).
+    self.appIconView = [[UIImageView alloc] initWithFrame:CGRectZero];
+    self.appIconView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.appIconView.contentMode = UIViewContentModeScaleAspectFit;
+    self.appIconView.layer.cornerRadius = 4.0;
+    self.appIconView.layer.cornerCurve = kCACornerCurveContinuous;
+    self.appIconView.clipsToBounds = YES;
+    self.appIconView.userInteractionEnabled = NO;
+    self.appIconView.hidden = YES;
+    [self.appIconView.widthAnchor constraintEqualToConstant:18].active = YES;
+    [self.appIconView.heightAnchor constraintEqualToConstant:18].active = YES;
+    [self.appIconView setContentHuggingPriority:UILayoutPriorityRequired
+                                        forAxis:UILayoutConstraintAxisHorizontal];
+
     self.titleLabel = [[UILabel alloc] init];
     self.titleLabel.numberOfLines = 1;
     self.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     self.titleLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.95];
     self.titleLabel.font = [UIFont systemFontOfSize:(_styleCompact ? 13 : 14) weight:UIFontWeightSemibold];
     self.titleLabel.userInteractionEnabled = NO;
-    [stack addArrangedSubview:self.titleLabel];
+
+    UIStackView *titleRow = [[UIStackView alloc] init];
+    titleRow.axis = UILayoutConstraintAxisHorizontal;
+    titleRow.alignment = UIStackViewAlignmentCenter;
+    titleRow.spacing = 7;
+    self.titleRow = titleRow;
+    [titleRow addArrangedSubview:self.appIconView];
+    [titleRow addArrangedSubview:self.titleLabel];
+    [stack addArrangedSubview:titleRow];
 
     self.artistLabel = [[UILabel alloc] init];
     self.artistLabel.numberOfLines = 1;
@@ -765,9 +970,70 @@ static RBNPSendFn rbNPSendCommand(void) {
         [transport.bottomAnchor constraintEqualToAnchor:self.transportContainer.bottomAnchor],
     ]];
 
+    // Empty state: one 44pt row instead of a ~118pt card of nothing. Every other
+    // arranged subview collapses to zero height when hidden, so the same stack
+    // serves both faces and no constraint ever has to be flipped.
+    UIStackView *empty = [[UIStackView alloc] init];
+    empty.axis = UILayoutConstraintAxisHorizontal;
+    empty.alignment = UIStackViewAlignmentCenter;
+    empty.spacing = 8;
+    empty.translatesAutoresizingMaskIntoConstraints = NO;
+    empty.hidden = YES;
+    [empty.heightAnchor constraintEqualToConstant:44].active = YES;
+    [stack addArrangedSubview:empty];
+    self.emptyRow = empty;
+
+    UIImageSymbolConfiguration *noteCfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:13 weight:UIFontWeightMedium];
+    UIImageView *note = [[UIImageView alloc] initWithImage:
+                         [UIImage systemImageNamed:@"music.note" withConfiguration:noteCfg]];
+    note.tintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
+    note.contentMode = UIViewContentModeCenter;
+    note.userInteractionEnabled = NO;
+    note.translatesAutoresizingMaskIntoConstraints = NO;
+    [note.widthAnchor constraintEqualToConstant:15].active = YES;
+    [note.heightAnchor constraintEqualToConstant:15].active = YES;
+    [note setContentHuggingPriority:UILayoutPriorityRequired
+                            forAxis:UILayoutConstraintAxisHorizontal];
+    [empty addArrangedSubview:note];
+
+    UILabel *emptyLabel = [[UILabel alloc] init];
+    emptyLabel.text = @"没有正在播放的内容";
+    emptyLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.62];
+    emptyLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    emptyLabel.userInteractionEnabled = NO;
+    // Low hugging on purpose: the label absorbs the slack so the button sits at
+    // the trailing edge instead of floating in the middle.
+    [emptyLabel setContentHuggingPriority:UILayoutPriorityDefaultLow
+                                  forAxis:UILayoutConstraintAxisHorizontal];
+    [empty addArrangedSubview:emptyLabel];
+
+    self.openButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.openButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.openButton.tag = kRBOpenTag;
+    self.openButton.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.14];
+    self.openButton.layer.cornerRadius = 13.0;
+    self.openButton.layer.cornerCurve = kCACornerCurveContinuous;
+    self.openButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+    [self.openButton setTitle:@"打开音乐" forState:UIControlStateNormal];
+    [self.openButton setTitleColor:[[UIColor whiteColor] colorWithAlphaComponent:0.90]
+                          forState:UIControlStateNormal];
+    [self.openButton addTarget:self action:@selector(rbOpenMusicTapped:)
+              forControlEvents:UIControlEventTouchUpInside];
+    [self.openButton addTarget:self action:@selector(rbTouchDown:)
+              forControlEvents:UIControlEventTouchDown];
+    [self.openButton addTarget:self action:@selector(rbTouchCancel:)
+              forControlEvents:(UIControlEventTouchCancel |
+                                UIControlEventTouchUpOutside |
+                                UIControlEventTouchDragExit)];
+    [self.openButton.widthAnchor constraintEqualToConstant:78].active = YES;
+    [self.openButton.heightAnchor constraintEqualToConstant:26].active = YES;
+    [empty addArrangedSubview:self.openButton];
+
     // A style change rebuilds the whole view; the card must not forget what is
     // playing just because the outline width moved. State lives in the card,
-    // the view only renders it.
+    // the view only renders it -- including which app is playing.
+    if (self.sourceBundleID.length) [self rbApplySourceApp:self.sourceBundleID];
     [self rbUpdateLabels];
     if (self.hasMedia) [self rbStartTick];
 }
