@@ -118,9 +118,12 @@ static NSArray<id<RBCard>> *rbSortedCards = nil;
 //   rear card   decorative card behind the front one (never interactive); it is
 //               a plain rounded rect on purpose -- a real card view would bring
 //               its own rows and hitTest and steal touches from underneath
-//   rbPeekTap   the grabber pill straddling the front card's top edge (tap target)
+//   rbPeekTap   the grabber pill, sitting ENTIRELY on the rear band at its left
+//               edge (0.3.5: it used to straddle the shared edge, centred)
 //   rbPeekLabel next card's short name inside that pill
-static CGFloat const kRBPeekOffset = 14.0; // how far the rear card sticks out
+// 0.3.5: 14 -> 22. The pill is 15pt tall and must not cross the seam, so the
+// band has to be tall enough to host it with ~3.5pt of padding above and below.
+static CGFloat const kRBPeekOffset = 22.0; // how far the rear card sticks out
 static UIControl *rbPeekTap = nil;
 static UILabel *rbPeekLabel = nil;
 // 0.3.1: geometry the deck is allowed to occupy on the current presentation.
@@ -259,6 +262,41 @@ static void RBReloadSettings(void) {
 @implementation RBReachDeckPeekButton
 @end
 
+// 0.3.5: the front card's drop shadow.
+// It cannot live on the card's own layer: every card root is clipsToBounds with
+// a corner radius, so layer.shadow* is clipped away outright. A separate shadow
+// HOST view would be worse -- it paints a blurred copy of the whole path,
+// interior included, and at 20% card opacity that reads as the ghost rectangle
+// 0.3.4 spent a build killing. So the shadow is drawn only where it is visible:
+// a top-down dark gradient confined to the rear band, sitting between the band
+// and the front card. Backing layer is the gradient itself, so it resizes with
+// the view and no layoutSubviews bookkeeping is needed.
+@interface RBReachDeckShadowView : UIView
+@end
+@implementation RBReachDeckShadowView
++ (Class)layerClass {
+    return [CAGradientLayer class];
+}
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.userInteractionEnabled = NO;
+        self.opaque = NO;
+        CAGradientLayer *g = (CAGradientLayer *)self.layer;
+        g.colors = @[
+            (id)[[UIColor blackColor] colorWithAlphaComponent:0.00].CGColor,
+            (id)[[UIColor blackColor] colorWithAlphaComponent:0.09].CGColor,
+            (id)[[UIColor blackColor] colorWithAlphaComponent:0.20].CGColor,
+            (id)[[UIColor blackColor] colorWithAlphaComponent:0.33].CGColor,
+        ];
+        g.locations = @[ @0.0, @0.42, @0.74, @1.0 ];
+        g.startPoint = CGPointMake(0.5, 0.0);
+        g.endPoint = CGPointMake(0.5, 1.0);
+    }
+    return self;
+}
+@end
+
 // The container spans the whole Reachability band, but only explicitly tagged
 // card rows ('RDB1'), the long-press menu/overlay ('RDB2'), the show-all /
 // collapse footer ('RDB3'), the card-stack sliver ('RDB4'), and the clipboard
@@ -391,12 +429,14 @@ static void RBReloadSettings(void) {
     //               for the system Reachability dismiss; nothing is ever tiled.
     BOOL showPeek = (sorted.count >= 2);
 
-    // 0.3.3/0.3.4 card stack, "grabber + depth":
-    //   - the card behind is drawn as a BAND ONLY (14pt tall, inset 8pt, radius
+    // 0.3.3/0.3.4/0.3.5 card stack, "grabber + depth":
+    //   - the card behind is drawn as a BAND ONLY (22pt tall, inset 8pt, radius
     //     +2). Depth is geometry, never an alpha difference;
-    //   - the front card gets a 1pt light line on its top edge;
-    //   - an 80x17 grabber pill straddles that edge (8.5pt above, 8.5pt below)
-    //     and carries a chevron plus the NEXT card's name.
+    //   - 0.3.5: the 1pt light line on the front card's top edge is GONE -- the
+    //     band now carries a gradient shadow cast by the front card instead;
+    //   - 0.3.5: an 88x15 grabber pill sits ENTIRELY on that band, flush with
+    //     its left edge (it used to straddle the seam, centred), and carries a
+    //     chevron plus the NEXT card's name.
     // 🔴 0.3.4 field report: at low card opacity the rear card used to be a FULL
     // card painted behind the front one, so it bled through the translucent card
     // and read as a ghost rectangle inside it -- worst with the border at 0,
@@ -462,17 +502,19 @@ static void RBReloadSettings(void) {
     [NSLayoutConstraint activateConstraints:stackConstraints];
     rbStackView = stack;
 
-    // 0.3.3: the highlight + grabber are created AFTER the stack so they render
+    // 0.3.3: the shadow + grabber are created AFTER the stack so they render
     // above the card (a sibling added earlier would be covered by it).
     if (showPeek && rear) {
-        UIView *hl = [[UIView alloc] initWithFrame:CGRectZero];
-        hl.translatesAutoresizingMaskIntoConstraints = NO;
-        hl.userInteractionEnabled = NO;
-        // With a borderless card this 1pt line is the ONLY thing separating the
-        // two planes, so it carries a little more weight in that case.
-        CGFloat hlAlpha = (rbStyleBorder > 0.01) ? 0.30 : 0.42;
-        hl.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:hlAlpha];
-        [container addSubview:hl];
+        // 0.3.5: the 1pt light line is gone. The front card now casts a shadow
+        // down onto the rear band, so the two planes separate by shading
+        // instead of by a hard hairline that fought the card's own border.
+        RBReachDeckShadowView *shade = [[RBReachDeckShadowView alloc] initWithFrame:CGRectZero];
+        shade.translatesAutoresizingMaskIntoConstraints = NO;
+        shade.layer.cornerRadius = MIN(rbStyleCorner + 2.0, 24.0);
+        shade.layer.cornerCurve = kCACornerCurveContinuous;
+        shade.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+        shade.layer.masksToBounds = YES;
+        [container addSubview:shade];
 
         RBReachDeckPeekButton *tap = [[RBReachDeckPeekButton alloc] initWithFrame:CGRectZero];
         tap.translatesAutoresizingMaskIntoConstraints = NO;
@@ -484,7 +526,7 @@ static void RBReloadSettings(void) {
         // control, so it keeps a floor of 0.55.
         CGFloat pillAlpha = MIN(MAX(rbStyleOpacity + 0.15, 0.55), 1.0);
         tap.backgroundColor = [UIColor colorWithWhite:0.0 alpha:pillAlpha];
-        tap.layer.cornerRadius = 8.5;
+        tap.layer.cornerRadius = 7.5;
         tap.layer.cornerCurve = kCACornerCurveContinuous;
         tap.layer.borderWidth = 0.5;
         tap.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.45].CGColor;
@@ -518,37 +560,44 @@ static void RBReloadSettings(void) {
         rbPeekLabel = name;
 
         [NSLayoutConstraint activateConstraints:@[
-            // rear band: 8pt inset, 14pt higher, and ONLY the band -- the 0.5pt
-            // tail into the card just hides the anti-aliased seam.
+            // rear band: 8pt inset, kRBPeekOffset higher, and ONLY the band --
+            // the 0.5pt tail into the card just hides the anti-aliased seam.
             [rear.leadingAnchor constraintEqualToAnchor:stack.leadingAnchor constant:8],
             [rear.trailingAnchor constraintEqualToAnchor:stack.trailingAnchor constant:-8],
             [rear.topAnchor constraintEqualToAnchor:stack.topAnchor constant:-kRBPeekOffset],
             [rear.heightAnchor constraintEqualToConstant:(kRBPeekOffset + 0.5)],
-            // 1pt light line on the front card's top edge, inset past the corners
-            [hl.leadingAnchor constraintEqualToAnchor:stack.leadingAnchor constant:12],
-            [hl.trailingAnchor constraintEqualToAnchor:stack.trailingAnchor constant:-12],
-            [hl.topAnchor constraintEqualToAnchor:stack.topAnchor constant:0.5],
-            [hl.heightAnchor constraintEqualToConstant:1],
-            // grabber pill straddles that edge: 8.5pt above, 8.5pt below
-            [tap.centerXAnchor constraintEqualToAnchor:stack.centerXAnchor],
-            [tap.centerYAnchor constraintEqualToAnchor:stack.topAnchor],
-            [tap.widthAnchor constraintEqualToConstant:80],
-            [tap.heightAnchor constraintEqualToConstant:17],
-            [chevron.leadingAnchor constraintEqualToAnchor:tap.leadingAnchor constant:12],
+            // shadow: exactly the band, ending on the front card's top edge so
+            // the darkest stop sits against the seam (top corners only, which is
+            // why it can be anchored to the band's own box).
+            [shade.leadingAnchor constraintEqualToAnchor:rear.leadingAnchor],
+            [shade.trailingAnchor constraintEqualToAnchor:rear.trailingAnchor],
+            [shade.topAnchor constraintEqualToAnchor:rear.topAnchor],
+            [shade.bottomAnchor constraintEqualToAnchor:stack.topAnchor],
+            // 0.3.5 grabber: entirely ON the rear band, flush with its left edge.
+            // centreY is measured from the seam upwards so the pill can never
+            // creep over the front card whatever the band height is. The 14pt
+            // inset keeps the pill clear of the band's own top-left arc (radius
+            // corner+2 curls ~7pt inwards at this height).
+            [tap.leadingAnchor constraintEqualToAnchor:rear.leadingAnchor constant:14],
+            [tap.centerYAnchor constraintEqualToAnchor:stack.topAnchor
+                                             constant:-(kRBPeekOffset * 0.5)],
+            [tap.widthAnchor constraintEqualToConstant:84],
+            [tap.heightAnchor constraintEqualToConstant:15],
+            [chevron.leadingAnchor constraintEqualToAnchor:tap.leadingAnchor constant:10],
             [chevron.centerYAnchor constraintEqualToAnchor:tap.centerYAnchor],
             [chevron.widthAnchor constraintEqualToConstant:10],
             [chevron.heightAnchor constraintEqualToConstant:10],
             [name.leadingAnchor constraintEqualToAnchor:chevron.trailingAnchor constant:5],
-            [name.trailingAnchor constraintEqualToAnchor:tap.trailingAnchor constant:-10],
+            [name.trailingAnchor constraintEqualToAnchor:tap.trailingAnchor constant:-8],
             [name.centerYAnchor constraintEqualToAnchor:tap.centerYAnchor],
         ]];
 
-        // Self-evidence for the 0.3.4 fix: these are the exact values the band
-        // and the pill were built with, so a report can be checked without
-        // guessing what the sliders were set to.
-        RBLog(@"stack rear band h=%.1f inset=8 offset=%.0f alpha=%.2f border=%.1f hl=%.2f pill=%.2f",
+        // Self-evidence for the 0.3.5 geometry: these are the exact values the
+        // band, the shade and the pill were built with, so a report can be
+        // checked without guessing what the sliders were set to.
+        RBLog(@"stack rear band h=%.1f inset=8 offset=%.0f alpha=%.2f border=%.1f pill=%.2f pill=lead+14 w=84 h=15 shade=grad",
               (kRBPeekOffset + 0.5), kRBPeekOffset, rbStyleOpacity,
-              rear.layer.borderWidth, hlAlpha, pillAlpha);
+              rear.layer.borderWidth, pillAlpha);
 
         // Name of the card sitting behind, so the pill says what it switches to.
         NSUInteger nextIdx = (rbCurrentCardIndex + 1) % sorted.count;

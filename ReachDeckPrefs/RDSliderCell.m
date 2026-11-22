@@ -118,20 +118,38 @@ typedef NS_ENUM(NSInteger, RDValueStyle) {
 - (CGFloat)normalizedValue:(CGFloat)value {
     if (!isfinite(value)) value = self.defaultValue;
     value = MAX(self.minimumValue, MIN(self.maximumValue, value));
-    value = round(value / self.inputStep) * self.inputStep;
+    CGFloat step = self.inputStep;
+    if (step > 0.0 && isfinite(step)) {
+        // Snap on an integer grid, then undo the binary-float residue that
+        // step * index introduces (0.1 * 3 = 0.30000000000000004), so the plist
+        // stores 0.3 instead of a 17-digit ghost and the caption reads cleanly.
+        double snapped = round((double)value / (double)step) * (double)step;
+        snapped = round(snapped * 1000.0) / 1000.0;
+        value = (CGFloat)snapped;
+    }
     return MAX(self.minimumValue, MIN(self.maximumValue, value));
 }
 
 - (NSString *)formattedValue:(CGFloat)value {
-    long iv = (long)lround(value);
+    // 0.3.5: a sub-unit inputStep means the value can legitimately sit between
+    // two integers. This used to lround() unconditionally, so with a 0.1 step
+    // the caption still printed "1 pt" for anything from 0.5 to 1.4 and the
+    // slider looked like it could not do decimals at all.
+    NSString *number = nil;
+    if (self.inputStep > 0.0 && self.inputStep < 1.0) {
+        int decimals = (self.inputStep < 0.1) ? 2 : 1;
+        number = [NSString stringWithFormat:@"%.*f", decimals, (double)value];
+    } else {
+        number = [NSString stringWithFormat:@"%ld", (long)lround(value)];
+    }
     switch (self.valueStyle) {
         case RDValueStylePercent:
-            return [NSString stringWithFormat:@"%ld%%", iv];
+            return [number stringByAppendingString:@"%"];
         case RDValueStylePoints:
-            return [NSString stringWithFormat:@"%ld pt", iv];
+            return [number stringByAppendingString:@" pt"];
         case RDValueStylePlain:
         default:
-            return [NSString stringWithFormat:@"%ld", iv];
+            return number;
     }
 }
 

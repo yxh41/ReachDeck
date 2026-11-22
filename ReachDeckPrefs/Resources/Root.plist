@@ -64,7 +64,7 @@
 			<key>label</key>
 			<string>更多卡片</string>
 		<key>footerText</key>
-		<string>两张卡片时上下并排显示；三张以上时右侧出现图标轨道，点按切换。</string>
+		<string>两张及以上时叠成一摞，只显示最上面一张；点按左上角的胶囊切换到下一张。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -168,7 +168,7 @@
 			<key>defaultValue</key>
 			<real>1</real>
 			<key>inputStep</key>
-			<real>1</real>
+			<real>0.1</real>
 			<key>valueStyle</key>
 			<string>plain</string>
 		</dict>
