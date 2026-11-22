@@ -14,6 +14,9 @@ static char kRBDurationKeyKey;                 // 0.2.27: rowKey on the duration
 static char kRBLongPressRowKey;                // 0.2.29: full row dict on the long-press recognizer
 static char kRBMenuContextKey;                 // 0.2.29: row dict on the popup menu
 static NSInteger const kRBMenuTag = 0x52444232; // 'RDB2': menu/overlay allowed by hitTest bridge
+static NSInteger const kRBExpandTag = 0x52444233; // 'RDB3': "show all / collapse" footer
+static NSUInteger const kRBCollapsedRowLimit = 3;
+static NSUInteger const kRBExpandedRowLimit = 8;
 static NSInteger rbPulseCount = 0;              // 0.2.17 diagnostic pulse counter
 static NSTimer *rbPulseTimer = nil;            // keep only one pulse series alive
 static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels for self-proof
@@ -34,6 +37,9 @@ static RBPrivacyCard *rbActivePrivacyCard = nil; // 0.2.31: for cross-process ca
 @property (nonatomic, strong) UIStackView *rowsStack;
 @property (nonatomic, strong) UILabel *emptyLabel;
 @property (nonatomic, strong) NSArray<NSDictionary *> *rows; // visible rows after merge/sort/cap
+@property (nonatomic, copy) NSArray<NSDictionary *> *allRows;   // full sorted list before windowing
+@property (nonatomic, assign) NSUInteger totalCount;
+@property (nonatomic, assign) BOOL expanded;                    // "还有 N 项" expanded to all rows
 @property (nonatomic, assign) BOOL hideSystemServices;
 @property (nonatomic, strong) NSSet *lastAttributions;
 @property (nonatomic, strong) NSSet *lastActiveAttributions;
@@ -64,6 +70,9 @@ static RBPrivacyCard *rbActivePrivacyCard = nil; // 0.2.31: for cross-process ca
 - (void)rbShowRowMenu:(UILongPressGestureRecognizer *)gesture;
 - (void)rbDismissRowMenu:(id)sender;
 - (void)rbMenuTapped:(UIButton *)button;
+- (void)rbApplyVisibleRows;
+- (void)rbToggleExpanded:(UITapGestureRecognizer *)gesture;
+- (UIView *)rbExpansionFooter;
 @end
 
 @implementation RBPrivacyCard
@@ -87,6 +96,7 @@ static RBPrivacyCard *rbActivePrivacyCard = nil; // 0.2.31: for cross-process ca
         _styleBorder = 1;
         _styleCompact = NO;
         _rows = @[];
+        _allRows = @[];
         _activeSince = [NSMutableDictionary dictionary];
         rbActivePrivacyCard = self;
         // SAFE MODE FIX (0.0.2): never touch UIKit here. A card can be created
@@ -152,7 +162,30 @@ void RBPrivacyCancelInteraction(void) {
     [self renderRows];
 }
 
+// 0.2.34: expansion is session-only. Reset when the reachability container tears
+// down so the next presentation starts at the compact 3-row height again.
+- (void)rbWillUnmount {
+    if (!self.expanded) return;
+    self.expanded = NO;
+    [self rbApplyVisibleRows];
+    RBLog(@"rows collapsed on unmount total=%lu", (unsigned long)self.totalCount);
+}
+
 #pragma mark - data ingestion
+
+// 0.2.34: derive the visible window from the full sorted list. The card stays at
+// 3 rows by default; tapping the footer expands to at most 8 rows. Keeping this
+// separate from ingestion means a sensor push while expanded preserves the state.
+- (void)rbApplyVisibleRows {
+    NSUInteger total = self.allRows.count;
+    if (total <= kRBCollapsedRowLimit) self.expanded = NO;
+    NSUInteger limit = self.expanded
+        ? MIN(total, kRBExpandedRowLimit)
+        : MIN(total, kRBCollapsedRowLimit);
+    self.totalCount = total;
+    self.rows = limit > 0 ? [self.allRows subarrayWithRange:NSMakeRange(0, limit)] : @[];
+    self.hiddenCount = total - self.rows.count;
+}
 
 - (void)setHideSystemServices:(BOOL)hide {
     if (_hideSystemServices == hide) return;
@@ -325,13 +358,11 @@ void RBPrivacyCancelInteraction(void) {
                            options:(NSCaseInsensitiveSearch | NSNumericSearch)];
     }];
 
-    NSUInteger maxRows = 3;
-    NSUInteger total = out.count;
-    NSArray *visible = total > maxRows ? [out subarrayWithRange:NSMakeRange(0, maxRows)] : out;
-    self.hiddenCount = total - visible.count;
-    self.rows = [visible copy];
-    RBLog(@"ingest rows=%lu from attrs=%lu hidden=%lu",
-          (unsigned long)visible.count, (unsigned long)attributions.count, (unsigned long)self.hiddenCount);
+    self.allRows = [out copy];
+    [self rbApplyVisibleRows];
+    RBLog(@"ingest rows=%lu from attrs=%lu hidden=%lu total=%lu expanded=%d",
+          (unsigned long)self.rows.count, (unsigned long)attributions.count,
+          (unsigned long)self.hiddenCount, (unsigned long)self.totalCount, (int)self.expanded);
     [self renderRows];
 }
 
@@ -941,7 +972,8 @@ void RBPrivacyCancelInteraction(void) {
     // kills its gesture recognizers. Rebuild only when the rendered content
     // actually changes.
     NSMutableString *sig = [NSMutableString string];
-    [sig appendFormat:@"h=%lu|", (unsigned long)self.hiddenCount];
+    [sig appendFormat:@"e=%d|t=%lu|h=%lu|", (int)self.expanded,
+        (unsigned long)self.totalCount, (unsigned long)self.hiddenCount];
     for (NSDictionary *row in self.rows) {
         [sig appendFormat:@"%@:%@:%@:%@:%@|",
             row[@"key"] ?: @"", row[@"kind"] ?: @"",
@@ -964,14 +996,79 @@ void RBPrivacyCancelInteraction(void) {
         [self.rowsStack addArrangedSubview:[self rowViewFor:row]];
     }
 
-    if (self.hiddenCount > 0) {
-        UILabel *more = [[UILabel alloc] init];
-        more.text = [NSString stringWithFormat:@"还有 %lu 项", (unsigned long)self.hiddenCount];
-        more.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.6];
-        more.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
-        more.textAlignment = NSTextAlignmentLeft;
-        [self.rowsStack addArrangedSubview:more];
+    if (self.totalCount > kRBCollapsedRowLimit) {
+        [self.rowsStack addArrangedSubview:[self rbExpansionFooter]];
     }
+}
+
+// 0.2.34: tappable footer. 'RDB3' lets the Reachability hitTest bridge accept
+// this view without widening the bridge to every card subview. Labels are
+// non-interactive so the tap always lands on the tagged footer itself.
+- (UIView *)rbExpansionFooter {
+    BOOL expanded = self.expanded;
+    UIView *footer = [[UIView alloc] init];
+    footer.translatesAutoresizingMaskIntoConstraints = NO;
+    footer.tag = kRBExpandTag;
+    footer.userInteractionEnabled = YES;
+    footer.accessibilityTraits = UIAccessibilityTraitButton;
+
+    UILabel *hint = [[UILabel alloc] init];
+    hint.translatesAutoresizingMaskIntoConstraints = NO;
+    hint.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    hint.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.62];
+    hint.userInteractionEnabled = NO;
+    if (!expanded) {
+        hint.text = [NSString stringWithFormat:@"还有 %lu 项", (unsigned long)self.hiddenCount];
+    } else if (self.hiddenCount > 0) {
+        hint.text = [NSString stringWithFormat:@"仅显示前 %lu 项", (unsigned long)kRBExpandedRowLimit];
+    } else {
+        hint.text = [NSString stringWithFormat:@"共 %lu 项", (unsigned long)self.totalCount];
+    }
+    [footer addSubview:hint];
+
+    UILabel *action = [[UILabel alloc] init];
+    action.translatesAutoresizingMaskIntoConstraints = NO;
+    action.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    action.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.88];
+    action.text = expanded ? @"收起" : nil;
+    action.userInteractionEnabled = NO;
+    [footer addSubview:action];
+
+    UIImage *chevronImage = [UIImage systemImageNamed:(expanded ? @"chevron.up" : @"chevron.down")];
+    UIImageView *chevron = [[UIImageView alloc] initWithImage:chevronImage];
+    chevron.translatesAutoresizingMaskIntoConstraints = NO;
+    chevron.tintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
+    chevron.contentMode = UIViewContentModeScaleAspectFit;
+    chevron.userInteractionEnabled = NO;
+    [footer addSubview:chevron];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [footer.heightAnchor constraintEqualToConstant:28],
+        [hint.leadingAnchor constraintEqualToAnchor:footer.leadingAnchor constant:2],
+        [hint.centerYAnchor constraintEqualToAnchor:footer.centerYAnchor],
+        [chevron.trailingAnchor constraintEqualToAnchor:footer.trailingAnchor constant:-2],
+        [chevron.centerYAnchor constraintEqualToAnchor:footer.centerYAnchor],
+        [chevron.widthAnchor constraintEqualToConstant:12],
+        [chevron.heightAnchor constraintEqualToConstant:12],
+        [action.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-5],
+        [action.centerYAnchor constraintEqualToAnchor:footer.centerYAnchor],
+        [hint.trailingAnchor constraintLessThanOrEqualToAnchor:action.leadingAnchor constant:-8],
+    ]];
+
+    UITapGestureRecognizer *tap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rbToggleExpanded:)];
+    [footer addGestureRecognizer:tap];
+    return footer;
+}
+
+- (void)rbToggleExpanded:(UITapGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateEnded) return;
+    if (self.totalCount <= kRBCollapsedRowLimit) return;
+    self.expanded = !self.expanded;
+    [self rbApplyVisibleRows];
+    RBLog(@"rows expand=%d total=%lu visible=%lu",
+          (int)self.expanded, (unsigned long)self.totalCount, (unsigned long)self.rows.count);
+    [self renderRows];
 }
 
 - (UIView *)rowViewFor:(NSDictionary *)row {

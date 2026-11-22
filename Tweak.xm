@@ -213,8 +213,9 @@ static void RBReloadSettings(void) {
 #pragma mark - Card container
 
 // The container spans the whole Reachability band, but only explicitly tagged
-// card rows ('RDB1') and the long-press menu/overlay ('RDB2') consume touches.
-// Everything else returns nil so Reachability gestures still pass through.
+// card rows ('RDB1'), the long-press menu/overlay ('RDB2'), and the show-all /
+// collapse footer ('RDB3') consume touches. Everything else returns nil so
+// Reachability gestures still pass through.
 @interface RBReachDeckContainerView : UIView
 @end
 @implementation RBReachDeckContainerView
@@ -222,8 +223,8 @@ static void RBReloadSettings(void) {
     UIView *hit = [super hitTest:point withEvent:event];
     if (!hit || hit == self) return nil;
     for (UIView *v = hit; v && v != self; v = v.superview) {
-        // 'RDB1' = interactive card row; 'RDB2' = 0.2.29 long-press menu/overlay.
-        if (v.tag == 0x52444231 || v.tag == 0x52444232) return hit;
+        // 'RDB1' = row; 'RDB2' = long-press menu/overlay; 'RDB3' = expand footer.
+        if (v.tag == 0x52444231 || v.tag == 0x52444232 || v.tag == 0x52444233) return hit;
     }
     return nil;
 }
@@ -260,6 +261,10 @@ static void RBReloadSettings(void) {
     // 0.2.31: clear the suppress flag on teardown so a menu left open from the
     // previous presentation cannot block a legitimate later deactivation.
     RBPrivacyCancelInteraction();
+    // 0.2.34: session-only card state (e.g. the expanded row list) resets here.
+    for (id<RBCard> card in rbCards) {
+        if ([card respondsToSelector:@selector(rbWillUnmount)]) [card rbWillUnmount];
+    }
     rbLiveController = nil;
     rbTopEffect = nil;
     // 0.2.9: sticky row is a retained pointer into the container. Clear it on
@@ -320,10 +325,20 @@ static void RBReloadSettings(void) {
     stack.alignment = UIStackViewAlignmentFill;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:stack];
+    // 0.2.34: keep the proven centred placement, but let a tall expanded card
+    // slide up instead of growing past the home indicator. Center is high (750),
+    // so normal content stays exactly where it was; the required bottom/top
+    // clamps only kick in when the expanded list would overflow.
+    NSLayoutConstraint *stackCenterY =
+        [stack.centerYAnchor constraintEqualToAnchor:container.centerYAnchor
+                                            constant:(rbCardAtBottom ? 140.0 : -110.0)];
+    stackCenterY.priority = UILayoutPriorityDefaultHigh; // 750
     [NSLayoutConstraint activateConstraints:@[
         [stack.centerXAnchor constraintEqualToAnchor:container.centerXAnchor],
-        [stack.centerYAnchor constraintEqualToAnchor:container.centerYAnchor constant:(rbCardAtBottom ? 140.0 : -110.0)],
+        stackCenterY,
         [stack.widthAnchor constraintEqualToAnchor:container.widthAnchor constant:-32],
+        [stack.bottomAnchor constraintLessThanOrEqualToAnchor:container.bottomAnchor constant:-16],
+        [stack.topAnchor constraintGreaterThanOrEqualToAnchor:container.topAnchor constant:60],
     ]];
 
     NSArray<id<RBCard>> *sorted = [rbCards sortedArrayUsingComparator:^NSComparisonResult(id<RBCard> a, id<RBCard> b) {
