@@ -23,10 +23,11 @@ static NSString *const kRBOptionPlaybackPosition = @"kMRMediaRemoteOptionPlaybac
 // 'RDB7': the scrubber is the only view on any card that swallows a DRAG. It has
 // to be whitelisted in the container's hitTest or the touch never reaches it.
 static NSInteger const kRBScrubberTag = 0x52444237;
-// 'RDB8': the "open music" button on the empty state.
+// 'RDB8': the empty-state music app buttons. One tag per app from this base
+// ('RDB8' + index); the container's hitTest accepts the whole band.
 static NSInteger const kRBOpenTag = 0x52444238;
-// Apple Music ships with the system, so this bundle id is always present -- no
-// probing, no fallbacks.
+// Last-resort target when none of the music apps below is installed (or when
+// LSApplicationProxy cannot be reached at all).
 static NSString *const kRBAppleMusicBundleID = @"com.apple.Music";
 
 // The now-playing dictionary is keyed by the identifier strings themselves, so
@@ -87,32 +88,101 @@ static RBNPGetClientFn rbNPGetClient(void) {
     return (RBNPGetClientFn)dlsym(h, "MRMediaRemoteGetNowPlayingClient");
 }
 
-// LSApplicationWorkspace is how this tweak opens another app without needing an
-// entitlement or a URL-scheme whitelist. Declared as a protocol so the call is
-// type-checked -- a bare performSelector would lose the BOOL return type and
-// trips -Werror.
+// LSApplicationWorkspace is the FALLBACK: it needs no entitlement and no URL
+// scheme whitelist. Declared as a protocol so the call is type-checked -- a bare
+// performSelector would lose the BOOL return type and trips -Werror.
 @protocol RBAppLaunching <NSObject>
 + (id)defaultWorkspace;
 - (BOOL)openApplicationWithBundleID:(NSString *)bundleID;
 @end
 
-static BOOL rbOpenApp(NSString *bundleID) {
-    Class cls = NSClassFromString(@"LSApplicationWorkspace");
-    if (!cls) {
-        RBLog(@"nowplaying open app skipped: no LSApplicationWorkspace");
-        return NO;
-    }
-    // 🔴 Two casts, both load-bearing under -Werror:
-    //   - sending +defaultWorkspace to a Class-typed receiver makes the compiler
-    //     look for a CLASS method on an unrelated type, so the receiver is cast
-    //     to bare id first (at runtime a Class still dispatches to its metaclass);
-    //   - the result is then cast back to the protocol so openApplication-
-    //     WithBundleID: is type-checked and keeps its BOOL return.
-    id<RBAppLaunching> ws = (id<RBAppLaunching>)[(id)cls defaultWorkspace];
-    if (!ws) return NO;
-    BOOL ok = [ws openApplicationWithBundleID:bundleID];
-    RBLog(@"nowplaying open app %@ ok=%d", bundleID, (int)ok);
-    return ok;
+// 🔴 0.4.4: openApplicationWithBundleID: is SYNCHRONOUS inside SpringBoard -- it
+// does not return until the target app reaches the foreground. The 0.4.3 field
+// log measures it: touch down at +28176ms, the call returned at +38332ms with
+// ok=0, and the launch only began at +38911ms. Ten seconds of frozen main
+// thread, which the user reads as "opening the app is slow".
+//
+// SpringBoardServices has the entry point the system itself uses:
+// SBSLaunchApplicationWithIdentifier only SUBMITS the launch request. It lives
+// in a private framework, so it is dlopen'd -- a link-time dependency that fails
+// to resolve would take the whole dylib down (Safe Mode) for one button.
+typedef int (*RBLaunchFn)(CFStringRef bundleID, Boolean suspended);
+
+static RBLaunchFn rbLaunchFn(void) {
+    static RBLaunchFn fn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+                         RTLD_LAZY);
+        if (h) fn = (RBLaunchFn)dlsym(h, "SBSLaunchApplicationWithIdentifier");
+        RBLog(@"nowplaying launch handle sbs=%d", (int)(fn != NULL));
+    });
+    return fn;
+}
+
+static void rbOpenApp(NSString *bundleID) {
+    if (!bundleID.length) return;
+    // 🔴 Never on the main thread. Even the lightweight path reaches FrontBoard
+    // over XPC, and the panel has to stay free to animate away the instant the
+    // button is tapped -- whatever the target app does next is its own business.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        CFTimeInterval t0 = CFAbsoluteTimeGetCurrent();
+        RBLaunchFn launch = rbLaunchFn();
+        if (launch) {
+            int rc = launch((__bridge CFStringRef)bundleID, false);
+            RBLog(@"nowplaying launch via=sbs app=%@ rc=%d took=%.1fms",
+                  bundleID, rc, (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+            if (rc == 0) return;
+        }
+        Class cls = NSClassFromString(@"LSApplicationWorkspace");
+        if (!cls) {
+            RBLog(@"nowplaying launch skipped: no LSApplicationWorkspace");
+            return;
+        }
+        // Two casts, both load-bearing under -Werror: sending +defaultWorkspace
+        // to a Class-typed receiver makes the compiler look for a CLASS method on
+        // an unrelated type, so the receiver goes through bare id first (at
+        // runtime a Class still dispatches to its metaclass); the result is then
+        // cast back to the protocol so the BOOL return survives.
+        id<RBAppLaunching> ws = (id<RBAppLaunching>)[(id)cls defaultWorkspace];
+        if (!ws) return;
+        BOOL ok = [ws openApplicationWithBundleID:bundleID];
+        RBLog(@"nowplaying launch via=workspace app=%@ ok=%d took=%.1fms",
+              bundleID, (int)ok, (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+    });
+}
+
+// 0.4.4: the empty state offers the music apps that are actually installed
+// instead of always opening Apple Music. Order is priority order -- the first
+// kRBMusicAppMaxShown that exist get a button.
+static NSString *const kRBMusicAppIDs[] = {
+    @"com.soda.music",         // 汽水音乐
+    @"com.netease.cloudmusic", // 网易云音乐
+    @"com.tencent.QQMusic",    // QQ 音乐
+    @"com.spotify.client",     // Spotify
+    @"com.kugou.kugou1002",    // 酷狗音乐
+    @"com.apple.Music",        // 音乐 -- last, and only if nothing else is there
+};
+static NSUInteger const kRBMusicAppCount = sizeof(kRBMusicAppIDs) / sizeof(kRBMusicAppIDs[0]);
+// Four keeps the row inside the card at the smallest font size; a fifth starts
+// squeezing the label.
+static NSUInteger const kRBMusicAppMaxShown = 4;
+
+@protocol RBAppProxy <NSObject>
+@property (nonatomic, readonly) NSString *bundleIdentifier;
+@end
+
+@interface LSApplicationProxy : NSObject
++ (id<RBAppProxy>)applicationProxyForIdentifier:(NSString *)identifier;
+@end
+
+static BOOL rbAppInstalled(NSString *bundleID) {
+    Class cls = NSClassFromString(@"LSApplicationProxy");
+    if (!cls) return NO;
+    id<RBAppProxy> proxy = (id<RBAppProxy>)[(id)cls applicationProxyForIdentifier:bundleID];
+    // A proxy can exist for a bundle that is no longer installed (stale
+    // placeholder), so the identifier has to be non-empty as well.
+    return proxy != nil && proxy.bundleIdentifier.length > 0;
 }
 
 // The app icon, not the album artwork. Artwork is the fragile corner of
@@ -276,7 +346,9 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 @property (nonatomic, strong) UIStackView *titleRow;
 @property (nonatomic, strong) UIStackView *emptyRow;
 @property (nonatomic, strong) UIImageView *appIconView;
-@property (nonatomic, strong) UIButton *openButton;
+@property (nonatomic, strong) UIStackView *openApps;
+/// Bundle ids behind the empty-state buttons, indexed by (button.tag - kRBOpenTag).
+@property (nonatomic, copy) NSArray<NSString *> *openTargets;
 @property (nonatomic, copy) NSString *sourceBundleID;
 // True from touchDown to touchUp on the scrubber. While set the tick and every
 // fetch-driven redraw leave elapsed/time/bar alone, otherwise the 1s clock drags
@@ -320,7 +392,7 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 - (void)rbScrubCancelled:(RBNPScrubber *)sender;
 - (void)rbFetchSourceApp;
 - (void)rbApplySourceApp:(NSString *)bundleID;
-- (void)rbOpenMusicTapped:(UIButton *)sender;
+- (void)rbOpenTargetTapped:(UIButton *)sender;
 - (void)rbHaptic:(UIImpactFeedbackStyle)style;
 - (void)rbTouchDown:(UIControl *)sender;
 - (void)rbTouchCancel:(UIControl *)sender;
@@ -398,7 +470,8 @@ static UIImage *rbAppIcon(NSString *bundleID) {
     self.titleRow = nil;
     self.emptyRow = nil;
     self.appIconView = nil;
-    self.openButton = nil;
+    self.openApps = nil;
+    self.openTargets = nil;
     self.scrubber = nil;
     // A rebuild throws the control away mid-drag only if the style changed from
     // the settings sheet, which cannot happen while a finger is on the card --
@@ -681,6 +754,11 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 - (void)rbScrubDown:(RBNPScrubber *)sender {
     (void)sender;
     if (!self.hasMedia || self.duration <= 1) return;
+    // 🔴 UIControl sends TouchDown from touchesBegan, and the scrubber sends one
+    // by hand as well so that a missed system event cannot strand the drag. The
+    // result is two deliveries per touch (0.4.3 log: "scrub down" twice, 4ms
+    // apart). The guard keeps the second one from re-arming and re-logging.
+    if (self.scrubbing) return;
     self.scrubbing = YES;
     // Same rule as the transport buttons: arm before the dismiss callback can
     // land, which on a drag happens long before any touch-up.
@@ -699,6 +777,9 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 
 - (void)rbScrubCancelled:(RBNPScrubber *)sender {
     (void)sender;
+    // TouchCancel also arrives twice (touchesCancelled plus the by-hand send in
+    // cancelTrackingWithEvent:), so the second delivery must be a no-op.
+    if (!self.scrubbing) return;
     // TouchCancel means the system took the touch away (incoming call, gesture
     // arbitration): drop the drag and redraw from the real elapsed time.
     self.scrubbing = NO;
@@ -759,12 +840,16 @@ static UIImage *rbAppIcon(NSString *bundleID) {
     [gen impactOccurred];
 }
 
-- (void)rbOpenMusicTapped:(UIButton *)sender {
-    (void)sender;
+- (void)rbOpenTargetTapped:(UIButton *)sender {
+    NSInteger idx = sender.tag - kRBOpenTag;
+    if (idx < 0 || (NSUInteger)idx >= self.openTargets.count) return;
+    NSString *bundleID = self.openTargets[(NSUInteger)idx];
     [self rbHaptic:UIImpactFeedbackStyleLight];
     // The whole reason Reachability exists is that the top of the screen is out
-    // of reach; the empty card should be a way into music, not a dead end.
-    rbOpenApp(kRBAppleMusicBundleID);
+    // of reach; the empty card should be a way into music, not a dead end -- and
+    // into the app the user actually listens with, not the one we guessed.
+    RBLog(@"nowplaying open target idx=%ld app=%@", (long)idx, bundleID);
+    rbOpenApp(bundleID);
     [self rbScheduleDisarm];
 }
 
@@ -1008,27 +1093,64 @@ static UIImage *rbAppIcon(NSString *bundleID) {
                                   forAxis:UILayoutConstraintAxisHorizontal];
     [empty addArrangedSubview:emptyLabel];
 
-    self.openButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.openButton.translatesAutoresizingMaskIntoConstraints = NO;
-    self.openButton.tag = kRBOpenTag;
-    self.openButton.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.14];
-    self.openButton.layer.cornerRadius = 13.0;
-    self.openButton.layer.cornerCurve = kCACornerCurveContinuous;
-    self.openButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    [self.openButton setTitle:@"打开音乐" forState:UIControlStateNormal];
-    [self.openButton setTitleColor:[[UIColor whiteColor] colorWithAlphaComponent:0.90]
-                          forState:UIControlStateNormal];
-    [self.openButton addTarget:self action:@selector(rbOpenMusicTapped:)
-              forControlEvents:UIControlEventTouchUpInside];
-    [self.openButton addTarget:self action:@selector(rbTouchDown:)
-              forControlEvents:UIControlEventTouchDown];
-    [self.openButton addTarget:self action:@selector(rbTouchCancel:)
-              forControlEvents:(UIControlEventTouchCancel |
-                                UIControlEventTouchUpOutside |
-                                UIControlEventTouchDragExit)];
-    [self.openButton.widthAnchor constraintEqualToConstant:78].active = YES;
-    [self.openButton.heightAnchor constraintEqualToConstant:26].active = YES;
-    [empty addArrangedSubview:self.openButton];
+    // 0.4.4: one button per installed music app. A single "open music" button
+    // has to pick an app on the user's behalf, and it picked the wrong one --
+    // Apple Music is the least likely choice for anyone who installed a
+    // third-party player. Capped at four so the label never gets squeezed.
+    NSMutableArray<NSString *> *targets = [NSMutableArray array];
+    for (NSUInteger i = 0; i < kRBMusicAppCount && targets.count < kRBMusicAppMaxShown; i++) {
+        if (rbAppInstalled(kRBMusicAppIDs[i])) [targets addObject:kRBMusicAppIDs[i]];
+    }
+    if (targets.count == 0) [targets addObject:kRBAppleMusicBundleID];
+    self.openTargets = targets;
+
+    UIStackView *apps = [[UIStackView alloc] init];
+    apps.axis = UILayoutConstraintAxisHorizontal;
+    apps.alignment = UIStackViewAlignmentCenter;
+    apps.spacing = 10.0;
+    apps.translatesAutoresizingMaskIntoConstraints = NO;
+    [apps setContentHuggingPriority:UILayoutPriorityRequired
+                            forAxis:UILayoutConstraintAxisHorizontal];
+    for (NSUInteger i = 0; i < targets.count; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.translatesAutoresizingMaskIntoConstraints = NO;
+        // 'RDB8' + index: the hitTest bridge accepts the whole 0x52444238..3D band.
+        b.tag = kRBOpenTag + (NSInteger)i;
+        // The launch icon from _applicationIconImageForBundleIdentifier: comes
+        // back square, so the rounding is ours to draw -- 6.75 is 22.5% of 30,
+        // which is the radius iOS uses on its own home screen icons.
+        b.layer.cornerRadius = 6.75;
+        b.layer.cornerCurve = kCACornerCurveContinuous;
+        b.clipsToBounds = YES;
+        UIImage *icon = rbAppIcon(targets[i]);
+        if (icon) {
+            // Background image scales to fill, which is what a 30pt tile wants.
+            [b setBackgroundImage:icon forState:UIControlStateNormal];
+        } else {
+            UIImageSymbolConfiguration *cfg =
+                [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIFontWeightMedium];
+            [b setImage:[[UIImage systemImageNamed:@"music.note" withConfiguration:cfg]
+                         imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate]
+               forState:UIControlStateNormal];
+            b.tintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.70];
+            b.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.14];
+        }
+        [b addTarget:self action:@selector(rbOpenTargetTapped:)
+    forControlEvents:UIControlEventTouchUpInside];
+        [b addTarget:self action:@selector(rbTouchDown:)
+    forControlEvents:UIControlEventTouchDown];
+        [b addTarget:self action:@selector(rbTouchCancel:)
+    forControlEvents:(UIControlEventTouchCancel |
+                      UIControlEventTouchUpOutside |
+                      UIControlEventTouchDragExit)];
+        [b.widthAnchor constraintEqualToConstant:30].active = YES;
+        [b.heightAnchor constraintEqualToConstant:30].active = YES;
+        [apps addArrangedSubview:b];
+    }
+    self.openApps = apps;
+    [empty addArrangedSubview:apps];
+    RBLog(@"nowplaying empty targets=%lu (%@)", (unsigned long)targets.count,
+          [targets componentsJoinedByString:@","]);
 
     // A style change rebuilds the whole view; the card must not forget what is
     // playing just because the outline width moved. State lives in the card,

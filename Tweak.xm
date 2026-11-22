@@ -328,11 +328,13 @@ static void RBReloadSettings(void) {
         // 'RDB1' row; 'RDB2' menu/overlay; 'RDB3' expand footer;
         // 'RDB4' card-stack sliver; 'RDB5' clipboard card root;
         // 'RDB6' now-playing transport button; 'RDB7' now-playing scrubber;
-        // 'RDB8' now-playing empty-state open button.
+        // 'RDB8'..'RDB=' the empty-state music app buttons ('RDB8' + index, the
+        // card caps them at four, the band leaves room for six).
         if (v.tag == 0x52444231 || v.tag == 0x52444232 ||
             v.tag == 0x52444233 || v.tag == 0x52444234 ||
             v.tag == 0x52444235 || v.tag == 0x52444236 ||
-            v.tag == 0x52444237 || v.tag == 0x52444238) return hit;
+            v.tag == 0x52444237 ||
+            (v.tag >= 0x52444238 && v.tag <= 0x5244423D)) return hit;
     }
     return nil;
 }
