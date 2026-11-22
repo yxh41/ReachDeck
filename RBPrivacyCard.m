@@ -621,14 +621,25 @@ void RBPrivacyCancelInteraction(void) {
     // but we are about to show a NEW menu, so re-arm the suppression here.
     rbPrivacyInteractionActive = YES;
 
-    UIView *host = self.view.superview ?: self.view;
-    if (!host) { RBLog(@"row menu skipped: no host"); return; }
-
     CGFloat itemH = 28.0;
     NSArray *titles = @[@"复制 Bundle ID", @"复制应用名称", @"打开这个 App",
                         @"复制状态摘要", @"本次隐藏此应用"];
     CGFloat menuW = 188.0;
-    CGFloat menuH = titles.count * itemH + 12.0;
+    CGFloat menuH = titles.count * itemH + 12.0; // 152pt
+
+    // 0.2.32 ROOT CAUSE: the direct superview is the UIStackView whose bounds
+    // are only the card height (60-81pt in field log). A 152pt menu hung there
+    // puts items 4/5 (local y >= 90) OUTSIDE the host bounds -- UIKit hitTest
+    // never reaches them, so "copy summary" / "hide for session" did nothing.
+    // Climb to the first ancestor tall enough to hold the whole menu (the
+    // 844pt ReachDeck container).
+    UIView *host = self.view.superview;
+    while (host && CGRectGetHeight(host.bounds) < (menuH + 16.0) && host.superview) {
+        host = host.superview;
+    }
+    if (!host) host = self.view;
+    RBLog(@"row menu host=%@ h=%.0f", NSStringFromClass([host class]),
+          (double)CGRectGetHeight(host.bounds));
     CGRect anchor = [gesture.view convertRect:gesture.view.bounds toView:host];
     CGFloat x = CGRectGetMidX(anchor) - menuW / 2.0;
     x = MAX(8.0, MIN(x, CGRectGetWidth(host.bounds) - menuW - 8.0));
@@ -679,6 +690,20 @@ void RBPrivacyCancelInteraction(void) {
     self.menuView = menu;
     RBLog(@"row menu show key=%@ items=%lu", bundle.length ? bundle : name,
           (unsigned long)titles.count);
+
+    // 0.2.32: auto-close after 8s. Field log 0.2.31 showed the suppress flag
+    // stuck at YES when a shown menu was never tapped (ScreenshotShell /
+    // ControlCenter deactivate calls got swallowed). Guard with identity check
+    // so an old timer cannot close a newer menu. Weak self avoids retain cycle.
+    __weak typeof(self) weakSelf = self;
+    UIView *shownMenu = menu;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.menuView != shownMenu) return;
+        RBLog(@"row menu auto-close timeout");
+        [strongSelf rbDismissRowMenu:nil];
+    });
 }
 
 - (void)rbDismissRowMenu:(id)sender {
