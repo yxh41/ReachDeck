@@ -71,7 +71,9 @@ static RBPrivacyCard *rbActivePrivacyCard = nil; // 0.2.31: for cross-process ca
 - (void)rbDismissRowMenu:(id)sender;
 - (void)rbMenuTapped:(UIButton *)button;
 - (void)rbApplyVisibleRows;
-- (void)rbToggleExpanded:(UITapGestureRecognizer *)gesture;
+- (void)rbExpansionTouchDown:(UIControl *)sender;
+- (void)rbExpansionTouchUp:(UIControl *)sender;
+- (void)rbExpansionTouchCancel:(UIControl *)sender;
 - (UIView *)rbExpansionFooter;
 @end
 
@@ -1001,16 +1003,27 @@ void RBPrivacyCancelInteraction(void) {
     }
 }
 
-// 0.2.34: tappable footer. 'RDB3' lets the Reachability hitTest bridge accept
-// this view without widening the bridge to every card subview. Labels are
-// non-interactive so the tap always lands on the tagged footer itself.
+// 0.2.34/0.2.35: tappable footer. 'RDB3' lets the Reachability hitTest bridge
+// accept this view without widening the bridge to every card subview. Labels are
+// non-interactive so the touch always lands on the tagged footer itself.
+// 0.2.35: UIControl (not UITapGestureRecognizer) so touchDown can arm the
+// deactivate-suppression flag BEFORE SpringBoard's dismiss gesture fires. In the
+// 0.2.34 field log `deactivate reached` preceded `rows expand` by 40-100ms.
 - (UIView *)rbExpansionFooter {
     BOOL expanded = self.expanded;
-    UIView *footer = [[UIView alloc] init];
+    UIControl *footer = [[UIControl alloc] init];
     footer.translatesAutoresizingMaskIntoConstraints = NO;
     footer.tag = kRBExpandTag;
     footer.userInteractionEnabled = YES;
     footer.accessibilityTraits = UIAccessibilityTraitButton;
+    [footer addTarget:self action:@selector(rbExpansionTouchDown:)
+     forControlEvents:UIControlEventTouchDown];
+    [footer addTarget:self action:@selector(rbExpansionTouchUp:)
+     forControlEvents:UIControlEventTouchUpInside];
+    [footer addTarget:self action:@selector(rbExpansionTouchCancel:)
+     forControlEvents:(UIControlEventTouchCancel |
+                         UIControlEventTouchUpOutside |
+                         UIControlEventTouchDragExit)];
 
     UILabel *hint = [[UILabel alloc] init];
     hint.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1055,20 +1068,45 @@ void RBPrivacyCancelInteraction(void) {
         [hint.trailingAnchor constraintLessThanOrEqualToAnchor:action.leadingAnchor constant:-8],
     ]];
 
-    UITapGestureRecognizer *tap =
-        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(rbToggleExpanded:)];
-    [footer addGestureRecognizer:tap];
     return footer;
 }
 
-- (void)rbToggleExpanded:(UITapGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateEnded) return;
-    if (self.totalCount <= kRBCollapsedRowLimit) return;
+- (void)rbExpansionTouchDown:(UIControl *)sender {
+    (void)sender;
+    // Arm before SpringBoard's dismiss gesture sees this touch. The field log
+    // showed deactivate firing 40-100ms BEFORE the tap's touchUpInside.
+    rbPrivacyInteractionActive = YES;
+    RBLog(@"rows expand touch down");
+}
+
+- (void)rbExpansionTouchUp:(UIControl *)sender {
+    (void)sender;
+    if (self.totalCount <= kRBCollapsedRowLimit) {
+        rbPrivacyInteractionActive = NO;
+        return;
+    }
     self.expanded = !self.expanded;
     [self rbApplyVisibleRows];
     RBLog(@"rows expand=%d total=%lu visible=%lu",
           (int)self.expanded, (unsigned long)self.totalCount, (unsigned long)self.rows.count);
     [self renderRows];
+
+    // Keep suppression briefly after touchUp: SpringBoard can deliver its
+    // dismiss callback a few ms late. Never clear a flag owned by an open
+    // long-press menu.
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.menuView) return;
+        rbPrivacyInteractionActive = NO;
+    });
+}
+
+- (void)rbExpansionTouchCancel:(UIControl *)sender {
+    (void)sender;
+    if (!self.menuView) rbPrivacyInteractionActive = NO;
+    RBLog(@"rows expand touch cancel");
 }
 
 - (UIView *)rowViewFor:(NSDictionary *)row {
