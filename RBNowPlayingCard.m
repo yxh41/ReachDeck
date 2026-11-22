@@ -254,7 +254,7 @@ static RBNPSendFn rbNPSendCommand(void) {
     self.transportContainer.alpha = has ? 1.0 : 0.32;
     NSString *symbol = self.playing ? @"pause.fill" : @"play.fill";
     UIImageSymbolConfiguration *cfg =
-        [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageFontWeightSemibold];
+        [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIFontWeightSemibold];
     [self.playButton setImage:[UIImage systemImageNamed:symbol withConfiguration:cfg]
                      forState:UIControlStateNormal];
 }
@@ -376,7 +376,7 @@ static RBNPSendFn rbNPSendCommand(void) {
     // No showsTouchWhenHighlighted: it is deprecated as of iOS 15 and this build
     // runs with -Werror.
     UIImageSymbolConfiguration *cfg =
-        [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageFontWeightSemibold];
+        [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIFontWeightSemibold];
     [b setImage:[UIImage systemImageNamed:symbol withConfiguration:cfg] forState:UIControlStateNormal];
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     [b addTarget:self action:@selector(rbTouchDown:) forControlEvents:UIControlEventTouchDown];
