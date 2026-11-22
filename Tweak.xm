@@ -257,6 +257,9 @@ static void RBReloadSettings(void) {
 
 - (void)viewWillDisappear:(BOOL)animated {
     %orig;
+    // 0.2.31: clear the suppress flag on teardown so a menu left open from the
+    // previous presentation cannot block a legitimate later deactivation.
+    RBPrivacyCancelInteraction();
     rbLiveController = nil;
     rbTopEffect = nil;
     // 0.2.9: sticky row is a retained pointer into the container. Clear it on
@@ -359,12 +362,21 @@ static void RBReloadSettings(void) {
 + (BOOL)reachabilitySupported { return YES; }
 - (BOOL)reachabilityEnabled { return YES; }
 - (void)setReachabilityEnabled:(BOOL)v { %orig(YES); }
-// 0.2.30 diagnostic: prove WHO collapses reachability. If this fires right
-// after "row menu show" with no "collapse: deactivateReachability" from our
-// own launch path, the SYSTEM dismiss gesture is to blame (overlay inserted
-// mid-touch). After moving menu display to UIGestureRecognizerStateEnded it
-// should no longer fire on a bare long-press.
+// 0.2.31 FIX: field log 0.2.30 proved the SYSTEM dismiss gesture calls this
+// ~236ms after longpress Began, while the finger is still held on a card row
+// and before our menu ever appears. That collapses Reachability under a normal
+// long-press. While a row interaction is active, swallow the deactivation so
+// the menu can be shown/used. Our OWN launch path clears the flag before it
+// calls deactivateReachability, so "open app" still collapses normally.
 - (void)deactivateReachability {
+    if (RBPrivacyInteractionActive()) {
+        NSArray *syms = [NSThread callStackSymbols];
+        NSString *top = syms.count > 3
+            ? [[syms subarrayWithRange:NSMakeRange(1, 3)] componentsJoinedByString:@" | "]
+            : @"(short stack)";
+        RBLog(@"deactivate suppressed (row interaction) stack=%@", top);
+        return;
+    }
     RBLog(@"deactivate reached (system or app launch)");
     %orig;
 }

@@ -15,6 +15,11 @@
 extern "C" {
 #endif
 extern void RBLog(NSString * _Nonnull fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+// 0.2.31: row long-press / menu is active. Tweak.xm's deactivateReachability
+// hook suppresses the SYSTEM reachability dismiss while this is YES, otherwise
+// a long hold on a card row collapses Reachability before the menu can be used.
+extern BOOL RBPrivacyInteractionActive(void);
+extern void RBPrivacyCancelInteraction(void);
 #ifdef __cplusplus
 }
 #endif

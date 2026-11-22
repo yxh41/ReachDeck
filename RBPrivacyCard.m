@@ -17,6 +17,8 @@ static NSInteger const kRBMenuTag = 0x52444232; // 'RDB2': menu/overlay allowed 
 static NSInteger rbPulseCount = 0;              // 0.2.17 diagnostic pulse counter
 static NSTimer *rbPulseTimer = nil;            // keep only one pulse series alive
 static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels for self-proof
+static BOOL rbPrivacyInteractionActive = NO;    // 0.2.31: read by Tweak.xm deactivate hook
+static RBPrivacyCard *rbActivePrivacyCard = nil; // 0.2.31: for cross-process cancel on collapse
 
 // ---- Private SpringBoard interfaces (runtime-verified from iOS 17/18 headers) ----
 // We deliberately do NOT declare a hardcoded sensor enum: its numeric values are not
@@ -88,6 +90,7 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
         _rows = @[];
         _activeSince = [NSMutableDictionary dictionary];
         _sessionHiddenBundles = [NSMutableSet set];
+        rbActivePrivacyCard = self;
         // SAFE MODE FIX (0.0.2): never touch UIKit here. A card can be created
         // while dyld is still running tweak initializers, before UIApplication is
         // initialized. UIView / Auto Layout calls at that point throw an
@@ -103,6 +106,15 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
     // can go away when the tweak rebuilds cards.
     [self.durationTimer invalidate];
     self.durationTimer = nil;
+    if (rbActivePrivacyCard == self) rbActivePrivacyCard = nil;
+}
+
+// 0.2.31 exported state, read from Tweak.xm's -deactivateReachability hook.
+// C linkage (see header) so the ObjC++ tweak can call into this ObjC file.
+BOOL RBPrivacyInteractionActive(void) { return rbPrivacyInteractionActive; }
+void RBPrivacyCancelInteraction(void) {
+    rbPrivacyInteractionActive = NO;
+    [rbActivePrivacyCard rbDismissRowMenu:nil];
 }
 
 #pragma mark - RBCard
@@ -345,6 +357,10 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
 // 0.2.29: shared by row tap and the menu's "打开这个 App" action. Keeps the
 // proven 0.2.18 async-launch path in one place instead of duplicating it.
 - (void)rbCollapseAndLaunchBundle:(NSString *)bundle {
+    // 0.2.31: this is OUR intentional collapse. Clear the suppress flag first
+    // so the deactivateReachability call below is NOT swallowed by the hook;
+    // a stale flag here used to block the app-launch exit entirely.
+    rbPrivacyInteractionActive = NO;
     // 0.2.15 root cause of "app only opens after reachability ends":
     // deactivateReachability flips reachabilityModeActive to 0 almost instantly
     // (0.2.10 probe: active=0 at +0.1s), but the SBReachabilityWindow teardown is
@@ -580,17 +596,30 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
 // and never rebuilt by renderRows. RDB2 tag lets the hitTest bridge accept it.
 - (void)rbShowRowMenu:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state == UIGestureRecognizerStateBegan) {
+        // 0.2.31: mark interaction active AT ONSET. Field log 0.2.30 proved the
+        // SYSTEM deactivates Reachability ~236ms after longpress Began while the
+        // finger is still down -- before the Ended menu ever shows. Suppress from
+        // here so the sheet cannot collapse under a held row.
+        rbPrivacyInteractionActive = YES;
         RBLog(@"row longpress fired");
-        return; // 0.2.30: show on Ended only, after the finger is lifted.
+        return; // show on Ended only, after the finger is lifted.
+    }
+    if (gesture.state == UIGestureRecognizerStateCancelled ||
+        gesture.state == UIGestureRecognizerStateFailed) {
+        rbPrivacyInteractionActive = NO;
+        return;
     }
     if (gesture.state != UIGestureRecognizerStateEnded) return;
 
     NSDictionary *row = objc_getAssociatedObject(gesture, &kRBLongPressRowKey);
     NSString *bundle = row[@"bundle"] ?: @"";
     NSString *name = row[@"name"] ?: @"";
-    if (row.count == 0) { RBLog(@"row menu skipped: no row context"); return; }
+    if (row.count == 0) { rbPrivacyInteractionActive = NO; RBLog(@"row menu skipped: no row context"); return; }
 
     [self rbDismissRowMenu:nil];
+    // rbDismissRowMenu clears the flag (correct for outside-tap and item-tap),
+    // but we are about to show a NEW menu, so re-arm the suppression here.
+    rbPrivacyInteractionActive = YES;
 
     UIView *host = self.view.superview ?: self.view;
     if (!host) { RBLog(@"row menu skipped: no host"); return; }
@@ -654,6 +683,7 @@ static NSInteger rbDurationShowLogged = 0;      // 0.2.28: log first few labels 
 
 - (void)rbDismissRowMenu:(id)sender {
     (void)sender;
+    rbPrivacyInteractionActive = NO;
     if (!self.menuView && !self.menuOverlay) return;
     [self.menuView removeFromSuperview];
     [self.menuOverlay removeFromSuperview];
