@@ -8,6 +8,7 @@
 #import "RBPrivacyCard.h"
 #import "RBClipboardCard.h"
 #import "RBNowPlayingCard.h"
+#import "RBAppLauncherCard.h"
 
 // Diagnostic log (0.0.3+): ASCII-only strings so they survive toolchain string
 // handling; mirrored to syslog and a plist-dir file the user can send us.
@@ -100,10 +101,13 @@ static void RBDumpIvars(const char *clsName) {
 static RBPrivacyCard *privacyCard = nil;
 static RBClipboardCard *clipboardCard = nil;
 static RBNowPlayingCard *nowPlayingCard = nil;
+// 0.5.1: dock apps card -- the four icons sitting in the Dock, one tap to launch.
+static RBAppLauncherCard *dockAppsCard = nil;
 static BOOL rbEnabled = YES;
 static BOOL rbCardPrivacy = YES;
 static BOOL rbCardClipboard = YES;
 static BOOL rbCardNowPlaying = YES;
+static BOOL rbCardDockApps = YES;
 static BOOL rbHideSystemServices = NO;
 static BOOL rbCardAtBottom = YES;         // 0.2.1: derived from cardAtTop (default off => bottom)
 // 0.2.19 style: defaults reproduce the pre-style look exactly.
@@ -145,6 +149,10 @@ static NSLayoutConstraint *rbStackTopConstraint = nil;
 // NOTE: allocating a card is safe here (state only); its UI is built lazily.
 static void RBRebuildCards(void) {
     NSMutableArray *cards = [NSMutableArray array];
+    if (rbCardDockApps) {
+        if (!dockAppsCard) dockAppsCard = [[RBAppLauncherCard alloc] init];
+        [cards addObject:dockAppsCard];
+    }
     if (rbCardPrivacy) {
         if (!privacyCard) privacyCard = [[RBPrivacyCard alloc] init];
         [privacyCard setHideSystemServices:rbHideSystemServices];
@@ -165,8 +173,8 @@ static void RBRebuildCards(void) {
         }
     }
     rbCards = [cards copy];
-    RBLog(@"rebuild cards privacy=%d nowplaying=%d clipboard=%d hideSys=%d bottom=%d count=%lu",
-          rbCardPrivacy, rbCardNowPlaying, rbCardClipboard, rbHideSystemServices,
+    RBLog(@"rebuild cards dockapps=%d privacy=%d nowplaying=%d clipboard=%d hideSys=%d bottom=%d count=%lu",
+          rbCardDockApps, rbCardPrivacy, rbCardNowPlaying, rbCardClipboard, rbHideSystemServices,
           rbCardAtBottom, (unsigned long)rbCards.count);
 }
 
@@ -178,6 +186,7 @@ static void RBReadPrefs(void) {
     rbCardPrivacy = d[@"cardPrivacy"] ? [d[@"cardPrivacy"] boolValue] : YES;
     rbCardNowPlaying = d[@"cardNowPlaying"] ? [d[@"cardNowPlaying"] boolValue] : YES;
     rbCardClipboard = d[@"cardClipboard"] ? [d[@"cardClipboard"] boolValue] : YES;
+    rbCardDockApps = d[@"cardDockApps"] ? [d[@"cardDockApps"] boolValue] : YES;
     rbHideSystemServices = d[@"hideSystemServices"] ? [d[@"hideSystemServices"] boolValue] : NO;
     // 0.2.1: the UI switch is "cardAtTop" (off = bottom, the visible band on this
     // device). Honour the old cardAtBottom key too for users upgrading from 0.1.x.
@@ -329,12 +338,14 @@ static void RBReloadSettings(void) {
         // 'RDB4' card-stack sliver; 'RDB5' clipboard card root;
         // 'RDB6' now-playing transport button; 'RDB7' now-playing scrubber;
         // 'RDB8'..'RDB=' the empty-state music app buttons ('RDB8' + index, the
-        // card caps them at four, the band leaves room for six).
+        // card caps them at four, the band leaves room for six);
+        // 'RDBA'..'RDBE' the dock-apps card root ('RDBA') and its four tiles.
         if (v.tag == 0x52444231 || v.tag == 0x52444232 ||
             v.tag == 0x52444233 || v.tag == 0x52444234 ||
             v.tag == 0x52444235 || v.tag == 0x52444236 ||
             v.tag == 0x52444237 ||
-            (v.tag >= 0x52444238 && v.tag <= 0x5244423D)) return hit;
+            (v.tag >= 0x52444238 && v.tag <= 0x5244423D) ||
+            (v.tag >= 0x52444241 && v.tag <= 0x52444245)) return hit;
     }
     return nil;
 }

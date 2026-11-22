@@ -70,6 +70,20 @@
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
+			<string>常用 App 卡片</string>
+			<key>key</key>
+			<string>cardDockApps</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.zlhkf.ReachDeck</string>
+			<key>footerText</key>
+			<string>显示 Dock 里的四个 App，点按直接打开。Dock 里放了什么就显示什么，排列顺序跟随 Dock。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
 			<string>正在播放卡片</string>
 			<key>key</key>
 			<string>cardNowPlaying</string>
