@@ -14,6 +14,15 @@ static NSInteger const kRBTransportTag = 0x52444236;
 static int const kRBCmdTogglePlayPause = 2;
 static int const kRBCmdNextTrack = 4;
 static int const kRBCmdPreviousTrack = 5;
+// 24 = kMRMediaRemoteCommandSeekToPlaybackPosition. The position rides in the
+// userInfo dictionary, so the existing send signature already fits and there is
+// nothing extra to dlsym.
+static int const kRBCmdSeekToPlaybackPosition = 24;
+static NSString *const kRBOptionPlaybackPosition = @"kMRMediaRemoteOptionPlaybackPosition";
+
+// 'RDB7': the scrubber is the only view on any card that swallows a DRAG. It has
+// to be whitelisted in the container's hitTest or the touch never reaches it.
+static NSInteger const kRBScrubberTag = 0x52444237;
 
 // The now-playing dictionary is keyed by the identifier strings themselves, so
 // these match the exported kMRMediaRemoteNowPlayingInfo* constants without
@@ -52,13 +61,142 @@ static RBNPSendFn rbNPSendCommand(void) {
     return (RBNPSendFn)dlsym(h, "MRMediaRemoteSendCommand");
 }
 
+#pragma mark - scrubber
+
+// 0.4.2: draggable progress bar.
+//
+// UIProgressView cannot be dragged -- it is a renderer with no tracking at all,
+// so the bar had to become a UIControl. Two decisions worth keeping:
+//
+//   * touch tracking, NOT a UIPanGestureRecognizer. A recogniser has to win an
+//     arbitration round against the Reachability gesture; beginTracking: simply
+//     claims the touch before any recogniser sees it.
+//   * the control is 22pt tall with a 2pt bar drawn in the middle. The bar is
+//     what you see, the 22pt is what a finger can actually hit. That strip is
+//     the only part of the card that no longer passes touches through to the
+//     Reachability dismiss -- everything else still does.
+@interface RBNPScrubber : UIControl
+@property (nonatomic, assign) double fraction;
+@end
+
+@implementation RBNPScrubber {
+    CALayer *_track;
+    CALayer *_fill;
+    UIView *_knob;
+    // Declared here so the custom setter below does not depend on autosynthesis.
+    double _fraction;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.tag = kRBScrubberTag;
+        self.backgroundColor = [UIColor clearColor];
+        self.opaque = NO;
+
+        _track = [CALayer layer];
+        _track.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.22].CGColor;
+        [self.layer addSublayer:_track];
+
+        _fill = [CALayer layer];
+        _fill.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.92].CGColor;
+        [self.layer addSublayer:_fill];
+
+        // Only visible while a finger is down: it advertises "this is draggable"
+        // exactly when that is useful, and leaves the resting card untouched.
+        _knob = [[UIView alloc] initWithFrame:CGRectZero];
+        _knob.backgroundColor = [UIColor whiteColor];
+        _knob.userInteractionEnabled = NO;
+        _knob.hidden = YES;
+        [self addSubview:_knob];
+    }
+    return self;
+}
+
+- (void)setFraction:(double)fraction {
+    if (!isfinite(fraction)) fraction = 0;
+    fraction = MAX(0.0, MIN(1.0, fraction));
+    if (fabs(fraction - _fraction) < 0.0005) return;
+    _fraction = fraction;
+    [self setNeedsLayout];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = CGRectGetWidth(self.bounds);
+    CGFloat h = CGRectGetHeight(self.bounds);
+    CGFloat barH = 2.0;
+    CGFloat y = floor((h - barH) * 0.5);
+
+    // 🔴 The tick rewrites fraction once a second; without this the implicit
+    // 0.25s animation makes the bar lag behind the clock and look drunk.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _track.frame = CGRectMake(0, y, w, barH);
+    _track.cornerRadius = barH * 0.5;
+    _fill.frame = CGRectMake(0, y, w * _fraction, barH);
+    _fill.cornerRadius = barH * 0.5;
+    [CATransaction commit];
+
+    _knob.frame = CGRectMake(w * _fraction - 4.0, (h - 8.0) * 0.5, 8.0, 8.0);
+    _knob.layer.cornerRadius = 4.0;
+}
+
+- (CGFloat)rbFractionAtTouch:(UITouch *)touch {
+    CGFloat w = CGRectGetWidth(self.bounds);
+    if (w < 1.0) return 0;
+    CGPoint p = [touch locationInView:self];
+    return MAX(0.0, MIN(1.0, p.x / w));
+}
+
+- (BOOL)beginTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    _knob.hidden = NO;
+    self.fraction = [self rbFractionAtTouch:touch];
+    [self sendActionsForControlEvents:UIControlEventTouchDown];
+    [self sendActionsForControlEvents:UIControlEventValueChanged];
+    return YES;
+}
+
+- (BOOL)continueTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    self.fraction = [self rbFractionAtTouch:touch];
+    [self sendActionsForControlEvents:UIControlEventValueChanged];
+    return YES;
+}
+
+- (void)endTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    if (touch) {
+        self.fraction = [self rbFractionAtTouch:touch];
+        [self sendActionsForControlEvents:UIControlEventValueChanged];
+    }
+    _knob.hidden = YES;
+    // Sent by hand rather than left to UIKit: whether UIControl fires
+    // TouchUpInside itself after endTracking: is not contractual, and a missed
+    // event would leave the card's scrubbing flag stuck at YES, which silently
+    // freezes the clock. rbScrubEnded: is idempotent, so a duplicate is harmless.
+    [self sendActionsForControlEvents:UIControlEventTouchUpInside];
+    [super endTrackingWithTouch:touch withEvent:event];
+}
+
+- (void)cancelTrackingWithEvent:(UIEvent *)event {
+    _knob.hidden = YES;
+    // Same reasoning: a lost TouchCancel would strand scrubbing == YES forever.
+    [self sendActionsForControlEvents:UIControlEventTouchCancel];
+    [super cancelTrackingWithEvent:event];
+}
+
+@end
+
 @interface RBNowPlayingCard ()
 @property (nonatomic, strong) UIView *view;
 @property (nonatomic, strong) UILabel *headerLabel;
 @property (nonatomic, strong) UILabel *timeLabel;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *artistLabel;
-@property (nonatomic, strong) UIProgressView *progressView;
+@property (nonatomic, strong) RBNPScrubber *scrubber;
+// True from touchDown to touchUp on the scrubber. While set the tick and every
+// fetch-driven redraw leave elapsed/time/bar alone, otherwise the 1s clock drags
+// the bar back out from under the finger.
+@property (nonatomic, assign) BOOL scrubbing;
 @property (nonatomic, strong) UIView *transportContainer;
 @property (nonatomic, strong) UIButton *prevButton;
 @property (nonatomic, strong) UIButton *playButton;
@@ -71,6 +209,9 @@ static RBNPSendFn rbNPSendCommand(void) {
 @property (nonatomic, assign) BOOL playing;
 @property (nonatomic, assign) BOOL hasMedia;
 @property (nonatomic, strong) NSTimer *tickTimer;
+// -1 = nothing waiting. Set on seek, consumed by the very next fetch so the log
+// can state whether the app actually moved.
+@property (nonatomic, assign) double pendingSeekTarget;
 
 @property (nonatomic, assign) CGFloat styleOpacity;
 @property (nonatomic, assign) CGFloat styleCorner;
@@ -87,6 +228,11 @@ static RBNPSendFn rbNPSendCommand(void) {
 - (void)rbTick;
 - (NSString *)rbTimeText:(double)seconds;
 - (void)rbSendCommand:(int)command label:(NSString *)label;
+- (void)rbSeekTo:(double)seconds;
+- (void)rbScrubDown:(RBNPScrubber *)sender;
+- (void)rbScrubChanged:(RBNPScrubber *)sender;
+- (void)rbScrubEnded:(RBNPScrubber *)sender;
+- (void)rbScrubCancelled:(RBNPScrubber *)sender;
 - (void)rbTouchDown:(UIControl *)sender;
 - (void)rbTouchCancel:(UIControl *)sender;
 - (void)rbScheduleDisarm;
@@ -102,6 +248,8 @@ static RBNPSendFn rbNPSendCommand(void) {
         _styleCorner = 16;
         _styleBorder = 1;
         _styleCompact = NO;
+        // "no pending seek" needs a sentinel that cannot collide with 0 seconds.
+        _pendingSeekTarget = -1;
     }
     return self;
 }
@@ -157,7 +305,11 @@ static RBNPSendFn rbNPSendCommand(void) {
     self.timeLabel = nil;
     self.titleLabel = nil;
     self.artistLabel = nil;
-    self.progressView = nil;
+    self.scrubber = nil;
+    // A rebuild throws the control away mid-drag only if the style changed from
+    // the settings sheet, which cannot happen while a finger is on the card --
+    // but the flag must not survive into the new view regardless.
+    self.scrubbing = NO;
     self.transportContainer = nil;
     self.prevButton = nil;
     self.playButton = nil;
@@ -215,6 +367,14 @@ static RBNPSendFn rbNPSendCommand(void) {
     self.hasMedia = (title.length > 0);
     RBLog(@"nowplaying state media=%d playing=%d elapsed=%.0f duration=%.0f",
           (int)self.hasMedia, (int)playing, elapsed, duration);
+    // A seek is only done once the system says so. Playing media drifts forward
+    // while the read-back is in flight, hence the deliberately loose 8s window.
+    if (self.pendingSeekTarget >= 0) {
+        double want = self.pendingSeekTarget;
+        self.pendingSeekTarget = -1;
+        RBLog(@"nowplaying seek %@ want=%.0f got=%.0f",
+              (fabs(elapsed - want) > 8.0) ? @"ignored" : @"confirmed", want, elapsed);
+    }
     [self rbUpdateLabels];
     if (self.hasMedia && playing) {
         [self rbStartTick];
@@ -236,18 +396,26 @@ static RBNPSendFn rbNPSendCommand(void) {
     self.titleLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:(has ? 0.95 : 0.55)];
     self.artistLabel.text = has ? (self.trackArtist.length ? self.trackArtist : @"未知艺术家")
                                 : @"播放音乐或播客后会显示";
-    self.timeLabel.text = has ? [NSString stringWithFormat:@"%@ / %@",
-                                 [self rbTimeText:self.elapsed], [self rbTimeText:self.duration]]
-                              : @"";
-    if (has && self.duration > 1) {
-        double frac = self.elapsed / self.duration;
-        if (frac < 0) frac = 0;
-        if (frac > 1) frac = 1;
-        [self.progressView setProgress:(float)frac animated:NO];
-    } else {
-        [self.progressView setProgress:0.0 animated:NO];
+    // While a finger is on the scrubber the clock and the bar belong to the
+    // finger -- not to the 1s tick, and not to an in-flight fetch that landed
+    // mid-drag. Everything else on the card still refreshes as usual.
+    if (!self.scrubbing) {
+        self.timeLabel.text = has ? [NSString stringWithFormat:@"%@ / %@",
+                                     [self rbTimeText:self.elapsed], [self rbTimeText:self.duration]]
+                                  : @"";
+        double frac = 0;
+        if (has && self.duration > 1) {
+            frac = self.elapsed / self.duration;
+            if (frac < 0) frac = 0;
+            if (frac > 1) frac = 1;
+        }
+        self.scrubber.fraction = frac;
     }
-    self.progressView.hidden = !has;
+    self.scrubber.hidden = !has;
+    // With nothing playing -- or a track whose length is still unknown -- a drag
+    // would move the bar with nowhere to seek to. Refusing the touch outright is
+    // cleaner than accepting it and bailing out inside every handler.
+    self.scrubber.userInteractionEnabled = (has && self.duration > 1);
     self.playButton.enabled = has;
     self.prevButton.enabled = has;
     self.nextButton.enabled = has;
@@ -286,6 +454,8 @@ static RBNPSendFn rbNPSendCommand(void) {
         [self rbStopTick];
         return;
     }
+    // A finger on the bar owns elapsed; advancing it here would fight the finger.
+    if (self.scrubbing) return;
     // Paused media keeps reporting a rate of 0, so the timer would just sit
     // there advancing nothing -- stop it and let the next rbRefresh restart it.
     if (!self.playing) {
@@ -343,6 +513,81 @@ static RBNPSendFn rbNPSendCommand(void) {
     [self rbScheduleDisarm];
 }
 
+#pragma mark - scrub
+
+- (void)rbScrubDown:(RBNPScrubber *)sender {
+    (void)sender;
+    if (!self.hasMedia || self.duration <= 1) return;
+    self.scrubbing = YES;
+    // Same rule as the transport buttons: arm before the dismiss callback can
+    // land, which on a drag happens long before any touch-up.
+    RBPrivacyArmInteraction();
+    RBLog(@"nowplaying scrub down");
+}
+
+- (void)rbScrubChanged:(RBNPScrubber *)sender {
+    if (!self.scrubbing || self.duration <= 1) return;
+    // The clock has to follow the finger too, otherwise the bar moves while the
+    // numbers sit still and the drag reads as broken.
+    double at = self.duration * sender.fraction;
+    self.timeLabel.text = [NSString stringWithFormat:@"%@ / %@",
+                           [self rbTimeText:at], [self rbTimeText:self.duration]];
+}
+
+- (void)rbScrubCancelled:(RBNPScrubber *)sender {
+    (void)sender;
+    // TouchCancel means the system took the touch away (incoming call, gesture
+    // arbitration): drop the drag and redraw from the real elapsed time.
+    self.scrubbing = NO;
+    [self rbUpdateLabels];
+    [self rbScheduleDisarm];
+    RBLog(@"nowplaying scrub cancel");
+}
+
+- (void)rbScrubEnded:(RBNPScrubber *)sender {
+    if (!self.scrubbing) return;
+    self.scrubbing = NO;
+    if (self.duration <= 1) {
+        [self rbUpdateLabels];
+        [self rbScheduleDisarm];
+        return;
+    }
+    double target = self.duration * sender.fraction;
+    RBLog(@"nowplaying scrub end fraction=%.3f target=%.0f", sender.fraction, target);
+    [self rbSeekTo:target];
+    [self rbScheduleDisarm];
+}
+
+- (void)rbSeekTo:(double)seconds {
+    RBNPSendFn send = rbNPSendCommand();
+    if (!send) {
+        RBLog(@"nowplaying seek skipped: no MediaRemote");
+        return;
+    }
+    if (!isfinite(seconds) || seconds < 0) seconds = 0;
+    if (self.duration > 1 && seconds > self.duration) seconds = self.duration;
+
+    NSDictionary *info = @{ kRBOptionPlaybackPosition: @(seconds) };
+    Boolean ok = send(kRBCmdSeekToPlaybackPosition, (__bridge CFDictionaryRef)info);
+    RBLog(@"nowplaying seek to=%.1f ok=%d", seconds, (int)ok);
+
+    // Optimistic on purpose: the bar has to stay where the finger left it. The
+    // read-back a beat later is the truth, and rbApplyTitle: compares the two so
+    // an app that accepts the command and silently ignores it is visible in the
+    // log instead of looking like a dead slider.
+    self.elapsed = seconds;
+    [self rbUpdateLabels];
+    self.pendingSeekTarget = seconds;
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf rbFetch];
+    });
+}
+
 // Same rule as the other cards: arm the dismiss suppression on touchDown,
 // because SpringBoard's dismiss callback can land before touchUpInside.
 - (void)rbTouchDown:(UIControl *)sender {
@@ -384,8 +629,8 @@ static RBNPSendFn rbNPSendCommand(void) {
         forControlEvents:(UIControlEventTouchCancel |
                           UIControlEventTouchUpOutside |
                           UIControlEventTouchDragExit)];
-    [b.widthAnchor constraintEqualToConstant:34].active = YES;
-    [b.heightAnchor constraintEqualToConstant:30].active = YES;
+    [b.widthAnchor constraintEqualToConstant:40].active = YES;
+    [b.heightAnchor constraintEqualToConstant:34].active = YES;
     return b;
 }
 
@@ -473,13 +718,24 @@ static RBNPSendFn rbNPSendCommand(void) {
     self.artistLabel.userInteractionEnabled = NO;
     [stack addArrangedSubview:self.artistLabel];
 
-    self.progressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
-    self.progressView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.progressView.progressTintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.92];
-    self.progressView.trackTintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.22];
-    self.progressView.userInteractionEnabled = NO;
-    [self.progressView.heightAnchor constraintEqualToConstant:2.0].active = YES;
-    [stack addArrangedSubview:self.progressView];
+    self.scrubber = [[RBNPScrubber alloc] initWithFrame:CGRectZero];
+    self.scrubber.translatesAutoresizingMaskIntoConstraints = NO;
+    // 22pt of finger target around a 2pt bar.
+    [self.scrubber.heightAnchor constraintEqualToConstant:22.0].active = YES;
+    [self.scrubber addTarget:self action:@selector(rbScrubDown:)
+            forControlEvents:UIControlEventTouchDown];
+    [self.scrubber addTarget:self action:@selector(rbScrubChanged:)
+            forControlEvents:UIControlEventValueChanged];
+    [self.scrubber addTarget:self action:@selector(rbScrubEnded:)
+            forControlEvents:(UIControlEventTouchUpInside | UIControlEventTouchUpOutside)];
+    [self.scrubber addTarget:self action:@selector(rbScrubCancelled:)
+            forControlEvents:UIControlEventTouchCancel];
+    [stack addArrangedSubview:self.scrubber];
+    // Those extra 20pt are finger target, not layout: collapse the gaps on both
+    // sides so the card grows by ~8pt instead of 20 while the visible breathing
+    // room around the bar stays roughly what it was.
+    [stack setCustomSpacing:0 afterView:self.artistLabel];
+    [stack setCustomSpacing:0 afterView:self.scrubber];
 
     // Wrapper so the transport group can be centred: the vertical stack fills
     // its arranged subviews, which would spread three buttons edge to edge.
