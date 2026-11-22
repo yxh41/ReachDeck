@@ -443,6 +443,10 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 // fetch-driven redraw leave elapsed/time/bar alone, otherwise the 1s clock drags
 // the bar back out from under the finger.
 @property (nonatomic, assign) BOOL scrubbing;
+// 0.4.8: true from the moment a hold is recognised until the finger that placed
+// it actually leaves. While set the panel must stay armed, otherwise the touch-up
+// that ends the hold reads as a tap outside and closes Reachability.
+@property (nonatomic, assign) BOOL holdActive;
 @property (nonatomic, strong) UIView *transportContainer;
 @property (nonatomic, strong) UIButton *prevButton;
 @property (nonatomic, strong) UIButton *playButton;
@@ -480,6 +484,9 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 - (void)rbNudgeBy:(double)delta;
 - (void)rbPrevLongPress:(UILongPressGestureRecognizer *)sender;
 - (void)rbNextLongPress:(UILongPressGestureRecognizer *)sender;
+- (void)rbHandleHold:(UILongPressGestureRecognizer *)sender
+               delta:(double)delta
+               label:(NSString *)label;
 - (void)rbScrubDown:(RBNPScrubber *)sender;
 - (void)rbScrubChanged:(RBNPScrubber *)sender;
 - (void)rbScrubEnded:(RBNPScrubber *)sender;
@@ -958,18 +965,56 @@ static UIImage *rbAppIcon(NSString *bundleID) {
     [self rbHaptic:UIImpactFeedbackStyleMedium];
     RBLog(@"nowplaying nudge delta=%.0f from=%.0f to=%.0f", delta, from, target);
     [self rbSeekTo:target];
-    [self rbScheduleDisarm];
+    // 🔴 0.4.8 FIX: no -rbScheduleDisarm here. It used to disarm 0.35s after the
+    // seek, but recognition alone burns 0.5s and the finger usually stays down
+    // longer than that, so the panel was already unarmed when the touch-up came
+    // and SpringBoard closed Reachability the instant the user let go. (Real log:
+    // nudge 51221ms -> deactivate 51763ms, no "suppressed" line in between.)
+    // The hold itself now owns the armed flag until the recogniser reports Ended.
 }
 
 - (void)rbPrevLongPress:(UILongPressGestureRecognizer *)sender {
-    // Only Began: a hold fires once, on recognition, not again on Ended.
-    if (sender.state != UIGestureRecognizerStateBegan) return;
-    [self rbNudgeBy:-15.0];
+    [self rbHandleHold:sender delta:-15.0 label:@"prev"];
 }
 
 - (void)rbNextLongPress:(UILongPressGestureRecognizer *)sender {
-    if (sender.state != UIGestureRecognizerStateBegan) return;
-    [self rbNudgeBy:15.0];
+    [self rbHandleHold:sender delta:15.0 label:@"next"];
+}
+
+// One hold = arm on recognition, nudge once, disarm only when the finger leaves.
+// Split into Began vs everything-else because the recogniser reports Ended,
+// Cancelled and Failed through the same selector and only Began should seek.
+- (void)rbHandleHold:(UILongPressGestureRecognizer *)sender
+               delta:(double)delta
+               label:(NSString *)label {
+    if (sender.state == UIGestureRecognizerStateBegan) {
+        self.holdActive = YES;
+        // Re-arm explicitly: the button's touchDown already did it, but a card
+        // rebuild between the two can have cleared the flag.
+        RBPrivacyArmInteraction();
+        RBLog(@"nowplaying hold begin %@", label);
+        [self rbNudgeBy:delta];
+
+        // Failsafe. If the card is rebuilt mid-hold the recogniser is torn down
+        // without ever reporting Ended, and a permanently armed panel would
+        // refuse to close for every later tap. One shot, and it only fires if
+        // this particular hold is still marked live.
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong typeof(self) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.holdActive) return;
+            strongSelf.holdActive = NO;
+            RBLog(@"nowplaying hold failsafe disarm");
+            [strongSelf rbScheduleDisarm];
+        });
+        return;
+    }
+
+    if (!self.holdActive) return;
+    self.holdActive = NO;
+    RBLog(@"nowplaying hold end %@ state=%ld", label, (long)sender.state);
+    [self rbScheduleDisarm];
 }
 
 - (void)rbHaptic:(UIImpactFeedbackStyle)style {
@@ -1002,6 +1047,11 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 
 - (void)rbTouchCancel:(UIControl *)sender {
     (void)sender;
+    // 0.4.8: recognising a hold cancels the button's touch sequence (that is the
+    // whole point of cancelsTouchesInView here). Disarming on that cancel would
+    // drop the suppression while the finger is still down, so the hold's own
+    // -Ended is the only thing allowed to disarm during a hold.
+    if (self.holdActive) return;
     [self rbScheduleDisarm];
 }
 
@@ -1011,6 +1061,9 @@ static UIImage *rbAppIcon(NSString *bundleID) {
                    dispatch_get_main_queue(), ^{
         __strong typeof(self) strongSelf = weakSelf;
         if (!strongSelf) return;
+        // 0.4.8: a hold or a live drag owns the flag until it ends on its own
+        // terms; a timer queued by an earlier tap must not disarm underneath it.
+        if (strongSelf.holdActive || strongSelf.scrubbing) return;
         RBPrivacyCancelInteraction();
     });
 }
