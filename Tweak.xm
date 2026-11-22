@@ -112,9 +112,13 @@ static NSArray<id<RBCard>> *rbCards = nil;
 static UIView *rbContainer = nil;        // container mounted inside _topWallpaperEffectView
 static NSUInteger rbHitTestLogCount = 0; // bounded self-evidence for the touch bridge
 static UIView *rbStickyRow = nil;        // ReachPlayer emptyView trick: keep down/up on one view
-static NSUInteger rbCurrentCardIndex = 0; // 0.3.0: paged deck selection
+static NSUInteger rbCurrentCardIndex = 0; // 0.3.0: deck selection
 static NSArray<id<RBCard>> *rbSortedCards = nil;
-static NSArray<UIControl *> *rbRailButtons = nil;
+// 0.3.2 card stack: the sliver of the card behind the front one, plus its tap
+// target. Only present when two or more cards are enabled.
+static CGFloat const kRBPeekHeight = 18.0;
+static UIView *rbPeekView = nil;
+static UIControl *rbPeekTap = nil;
 // 0.3.1: geometry the deck is allowed to occupy on the current presentation.
 // Kept as statics because viewDidAppear re-measures after the reachability
 // animation settles (at viewWillAppear the host is not in a window yet).
@@ -222,14 +226,14 @@ static void RBReloadSettings(void) {
 @interface SBReachabilityWindow : UIWindow
 @end
 
-@class RBReachDeckRailButton;
+@class RBReachDeckPeekButton;
 
 @interface SBReachabilityBackgroundViewController : UIViewController
 - (void)addRBContainer;
-- (void)rbRailTouchDown:(RBReachDeckRailButton *)sender;
-- (void)rbRailTouchUp:(RBReachDeckRailButton *)sender;
-- (void)rbRailTouchCancel:(RBReachDeckRailButton *)sender;
-- (void)rbUpdateRailSelection;
+- (void)rbPeekTouchDown:(RBReachDeckPeekButton *)sender;
+- (void)rbPeekTouchUp:(RBReachDeckPeekButton *)sender;
+- (void)rbPeekTouchCancel:(RBReachDeckPeekButton *)sender;
+- (void)rbShowCardAtIndex:(NSUInteger)index;
 - (void)rbUpdateUsableGeometry;
 @end
 
@@ -242,19 +246,19 @@ static void RBReloadSettings(void) {
 // ============================================================================
 #pragma mark - Card container
 
-// 0.3.0: one rail item per card. The tag is fixed for hitTest; cardIndex is
-// separate because the tag cannot also encode the page number.
-@interface RBReachDeckRailButton : UIControl
-@property (nonatomic, assign) NSUInteger cardIndex;
+// 0.3.2: card-stack presentation. The card behind the front one only shows an
+// 18pt sliver along the top edge; that sliver IS the switcher. It reuses the
+// 'RDB4' tag the 0.3.0 rail used, so the hitTest bridge needs no new entry.
+@interface RBReachDeckPeekButton : UIControl
 @end
-@implementation RBReachDeckRailButton
+@implementation RBReachDeckPeekButton
 @end
 
 // The container spans the whole Reachability band, but only explicitly tagged
 // card rows ('RDB1'), the long-press menu/overlay ('RDB2'), the show-all /
-// collapse footer ('RDB3'), the card rail ('RDB4'), and the clipboard card
-// root ('RDB5') consume touches. Everything else returns nil so Reachability
-// gestures still pass through.
+// collapse footer ('RDB3'), the card-stack sliver ('RDB4'), and the clipboard
+// card root ('RDB5') consume touches. Everything else returns nil so
+// Reachability gestures still pass through.
 @interface RBReachDeckContainerView : UIView
 @end
 @implementation RBReachDeckContainerView
@@ -263,7 +267,7 @@ static void RBReloadSettings(void) {
     if (!hit || hit == self) return nil;
     for (UIView *v = hit; v && v != self; v = v.superview) {
         // 'RDB1' row; 'RDB2' menu/overlay; 'RDB3' expand footer;
-        // 'RDB4' card rail item; 'RDB5' clipboard card root.
+        // 'RDB4' card-stack sliver; 'RDB5' clipboard card root.
         if (v.tag == 0x52444231 || v.tag == 0x52444232 ||
             v.tag == 0x52444233 || v.tag == 0x52444234 ||
             v.tag == 0x52444235) return hit;
@@ -313,7 +317,8 @@ static void RBReloadSettings(void) {
     }
     rbCurrentCardIndex = 0;
     rbSortedCards = nil;
-    rbRailButtons = nil;
+    rbPeekView = nil;
+    rbPeekTap = nil;
     rbStackView = nil;
     rbStackTopConstraint = nil;
     rbLiveController = nil;
@@ -373,73 +378,75 @@ static void RBReloadSettings(void) {
     }];
     rbSortedCards = sorted;
     if (rbCurrentCardIndex >= sorted.count) rbCurrentCardIndex = 0;
-    // 0.3.0 paging rule (the approved design):
-    //   1 card  -> single card, no rail
-    //   2 cards -> both stacked, no rail (there is nothing to switch between)
-    //   3+      -> one card at a time, vertical rail on the deck's right edge
-    BOOL showAllCards = (sorted.count <= 2);
-    BOOL hasRail = (sorted.count > 2);
+    // 0.3.2 presentation rule (approved design):
+    //   1 card  -> single card
+    //   2+ cards -> CARD STACK: only the front card is laid out, the next one
+    //               shows an 18pt sliver along the top edge, and tapping that
+    //               sliver cycles. Vertical swipes stay reserved for the
+    //               system Reachability dismiss; nothing is ever tiled.
+    BOOL showPeek = (sorted.count >= 2);
 
-    // 0.3.0: vertical card rail on the deck's right edge (NOT the screen edge).
-    // It is tap-only; vertical swipes stay reserved for Reachability dismissal.
-    UIStackView *rail = nil;
-    NSMutableArray<UIControl *> *railButtons = [NSMutableArray array];
-    if (hasRail) {
-        rail = [[UIStackView alloc] init];
-        rail.axis = UILayoutConstraintAxisVertical;
-        rail.spacing = 8;
-        rail.alignment = UIStackViewAlignmentCenter;
-        rail.translatesAutoresizingMaskIntoConstraints = NO;
-        [container addSubview:rail];
+    // 0.3.2: the sliver of the card behind. An 18pt strip with ONLY its top
+    // corners rounded (maskedCorners) so it reads as a card edge sliding out
+    // from under the front card. Reuses the 'RDB4' tag the 0.3.0 rail had.
+    if (showPeek) {
+        UIView *peek = [[UIView alloc] initWithFrame:CGRectZero];
+        peek.translatesAutoresizingMaskIntoConstraints = NO;
+        peek.userInteractionEnabled = NO; // the tap control above handles touches
+        peek.backgroundColor = [UIColor colorWithWhite:0.0 alpha:(rbStyleOpacity * 0.92 + 0.08)];
+        peek.layer.cornerRadius = MIN(rbStyleCorner, 12.0);
+        peek.layer.cornerCurve = kCACornerCurveContinuous;
+        peek.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+        peek.layer.borderWidth = 0.5;
+        peek.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.30].CGColor;
+        [container addSubview:peek];
+        rbPeekView = peek;
 
-        for (NSUInteger i = 0; i < sorted.count; i++) {
-            id<RBCard> card = sorted[i];
-            RBReachDeckRailButton *button = [[RBReachDeckRailButton alloc] initWithFrame:CGRectZero];
-            button.cardIndex = i;
-            button.tag = 0x52444234; // 'RDB4': accepted by the hitTest bridge
-            button.translatesAutoresizingMaskIntoConstraints = NO;
-            button.layer.cornerRadius = 13;
-            button.userInteractionEnabled = YES;
-            button.accessibilityTraits = UIAccessibilityTraitButton;
-            if ([card respondsToSelector:@selector(rbRailTitle)]) {
-                button.accessibilityLabel = card.rbRailTitle;
-            }
-            [button addTarget:self action:@selector(rbRailTouchDown:)
-             forControlEvents:UIControlEventTouchDown];
-            [button addTarget:self action:@selector(rbRailTouchUp:)
-             forControlEvents:UIControlEventTouchUpInside];
-            [button addTarget:self action:@selector(rbRailTouchCancel:)
-             forControlEvents:(UIControlEventTouchCancel |
-                             UIControlEventTouchUpOutside |
-                             UIControlEventTouchDragExit)];
+        RBReachDeckPeekButton *tap = [[RBReachDeckPeekButton alloc] initWithFrame:CGRectZero];
+        tap.translatesAutoresizingMaskIntoConstraints = NO;
+        tap.tag = 0x52444234; // 'RDB4': accepted by the hitTest bridge
+        tap.userInteractionEnabled = YES;
+        tap.accessibilityTraits = UIAccessibilityTraitButton;
+        // Identity of the card sitting behind, so VoiceOver announces what the
+        // sliver switches TO (rbRailTitle is the card's short display name).
+        NSUInteger nextIdx = (rbCurrentCardIndex + 1) % sorted.count;
+        id<RBCard> nextCard = sorted[nextIdx];
+        NSString *nextTitle = [nextCard respondsToSelector:@selector(rbRailTitle)]
+            ? nextCard.rbRailTitle : nil;
+        tap.accessibilityLabel = nextTitle.length
+            ? [NSString stringWithFormat:@"切换到%@", nextTitle]
+            : @"切换卡片";
+        [tap addTarget:self action:@selector(rbPeekTouchDown:)
+      forControlEvents:UIControlEventTouchDown];
+        [tap addTarget:self action:@selector(rbPeekTouchUp:)
+      forControlEvents:UIControlEventTouchUpInside];
+        [tap addTarget:self action:@selector(rbPeekTouchCancel:)
+      forControlEvents:(UIControlEventTouchCancel |
+                        UIControlEventTouchUpOutside |
+                        UIControlEventTouchDragExit)];
+        [container addSubview:tap];
+        rbPeekTap = tap;
 
-            NSString *symbol = @"square.grid.2x2.fill";
-            if ([card respondsToSelector:@selector(rbRailImageName)] && card.rbRailImageName.length) {
-                symbol = card.rbRailImageName;
-            }
-            UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:symbol]];
-            icon.translatesAutoresizingMaskIntoConstraints = NO;
-            icon.contentMode = UIViewContentModeScaleAspectFit;
-            icon.userInteractionEnabled = NO;
-            [button addSubview:icon];
-            [NSLayoutConstraint activateConstraints:@[
-                [button.widthAnchor constraintEqualToConstant:26],
-                [button.heightAnchor constraintEqualToConstant:26],
-                [icon.centerXAnchor constraintEqualToAnchor:button.centerXAnchor],
-                [icon.centerYAnchor constraintEqualToAnchor:button.centerYAnchor],
-                [icon.widthAnchor constraintEqualToConstant:14],
-                [icon.heightAnchor constraintEqualToConstant:14],
-            ]];
-            [rail addArrangedSubview:button];
-            [railButtons addObject:button];
-        }
-        rbRailButtons = [railButtons copy];
+        // A small chevron on the sliver makes the affordance unmistakable.
+        UIImageView *chevron = [[UIImageView alloc] initWithImage:
+                                [UIImage systemImageNamed:@"chevron.up"]];
+        chevron.translatesAutoresizingMaskIntoConstraints = NO;
+        chevron.contentMode = UIViewContentModeScaleAspectFit;
+        chevron.tintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
+        chevron.userInteractionEnabled = NO;
+        [tap addSubview:chevron];
+        [NSLayoutConstraint activateConstraints:@[
+            [chevron.centerXAnchor constraintEqualToAnchor:tap.centerXAnchor],
+            [chevron.centerYAnchor constraintEqualToAnchor:tap.centerYAnchor],
+            [chevron.widthAnchor constraintEqualToConstant:10],
+            [chevron.heightAnchor constraintEqualToConstant:10],
+        ]];
     } else {
-        rbRailButtons = nil;
+        rbPeekView = nil;
+        rbPeekTap = nil;
     }
 
-    // Content is centred like ReachPlayer, but the card area now leaves room for
-    // the rail when more than one card exists.
+    // Content is centred like ReachPlayer.
     UIStackView *stack = [[UIStackView alloc] init];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 12;
@@ -448,15 +455,13 @@ static void RBReloadSettings(void) {
     [container addSubview:stack];
     // 0.2.34: keep the proven centred placement, but let a tall expanded card
     // slide up instead of growing past the home indicator. Center is high (750),
-    // so normal content stays exactly where it was; the required bottom/top
-    // clamps only kick in when the expanded list would overflow.
-    // 0.3.0: with two cards stacked, keep the SAME bottom edge as a single card
-    // so the deck grows upward into free space instead of covering the home
-    // indicator (52pt ~= half of the clipboard card's height).
-    CGFloat deckLift = (showAllCards && sorted.count > 1) ? 52.0 : 0.0;
+    // so normal content stays exactly where it was; the top/bottom clamps only
+    // kick in when the expanded list would overflow.
+    // 0.3.2: the 52pt lift that compensated for a tiled second card is gone --
+    // a card stack only ever lays out one card.
     NSLayoutConstraint *stackCenterY =
         [stack.centerYAnchor constraintEqualToAnchor:container.centerYAnchor
-                                            constant:(rbCardAtBottom ? 140.0 : -110.0) - deckLift];
+                                            constant:(rbCardAtBottom ? 140.0 : -110.0)];
     stackCenterY.priority = UILayoutPriorityDefaultHigh; // 750
     // 0.3.1: the top clamp is REQUIRED and its constant is replaced at
     // viewDidAppear with the real safe-area line (see rbUpdateUsableGeometry).
@@ -470,20 +475,29 @@ static void RBReloadSettings(void) {
     stackBottom.priority = 999;
     NSMutableArray<NSLayoutConstraint *> *stackConstraints = [NSMutableArray arrayWithObjects:
         [stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16],
+        [stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
         stackCenterY,
         stackBottom,
         rbStackTopConstraint,
         nil];
-    rbStackView = stack;
-    if (hasRail) {
-        [stackConstraints addObject:[stack.trailingAnchor constraintEqualToAnchor:rail.leadingAnchor constant:-8]];
-        [stackConstraints addObject:[rail.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-8]];
-        [stackConstraints addObject:[rail.centerYAnchor constraintEqualToAnchor:stack.centerYAnchor]];
-        [stackConstraints addObject:[rail.widthAnchor constraintEqualToConstant:28]];
-    } else {
-        [stackConstraints addObject:[stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16]];
-    }
     [NSLayoutConstraint activateConstraints:stackConstraints];
+    rbStackView = stack;
+
+    if (showPeek) {
+        // The sliver is inset 10pt from the card on both sides and sits flush on
+        // top of it; the tap target is slightly wider and 2pt taller at the
+        // bottom so the edge is comfortable to hit without covering real content.
+        [NSLayoutConstraint activateConstraints:@[
+            [rbPeekView.leadingAnchor constraintEqualToAnchor:stack.leadingAnchor constant:10],
+            [rbPeekView.trailingAnchor constraintEqualToAnchor:stack.trailingAnchor constant:-10],
+            [rbPeekView.bottomAnchor constraintEqualToAnchor:stack.topAnchor],
+            [rbPeekView.heightAnchor constraintEqualToConstant:kRBPeekHeight],
+            [rbPeekTap.leadingAnchor constraintEqualToAnchor:rbPeekView.leadingAnchor constant:-6],
+            [rbPeekTap.trailingAnchor constraintEqualToAnchor:rbPeekView.trailingAnchor constant:6],
+            [rbPeekTap.topAnchor constraintEqualToAnchor:rbPeekView.topAnchor constant:-2],
+            [rbPeekTap.bottomAnchor constraintEqualToAnchor:stack.topAnchor constant:2],
+        ]];
+    }
 
     for (NSUInteger i = 0; i < sorted.count; i++) {
         id<RBCard> card = sorted[i];
@@ -491,13 +505,12 @@ static void RBReloadSettings(void) {
         UIView *v = card.rbView;
         if (!v) continue;
         v.translatesAutoresizingMaskIntoConstraints = NO;
-        // Paged mode shows one card; stacked mode shows every card at once.
-        if (hasRail) v.hidden = (i != rbCurrentCardIndex);
+        // Card stack: exactly one card is laid out at a time.
+        if (showPeek) v.hidden = (i != rbCurrentCardIndex);
         [stack addArrangedSubview:v];
         RBLog(@"addRBContainer card=%@ h=%.0f hidden=%d",
               [card rbIdentifier], v.frame.size.height, (int)v.hidden);
     }
-    [self rbUpdateRailSelection];
 
     rbContainer = container;
     rbHitTestLogCount = 0;
@@ -520,25 +533,8 @@ static void RBReloadSettings(void) {
               NSStringFromCGRect(rbStackView.frame),
               (unsigned long)rbCurrentCardIndex,
               (unsigned long)sorted.count,
-              showAllCards ? @"stack" : (hasRail ? @"page" : @"single"));
+              showPeek ? @"peek" : @"single");
     });
-}
-
-%new
-- (void)rbUpdateRailSelection {
-    for (NSUInteger i = 0; i < rbRailButtons.count; i++) {
-        UIControl *button = rbRailButtons[i];
-        BOOL active = (i == rbCurrentCardIndex);
-        button.backgroundColor = active
-            ? [[UIColor whiteColor] colorWithAlphaComponent:0.18]
-            : [UIColor clearColor];
-        for (UIView *sub in button.subviews) {
-            if ([sub isKindOfClass:[UIImageView class]]) {
-                ((UIImageView *)sub).tintColor =
-                    [[UIColor whiteColor] colorWithAlphaComponent:(active ? 0.95 : 0.45)];
-            }
-        }
-    }
 }
 
 %new
@@ -564,7 +560,10 @@ static void RBReloadSettings(void) {
         RBLog(@"deck usable safeTop fallback=%.0f (window reported 0)", safeTop);
     }
     CGFloat notchBottom = safeTop - CGRectGetMinY(containerInWindow);
-    CGFloat topLimit = notchBottom + 10.0;
+    // 0.3.2: the card-stack sliver needs its own 18pt + 2pt above the front
+    // card, so the whole deck starts that much lower and stays below the notch.
+    CGFloat peekReserve = (rbSortedCards.count >= 2) ? (kRBPeekHeight + 2.0) : 0.0;
+    CGFloat topLimit = notchBottom + 10.0 + peekReserve;
     if (topLimit < 10.0) topLimit = 10.0;
     CGFloat maxTop = CGRectGetHeight(rbContainer.bounds) * 0.45;
     if (topLimit > maxTop) {
@@ -573,24 +572,10 @@ static void RBReloadSettings(void) {
     }
     CGFloat bottomLimit = CGRectGetHeight(rbContainer.bounds) - 16.0;
     CGFloat avail = bottomLimit - topLimit;
-    // Stacked mode (2 cards) shows both at once, so a card that CANNOT resize
-    // gets its height reserved first and the variable-height card only receives
-    // what is left over. Unknown height falls back to the clipboard card's
-    // measured ~100pt + stack spacing.
-    CGFloat reserved = 0.0;
-    if (rbSortedCards.count == 2) {
-        for (id<RBCard> other in rbSortedCards) {
-            if (![other respondsToSelector:@selector(rbSetAvailableHeight:)]) {
-                CGFloat h = CGRectGetHeight(other.rbView.frame);
-                reserved = (h > 1.0 ? h : 100.0) + 12.0;
-                break;
-            }
-        }
-    }
     RBLog(@"deck usable win=%@ containerInWindow=%@ safeTop=%.0f safeBottom=%.0f "
-          @"topLimit=%.0f bottomLimit=%.0f avail=%.0f reserved=%.0f stack=%@",
+          @"topLimit=%.0f bottomLimit=%.0f avail=%.0f peek=%.0f stack=%@",
           NSStringFromClass([win class]), NSStringFromCGRect(containerInWindow),
-          safeTop, insets.bottom, topLimit, bottomLimit, avail, reserved,
+          safeTop, insets.bottom, topLimit, bottomLimit, avail, peekReserve,
           NSStringFromCGRect(rbStackView.frame));
     if (avail < 120.0) { RBLog(@"deck usable bail: avail=%.0f", avail); return; }
 
@@ -599,48 +584,88 @@ static void RBReloadSettings(void) {
     // its expanded row list from this instead of assuming 8 rows fit.
     for (id<RBCard> card in rbSortedCards) {
         if ([card respondsToSelector:@selector(rbSetAvailableHeight:)]) {
-            [card rbSetAvailableHeight:(avail - reserved)];
+            [card rbSetAvailableHeight:avail];
         }
     }
 }
 
 %new
-- (void)rbRailTouchDown:(RBReachDeckRailButton *)sender {
-    // Close any privacy menu first, then arm suppression before SpringBoard's
-    // dismiss gesture sees this touch (same rule as the expand footer).
+- (void)rbPeekTouchDown:(RBReachDeckPeekButton *)sender {
+    (void)sender;
+    // Same rule as the expand footer and the old rail: arm the dismiss
+    // suppression on touchDown, because SpringBoard's dismiss callback can
+    // arrive before touchUpInside.
     RBPrivacyCancelInteraction();
     RBPrivacyArmInteraction();
-    RBLog(@"rail touch down index=%lu", (unsigned long)sender.cardIndex);
+    RBLog(@"peek touch down");
 }
 
 %new
-- (void)rbRailTouchUp:(RBReachDeckRailButton *)sender {
-    NSUInteger idx = sender.cardIndex;
-    if (idx >= rbSortedCards.count) {
-        RBPrivacyCancelInteraction();
-        return;
-    }
-    if (rbSortedCards.count <= 2) {
-        // Stacked mode (<=2 cards) has no rail; nothing to page.
-        RBPrivacyCancelInteraction();
-        RBLog(@"rail switch ignored: stacked mode count=%lu",
-              (unsigned long)rbSortedCards.count);
-        return;
-    }
-    rbCurrentCardIndex = idx;
+- (void)rbShowCardAtIndex:(NSUInteger)index {
+    if (index >= rbSortedCards.count) return;
     for (NSUInteger i = 0; i < rbSortedCards.count; i++) {
         id<RBCard> card = rbSortedCards[i];
         UIView *v = card.rbView;
-        v.hidden = (i != idx);
-        if (i != idx && [card respondsToSelector:@selector(rbWillUnmount)]) {
+        v.hidden = (i != index);
+        if (i != index && [card respondsToSelector:@selector(rbWillUnmount)]) {
             [card rbWillUnmount];
         }
     }
-    [self rbUpdateRailSelection];
-    id<RBCard> target = rbSortedCards[idx];
+    id<RBCard> target = rbSortedCards[index];
     if ([target respondsToSelector:@selector(rbRefresh)]) [target rbRefresh];
-    RBLog(@"rail switch index=%lu id=%@",
-          (unsigned long)idx, [target rbIdentifier]);
+
+    // The card that was hidden behind the sliver "slides out": a short fade +
+    // scale so the switch reads as depth rather than a hard cut. The reset is
+    // performed WITHOUT animation (the caller already opened one for the height
+    // change), and it ends at identity so the card's own hitTest geometry is
+    // never left transformed.
+    UIView *incoming = target.rbView;
+    if (incoming) {
+        [UIView performWithoutAnimation:^{
+            incoming.alpha = 0.0;
+            incoming.transform = CGAffineTransformMakeScale(0.965, 0.965);
+        }];
+        [UIView animateWithDuration:0.24
+                              delay:0
+                            options:UIViewAnimationOptionCurveEaseOut |
+                                    UIViewAnimationOptionBeginFromCurrentState
+                         animations:^{
+            incoming.alpha = 1.0;
+            incoming.transform = CGAffineTransformIdentity;
+        } completion:nil];
+    }
+    RBLog(@"peek switch index=%lu id=%@",
+          (unsigned long)index, [target rbIdentifier]);
+
+    // Keep the sliver's VoiceOver label pointing at the NEW card behind it.
+    if (rbPeekTap && rbSortedCards.count > 1) {
+        id<RBCard> behind = rbSortedCards[(index + 1) % rbSortedCards.count];
+        NSString *behindTitle = [behind respondsToSelector:@selector(rbRailTitle)]
+            ? behind.rbRailTitle : nil;
+        rbPeekTap.accessibilityLabel = behindTitle.length
+            ? [NSString stringWithFormat:@"切换到%@", behindTitle]
+            : @"切换卡片";
+    }
+}
+
+%new
+- (void)rbPeekTouchUp:(RBReachDeckPeekButton *)sender {
+    (void)sender;
+    if (rbSortedCards.count < 2) {
+        RBPrivacyCancelInteraction();
+        return;
+    }
+    NSUInteger next = (rbCurrentCardIndex + 1) % rbSortedCards.count;
+    rbCurrentCardIndex = next;
+    // Opened around the switch so the deck's height change (a tall expanded
+    // privacy card -> the short clipboard card) eases instead of popping.
+    [UIView animateWithDuration:0.24 delay:0 options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        [self rbShowCardAtIndex:next];
+        // Force the pass inside the block, otherwise the hidden-flag change is
+        // laid out after the block closes and the height would pop.
+        [rbContainer layoutIfNeeded];
+    } completion:nil];
 
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
@@ -651,10 +676,10 @@ static void RBReloadSettings(void) {
 }
 
 %new
-- (void)rbRailTouchCancel:(RBReachDeckRailButton *)sender {
+- (void)rbPeekTouchCancel:(RBReachDeckPeekButton *)sender {
     (void)sender;
     RBPrivacyCancelInteraction();
-    RBLog(@"rail touch cancel");
+    RBLog(@"peek touch cancel");
 }
 
 %end

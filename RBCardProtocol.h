@@ -24,7 +24,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)rbWillUnmount;
 /// Whether the card wants the long-press "pin" gesture to defeat the 0.8s keep-alive.
 @property (nonatomic, readonly) BOOL rbWantsPin;
-/// 0.3.0: identity shown in the vertical card rail (SF Symbol name + label).
+/// 0.3.0: short identity of the card (SF Symbol name + label). 0.3.2 uses the
+/// label for the card-stack sliver's accessibility text, so VoiceOver announces
+/// which card a tap on the sliver switches to.
 @property (nonatomic, readonly, copy) NSString *rbRailImageName;
 @property (nonatomic, readonly, copy) NSString *rbRailTitle;
 /// 0.3.0: shared appearance settings applied to every card.
