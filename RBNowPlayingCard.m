@@ -183,7 +183,9 @@ _Static_assert(sizeof(kRBMusicAppIDs) / sizeof(kRBMusicAppIDs[0]) ==
 @property (nonatomic, readonly) NSString *bundleIdentifier;
 // Private and version-dependent -- every call site probes respondsToSelector:
 // first. Declared here only so the call is type-checked instead of going
-// through performSelector, which would lose the NSData return type under -Werror.
+// through performSelector, which would lose the return type under -Werror.
+- (BOOL)isInstalled;
+- (NSURL *)bundleURL;
 - (NSData *)iconData;
 - (NSData *)iconDataForVariant:(int)variant;
 @end
@@ -196,9 +198,26 @@ static BOOL rbAppInstalled(NSString *bundleID) {
     Class cls = NSClassFromString(@"LSApplicationProxy");
     if (!cls) return NO;
     id<RBAppProxy> proxy = (id<RBAppProxy>)[(id)cls applicationProxyForIdentifier:bundleID];
-    // A proxy can exist for a bundle that is no longer installed (stale
-    // placeholder), so the identifier has to be non-empty as well.
-    return proxy != nil && proxy.bundleIdentifier.length > 0;
+    if (!proxy || proxy.bundleIdentifier.length == 0) return NO;
+
+    // 🔴 0.4.5 field log: `com.spotify.client` still produced a tile, and tapping
+    // it returned SBS rc=7 with the workspace fallback ok=0 -- the app was not
+    // installed at all. LSApplicationProxy answers an UNKNOWN identifier with a
+    // lazy placeholder whose -bundleIdentifier simply echoes the query back, so
+    // "proxy exists and has an id" proves nothing. Ask the proxy for its own
+    // state, then confirm the bundle is actually on disk. Each check only ever
+    // vetoes; when an accessor is missing we keep the old, lenient answer so a
+    // future iOS cannot make every tile vanish.
+    BOOL hasState = [proxy respondsToSelector:@selector(isInstalled)];
+    BOOL stateInstalled = hasState ? [proxy isInstalled] : YES;
+    BOOL hasURL = [proxy respondsToSelector:@selector(bundleURL)];
+    NSURL *url = hasURL ? [proxy bundleURL] : nil;
+    BOOL onDisk = (url.path.length == 0)
+        ? YES
+        : [[NSFileManager defaultManager] fileExistsAtPath:url.path];
+    RBLog(@"nowplaying app probe app=%@ hasState=%d state=%d hasURL=%d onDisk=%d",
+          bundleID, (int)hasState, (int)stateInstalled, (int)hasURL, (int)onDisk);
+    return stateInstalled && onDisk;
 }
 
 // The app icon, not the album artwork. Artwork is the fragile corner of
