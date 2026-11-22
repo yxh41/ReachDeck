@@ -3,8 +3,13 @@
 #import <dlfcn.h>             // dlopen/dlsym for SpringBoardServices
 
 static NSInteger const kRBDockRootTag = 0x52444241; // 'RDBA': card root
-static NSInteger const kRBDockTileTag = 0x52444242; // 'RDBB' + index (0..3)
-static NSUInteger const kRBDockMaxTiles = 4;
+static NSInteger const kRBDockTileTag = 0x52444242; // 'RDBB' + index (0..7)
+// 0.5.4: up to eight apps, five per row. A sixth app cannot share the first row
+// without shrinking every tile below the label's width, so the card grows a
+// second row instead of squeezing -- the height follows the constraints, no
+// hard-coded "expanded" mode.
+static NSUInteger const kRBDockMaxTiles = 8;
+static NSUInteger const kRBDockRowTiles = 5;
 
 #pragma mark - private SpringBoard icon model
 
@@ -414,7 +419,8 @@ static void rbDockLaunch(NSString *bundleID) {
         return;
     }
 
-    CGFloat side = self.styleCompact ? 46.0 : 52.0;
+    // 0.5.4: smaller tiles so five fit on one row (and eight across two).
+    CGFloat side = self.styleCompact ? 38.0 : 44.0;
     for (NSUInteger i = 0; i < self.tiles.count; i++) {
         UIView *tile = self.tiles[i];
         UIImageView *iconView = (UIImageView *)[tile viewWithTag:1001];
@@ -487,9 +493,80 @@ static void rbDockLaunch(NSString *bundleID) {
 
 #pragma mark view
 
+- (UIStackView *)rbMakeRow {
+    UIStackView *row = [[UIStackView alloc] initWithFrame:CGRectZero];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.distribution = UIStackViewDistributionFillEqually;
+    row.alignment = UIStackViewAlignmentCenter;
+    row.spacing = self.styleCompact ? 6.0 : 8.0;
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    return row;
+}
+
+- (UIControl *)rbMakeTileAtIndex:(NSUInteger)index side:(CGFloat)side {
+    UIControl *tile = [[UIControl alloc] initWithFrame:CGRectZero];
+    tile.tag = kRBDockTileTag + (NSInteger)index;
+    tile.userInteractionEnabled = YES;
+    tile.translatesAutoresizingMaskIntoConstraints = NO;
+    [tile addTarget:self action:@selector(rbTileDown:) forControlEvents:UIControlEventTouchDown];
+    [tile addTarget:self action:@selector(rbTileUp:) forControlEvents:UIControlEventTouchUpInside];
+    [tile addTarget:self action:@selector(rbTileCancel:) forControlEvents:UIControlEventTouchCancel];
+    // 0.5.1: a touch that drags out and back in must still arm, otherwise the
+    // second TouchDown of the same sequence arrives with no suppression.
+    [tile addTarget:self action:@selector(rbTileDown:) forControlEvents:UIControlEventTouchDragEnter];
+
+    UIImageView *iconView = [[UIImageView alloc] initWithFrame:CGRectZero];
+    iconView.tag = 1001;
+    iconView.translatesAutoresizingMaskIntoConstraints = NO;
+    iconView.userInteractionEnabled = NO;
+    iconView.layer.cornerRadius = side * 0.2237;   // the system icon corner ratio
+    iconView.layer.cornerCurve = kCACornerCurveContinuous;
+    iconView.clipsToBounds = YES;
+    iconView.contentMode = UIViewContentModeScaleAspectFit;
+    [tile addSubview:iconView];
+
+    UILabel *nameLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    nameLabel.tag = 1002;
+    nameLabel.font = [UIFont systemFontOfSize:(self.styleCompact ? 9.0 : 10.0) weight:UIFontWeightRegular];
+    nameLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.88];
+    nameLabel.textAlignment = NSTextAlignmentCenter;
+    nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    nameLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    nameLabel.userInteractionEnabled = NO;
+    [tile addSubview:nameLabel];
+
+    // The square is nominal, not absolute: on a narrow card the tile wins, and
+    // the icon shrinks with it (height follows width) instead of overflowing.
+    NSLayoutConstraint *iconW = [iconView.widthAnchor constraintEqualToConstant:side];
+    NSLayoutConstraint *iconH = [iconView.heightAnchor constraintEqualToConstant:side];
+    iconW.priority = 999;
+    iconH.priority = 999;
+    [NSLayoutConstraint activateConstraints:@[
+        [iconView.topAnchor constraintEqualToAnchor:tile.topAnchor],
+        [iconView.centerXAnchor constraintEqualToAnchor:tile.centerXAnchor],
+        iconW, iconH,
+        [iconView.widthAnchor constraintLessThanOrEqualToAnchor:tile.widthAnchor],
+        [iconView.heightAnchor constraintEqualToAnchor:iconView.widthAnchor],
+        [nameLabel.topAnchor constraintEqualToAnchor:iconView.bottomAnchor constant:4.0],
+        [nameLabel.leadingAnchor constraintEqualToAnchor:tile.leadingAnchor],
+        [nameLabel.trailingAnchor constraintEqualToAnchor:tile.trailingAnchor],
+        [nameLabel.bottomAnchor constraintEqualToAnchor:tile.bottomAnchor],
+    ]];
+    return tile;
+}
+
 - (void)buildView {
     CGFloat pad = self.styleCompact ? 8.0 : 11.0;
-    CGFloat side = self.styleCompact ? 46.0 : 52.0;
+    CGFloat side = self.styleCompact ? 38.0 : 44.0;
+    CGFloat rowGap = self.styleCompact ? 5.0 : 7.0;
+
+    // The row count is decided HERE, from the target list, and never toggled
+    // later: a hidden UIStackView keeps every constraint alive, so showing a
+    // second row after the fact is the same trap that made the empty state
+    // fight Auto Layout before 0.5.1. Building what is needed once is simpler
+    // and leaves the card height entirely to the constraint chain.
+    NSUInteger shown = MIN(self.targets.count, kRBDockMaxTiles);
+    NSUInteger secondRowTiles = (shown > kRBDockRowTiles) ? (shown - kRBDockRowTiles) : 0;
 
     UIControl *root = [[UIControl alloc] initWithFrame:CGRectZero];
     root.translatesAutoresizingMaskIntoConstraints = NO;
@@ -508,58 +585,33 @@ static void rbDockLaunch(NSString *bundleID) {
     header.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.58];
     header.translatesAutoresizingMaskIntoConstraints = NO;
 
-    UIStackView *row = [[UIStackView alloc] initWithFrame:CGRectZero];
-    row.axis = UILayoutConstraintAxisHorizontal;
-    row.distribution = UIStackViewDistributionFillEqually;
-    row.alignment = UIStackViewAlignmentCenter;
-    row.spacing = self.styleCompact ? 6.0 : 8.0;
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-
     NSMutableArray<UIView *> *tiles = [NSMutableArray arrayWithCapacity:kRBDockMaxTiles];
-    for (NSUInteger i = 0; i < kRBDockMaxTiles; i++) {
-        UIControl *tile = [[UIControl alloc] initWithFrame:CGRectZero];
-        tile.tag = kRBDockTileTag + (NSInteger)i;
-        tile.userInteractionEnabled = YES;
-        tile.translatesAutoresizingMaskIntoConstraints = NO;
-        [tile addTarget:self action:@selector(rbTileDown:) forControlEvents:UIControlEventTouchDown];
-        [tile addTarget:self action:@selector(rbTileUp:) forControlEvents:UIControlEventTouchUpInside];
-        [tile addTarget:self action:@selector(rbTileCancel:) forControlEvents:UIControlEventTouchCancel];
-        // 0.5.1: a touch that drags out and back in must still arm, otherwise the
-        // second TouchDown of the same sequence arrives with no suppression.
-        [tile addTarget:self action:@selector(rbTileDown:) forControlEvents:UIControlEventTouchDragEnter];
 
-        UIImageView *iconView = [[UIImageView alloc] initWithFrame:CGRectZero];
-        iconView.tag = 1001;
-        iconView.translatesAutoresizingMaskIntoConstraints = NO;
-        iconView.userInteractionEnabled = NO;
-        iconView.layer.cornerRadius = side * 0.2237;   // the system icon corner ratio
-        iconView.layer.cornerCurve = kCACornerCurveContinuous;
-        iconView.clipsToBounds = YES;
-        iconView.contentMode = UIViewContentModeScaleAspectFit;
-        [tile addSubview:iconView];
-
-        UILabel *nameLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-        nameLabel.tag = 1002;
-        nameLabel.font = [UIFont systemFontOfSize:(self.styleCompact ? 9.0 : 10.0) weight:UIFontWeightRegular];
-        nameLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.88];
-        nameLabel.textAlignment = NSTextAlignmentCenter;
-        nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-        nameLabel.translatesAutoresizingMaskIntoConstraints = NO;
-        nameLabel.userInteractionEnabled = NO;
-        [tile addSubview:nameLabel];
-
-        [NSLayoutConstraint activateConstraints:@[
-            [iconView.topAnchor constraintEqualToAnchor:tile.topAnchor],
-            [iconView.centerXAnchor constraintEqualToAnchor:tile.centerXAnchor],
-            [iconView.widthAnchor constraintEqualToConstant:side],
-            [iconView.heightAnchor constraintEqualToConstant:side],
-            [nameLabel.topAnchor constraintEqualToAnchor:iconView.bottomAnchor constant:4.0],
-            [nameLabel.leadingAnchor constraintEqualToAnchor:tile.leadingAnchor],
-            [nameLabel.trailingAnchor constraintEqualToAnchor:tile.trailingAnchor],
-            [nameLabel.bottomAnchor constraintEqualToAnchor:tile.bottomAnchor],
-        ]];
-        [row addArrangedSubview:tile];
+    UIStackView *row1 = [self rbMakeRow];
+    for (NSUInteger i = 0; i < kRBDockRowTiles; i++) {
+        UIControl *tile = [self rbMakeTileAtIndex:i side:side];
+        [row1 addArrangedSubview:tile];
         [tiles addObject:tile];
+    }
+
+    UIStackView *row2 = nil;
+    if (secondRowTiles > 0) {
+        row2 = [self rbMakeRow];
+        for (NSUInteger i = 0; i < secondRowTiles; i++) {
+            UIControl *tile = [self rbMakeTileAtIndex:(kRBDockRowTiles + i) side:side];
+            [row2 addArrangedSubview:tile];
+            [tiles addObject:tile];
+        }
+        // Transparent spacers fill the row out to five slots. FillEqually then
+        // hands row 2 the SAME per-tile width as row 1, so a six-app list lines
+        // up under a full first row instead of stretching one tile edge to edge.
+        for (NSUInteger i = secondRowTiles; i < kRBDockRowTiles; i++) {
+            UIView *spacer = [[UIView alloc] initWithFrame:CGRectZero];
+            spacer.translatesAutoresizingMaskIntoConstraints = NO;
+            spacer.userInteractionEnabled = NO;
+            spacer.backgroundColor = [UIColor clearColor];
+            [row2 addArrangedSubview:spacer];
+        }
     }
 
     UILabel *empty = [[UILabel alloc] initWithFrame:CGRectZero];
@@ -570,31 +622,42 @@ static void rbDockLaunch(NSString *bundleID) {
     empty.translatesAutoresizingMaskIntoConstraints = NO;
 
     [root addSubview:header];
-    [root addSubview:row];
+    [root addSubview:row1];
+    if (row2) [root addSubview:row2];
     [root addSubview:empty];
-    [NSLayoutConstraint activateConstraints:@[
+
+    NSMutableArray<NSLayoutConstraint *> *constraints = [NSMutableArray arrayWithArray:@[
         [header.topAnchor constraintEqualToAnchor:root.topAnchor constant:pad],
         [header.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad + 1.0],
         [header.trailingAnchor constraintLessThanOrEqualToAnchor:root.trailingAnchor constant:-(pad + 1.0)],
 
-        [row.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:(self.styleCompact ? 5.0 : 7.0)],
-        [row.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad],
-        [row.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-pad],
-        [row.bottomAnchor constraintEqualToAnchor:root.bottomAnchor constant:-pad],
+        [row1.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:rowGap],
+        [row1.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad],
+        [row1.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-pad],
 
         [empty.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:10.0],
         [empty.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad + 1.0],
     ]];
-    // The row and the placeholder never share the screen, but both are laid out
-    // (hidden views keep their constraints). Only the ROW may define the card's
-    // bottom edge -- giving the placeholder its own bottom-to-card equation makes
-    // the two chains demand different heights for the same view, which Auto
-    // Layout resolves by breaking a constraint at random.
-    [empty.bottomAnchor constraintLessThanOrEqualToAnchor:root.bottomAnchor constant:-(pad + 2.0)].active = YES;
+    // Only the ROW may define the card's bottom edge. Giving the placeholder its
+    // own bottom-to-card equation makes two chains demand different heights for
+    // the same view, which Auto Layout resolves by breaking one at random.
+    [constraints addObject:[empty.bottomAnchor constraintLessThanOrEqualToAnchor:root.bottomAnchor
+                                                                        constant:-(pad + 2.0)]];
+    if (row2) {
+        [constraints addObjectsFromArray:@[
+            [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:rowGap],
+            [row2.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad],
+            [row2.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-pad],
+            [row2.bottomAnchor constraintEqualToAnchor:root.bottomAnchor constant:-pad],
+        ]];
+    } else {
+        [constraints addObject:[row1.bottomAnchor constraintEqualToAnchor:root.bottomAnchor constant:-pad]];
+    }
+    [NSLayoutConstraint activateConstraints:constraints];
 
     self.view = root;
     self.headerLabel = header;
-    self.tilesRow = row;
+    self.tilesRow = row1;
     self.emptyLabel = empty;
     self.tiles = tiles;
 }

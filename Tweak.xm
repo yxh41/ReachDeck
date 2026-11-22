@@ -349,13 +349,14 @@ static void RBReloadSettings(void) {
         // 'RDB6' now-playing transport button; 'RDB7' now-playing scrubber;
         // 'RDB8'..'RDB=' the empty-state music app buttons ('RDB8' + index, the
         // card caps them at four, the band leaves room for six);
-        // 'RDBA'..'RDBE' the dock-apps card root ('RDBA') and its four tiles.
+        // 'RDBA'..'RDBI' the dock-apps card root ('RDBA') and its eight tiles
+        // (0.5.4 raised the cap from four to eight, so the range grew with it).
         if (v.tag == 0x52444231 || v.tag == 0x52444232 ||
             v.tag == 0x52444233 || v.tag == 0x52444234 ||
             v.tag == 0x52444235 || v.tag == 0x52444236 ||
             v.tag == 0x52444237 ||
             (v.tag >= 0x52444238 && v.tag <= 0x5244423D) ||
-            (v.tag >= 0x52444241 && v.tag <= 0x52444245)) return hit;
+            (v.tag >= 0x52444241 && v.tag <= 0x52444249)) return hit;
     }
     return nil;
 }

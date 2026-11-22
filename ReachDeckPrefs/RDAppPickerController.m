@@ -16,7 +16,7 @@
 //     returns a lazy placeholder echoing the query), so every candidate is
 //     re-checked against the disk first.
 
-static NSUInteger const kRDMaxPickedApps = 4;
+static NSUInteger const kRDMaxPickedApps = 8;
 static CGFloat const kRDAppIconSide = 32.0;
 static NSString *const kRDAppsKey = @"cardCustomApps";
 static NSString *const kRDAppRowID = @"RDAppRow";
@@ -79,6 +79,13 @@ static void RDWriteValueForKey(id value, NSString *key) {
 + (NSArray *)enumerableApplicationProxies;
 @end
 
+@interface UIImage (RDAppIconLookup)
+// The lookup the home screen itself uses. Declared here only so the call is
+// type-checked instead of going through performSelector, which drops the return
+// type and trips -Werror.
++ (UIImage *)_applicationIconImageForBundleIdentifier:(NSString *)bundleID format:(int)format;
+@end
+
 static NSCache *RDAppIconCache(void) {
     static NSCache *cache = nil;
     static dispatch_once_t once;
@@ -98,21 +105,117 @@ static dispatch_queue_t RDAppIconQueue(void) {
     return queue;
 }
 
+// Sampling one pixel is the only honest test: UIKit's private lookup returns a
+// correctly sized but fully TRANSPARENT image for some bundles (system apps
+// especially), and treating that as "found" leaves an invisible tile.
+static BOOL RDImageHasContent(UIImage *image) {
+    if (!image || !image.CGImage) return NO;
+    if (image.size.width < 8.0 || image.size.height < 8.0) return NO;
+    unsigned char px[4] = {0, 0, 0, 0};
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, 1, 1, 8, 4, space,
+                                             (uint32_t)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(space);
+    if (!ctx) return YES;   // cannot measure, so trust the lookup
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+    CGContextDrawImage(ctx, CGRectMake(0.0, 0.0, 1.0, 1.0), image.CGImage);
+    CGContextRelease(ctx);
+    return px[3] > 12;
+}
+
+// Read the compiled app icon straight out of the .app -- the same approach the
+// Oback picker uses. Xcode copies the icon next to Info.plist even when the
+// project draws it from an asset catalog, so this covers the bundles whose
+// iconData comes back empty.
+static UIImage *RDAppIconFromBundle(id<RDAppProxy> proxy) {
+    if (![proxy respondsToSelector:@selector(bundleURL)]) return nil;
+    NSURL *url = [proxy bundleURL];
+    if (![url isKindOfClass:[NSURL class]] || !url.path.length) return nil;
+
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                          [url.path stringByAppendingPathComponent:@"Info.plist"]];
+    if (![info isKindOfClass:[NSDictionary class]]) return nil;
+
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    void (^addName)(id) = ^(id raw) {
+        if (![raw isKindOfClass:[NSString class]]) return;
+        NSString *name = (NSString *)raw;
+        if (!name.length) return;
+        [candidates addObject:name];
+        [candidates addObject:[NSString stringWithFormat:@"%@@2x", name]];
+        [candidates addObject:[NSString stringWithFormat:@"%@@3x", name]];
+    };
+
+    addName(info[@"CFBundleIconName"]);
+    id icons = info[@"CFBundleIcons"];
+    if ([icons isKindOfClass:[NSDictionary class]]) {
+        id primary = icons[@"CFBundlePrimaryIcon"];
+        if ([primary isKindOfClass:[NSDictionary class]]) {
+            addName(primary[@"CFBundleIconName"]);
+            id files = primary[@"CFBundleIconFiles"];
+            if ([files isKindOfClass:[NSArray class]]) {
+                for (id file in files) addName(file);
+            }
+        }
+    }
+    id legacy = info[@"CFBundleIconFiles"];
+    if ([legacy isKindOfClass:[NSArray class]]) {
+        for (id file in legacy) addName(file);
+    }
+
+    for (NSString *candidate in candidates) {
+        for (NSString *name in @[ candidate, [candidate stringByAppendingString:@".png"] ]) {
+            UIImage *img = [UIImage imageWithContentsOfFile:
+                            [url.path stringByAppendingPathComponent:name]];
+            if (img) return img;
+        }
+    }
+    return nil;
+}
+
 static UIImage *RDAppRenderIcon(NSString *bundleID, CGFloat side) {
     if (!bundleID.length) return nil;
     Class cls = NSClassFromString(@"LSApplicationProxy");
     if (!cls) return nil;
     id<RDAppProxy> proxy = (id<RDAppProxy>)[(id)cls applicationProxyForIdentifier:bundleID];
     if (!proxy) return nil;
-    NSData *data = nil;
-    if ([proxy respondsToSelector:@selector(iconData)]) data = [proxy iconData];
-    if (!data.length && [proxy respondsToSelector:@selector(iconDataForVariant:)]) {
-        data = [proxy iconDataForVariant:0];
+
+    // Three lookups, cheapest first. 0.5.3 shipped only #2, and `iconData` comes
+    // back empty for most bundles on iOS 16 -- which is why the whole list had
+    // no artwork at all.
+    UIImage *found = nil;
+
+    // 1. UIKit's private lookup: one XPC round trip and the exact raster the home
+    //    screen draws. It hands back a fully TRANSPARENT placeholder for some
+    //    bundles, so the pixels are sampled before it is trusted.
+    if ([UIImage respondsToSelector:@selector(_applicationIconImageForBundleIdentifier:format:)]) {
+        UIImage *img = [UIImage _applicationIconImageForBundleIdentifier:bundleID format:2];
+        if (RDImageHasContent(img)) found = img;
     }
-    if (!data.length) return nil;
-    UIImage *raw = [UIImage imageWithData:data];
-    if (!raw) return nil;
-    if (raw.size.width <= side + 1.0 && raw.size.height <= side + 1.0) return raw;
+
+    // 2. LaunchServices PNG data.
+    if (!found) {
+        NSData *data = nil;
+        if ([proxy respondsToSelector:@selector(iconData)]) data = [proxy iconData];
+        if (!data.length && [proxy respondsToSelector:@selector(iconDataForVariant:)]) {
+            data = [proxy iconDataForVariant:0];
+        }
+        if (data.length) {
+            UIImage *img = [UIImage imageWithData:data];
+            if (RDImageHasContent(img)) found = img;
+        }
+    }
+
+    // 3. The bundle's own PNG, the way Oback reads it. Xcode copies the compiled
+    //    app icon next to Info.plist, so this works for asset-catalog apps too --
+    //    it only costs a file read, which is why it is last.
+    if (!found) {
+        UIImage *img = RDAppIconFromBundle(proxy);
+        if (RDImageHasContent(img)) found = img;
+    }
+
+    if (!found) return nil;
+    if (found.size.width <= side + 1.0 && found.size.height <= side + 1.0) return found;
 
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
     fmt.opaque = NO;
@@ -120,7 +223,7 @@ static UIImage *RDAppRenderIcon(NSString *bundleID, CGFloat side) {
         [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side) format:fmt];
     return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         (void)ctx;
-        [raw drawInRect:CGRectMake(0.0, 0.0, side, side)];
+        [found drawInRect:CGRectMake(0.0, 0.0, side, side)];
     }];
 }
 
@@ -291,7 +394,7 @@ static NSString *RDAppProxyName(id<RDAppProxy> proxy, NSString *bundleID) {
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (!self.entries.count) return @"无法读取已安装的 App 列表，请重开设置再试。";
     if (!self.selected.count) {
-        return @"还没有选择，卡片目前显示 Dock 里的 App。最多可以选 4 个，选满后卡片只显示你选的这些。";
+        return @"还没有选择，卡片目前显示 Dock 里的 App。最多可以选 8 个：前 5 个排一行，后面的自动换到第二行。";
     }
     return @"点按右侧有蓝色序号的 App 可以取消选择。已选的 App 会取代 Dock，按序号从左到右排列。";
 }
@@ -365,8 +468,8 @@ static NSString *RDAppProxyName(id<RDAppProxy> proxy, NSString *bundleID) {
 
 - (void)rdShowLimitAlert {
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"最多选择 4 个"
-                         message:@"卡片一行只放得下 4 个图标。想换的话，先取消一个已选的 App。"
+        alertControllerWithTitle:@"最多选择 8 个"
+                         message:@"卡片排两行：每行 5 个，第二行放剩下的。想换的话，先取消一个已选的 App。"
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"好"
                                              style:UIAlertActionStyleDefault
