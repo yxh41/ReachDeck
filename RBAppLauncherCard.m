@@ -1,5 +1,6 @@
 #import "RBAppLauncherCard.h"
 #import "RBPrivacyCard.h"   // RBLog + shared interaction suppression
+#import <dlfcn.h>             // dlopen/dlsym for SpringBoardServices
 
 static NSInteger const kRBDockRootTag = 0x52444241; // 'RDBA': card root
 static NSInteger const kRBDockTileTag = 0x52444242; // 'RDBB' + index (0..3)
