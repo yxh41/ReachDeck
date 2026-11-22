@@ -447,6 +447,11 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 // it actually leaves. While set the panel must stay armed, otherwise the touch-up
 // that ends the hold reads as a tap outside and closes Reachability.
 @property (nonatomic, assign) BOOL holdActive;
+// 0.4.9: which hold currently owns the flag. A failsafe timer belongs to one
+// specific hold; without this counter an old timer firing a few seconds later
+// disarms the NEW hold that is in progress. (Real log: hold begin at 219098ms,
+// then "hold failsafe disarm" at 219110ms from the hold that began at 213037ms.)
+@property (nonatomic, assign) NSUInteger holdGeneration;
 @property (nonatomic, strong) UIView *transportContainer;
 @property (nonatomic, strong) UIButton *prevButton;
 @property (nonatomic, strong) UIButton *playButton;
@@ -462,6 +467,10 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 // -1 = nothing waiting. Set on seek, consumed by the very next fetch so the log
 // can state whether the app actually moved.
 @property (nonatomic, assign) double pendingSeekTarget;
+// 0.4.9: when the pending seek was issued, in NSTimeInterval terms. A read-back
+// that disagrees while the command is still fresh is the system answering with
+// the pre-seek position, not a refusal -- the two cases must not look alike.
+@property (nonatomic, assign) NSTimeInterval seekStartedAt;
 
 @property (nonatomic, assign) CGFloat styleOpacity;
 @property (nonatomic, assign) CGFloat styleCorner;
@@ -695,11 +704,29 @@ static UIImage *rbAppIcon(NSString *bundleID) {
           (int)self.hasMedia, (int)playing, elapsed, duration);
     // A seek is only done once the system says so. Playing media drifts forward
     // while the read-back is in flight, hence the deliberately loose 8s window.
+    // 🔴 0.4.9: a read-back that disagrees is only a refusal if it is OLD. When
+    // the fetch lands within a second of the command, MediaRemote is answering
+    // with the position from before the seek -- writing that back snaps the bar
+    // backwards and makes a successful nudge look like it did nothing. Real log:
+    // seek to 19.2 at 312473ms, "elapsed=6" at 313093ms.
     if (self.pendingSeekTarget >= 0) {
         double want = self.pendingSeekTarget;
-        self.pendingSeekTarget = -1;
-        RBLog(@"nowplaying seek %@ want=%.0f got=%.0f",
-              (fabs(elapsed - want) > 8.0) ? @"ignored" : @"confirmed", want, elapsed);
+        double age = [NSDate timeIntervalSinceReferenceDate] - self.seekStartedAt;
+        if (fabs(elapsed - want) <= 8.0) {
+            self.pendingSeekTarget = -1;
+            RBLog(@"nowplaying seek confirmed want=%.0f got=%.0f", want, elapsed);
+        } else if (age < 1.2) {
+            // Keep the optimistic position and stay pending: the 0.6s re-fetch
+            // is the one that carries the truth. Without the deadline a genuine
+            // refusal would never surface, so age retires the hope after 1.2s.
+            self.elapsed = want;
+            RBLog(@"nowplaying seek pending want=%.0f got=%.0f age=%.2f",
+                  want, elapsed, age);
+        } else {
+            self.pendingSeekTarget = -1;
+            RBLog(@"nowplaying seek ignored want=%.0f got=%.0f age=%.2f",
+                  want, elapsed, age);
+        }
     }
     [self rbUpdateLabels];
     if (self.hasMedia && playing) {
@@ -937,6 +964,7 @@ static UIImage *rbAppIcon(NSString *bundleID) {
     self.elapsed = seconds;
     [self rbUpdateLabels];
     self.pendingSeekTarget = seconds;
+    self.seekStartedAt = [NSDate timeIntervalSinceReferenceDate];
 
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
@@ -982,37 +1010,54 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 }
 
 // One hold = arm on recognition, nudge once, disarm only when the finger leaves.
-// Split into Began vs everything-else because the recogniser reports Ended,
-// Cancelled and Failed through the same selector and only Began should seek.
+// 🔴 0.4.9: the state split is explicit. A long-press recogniser reports Changed
+// while the finger is still down (any small movement), and treating "not Began"
+// as "finished" disarmed the panel mid-hold -- the user then let go and
+// SpringBoard closed Reachability. Real log: hold begin 314403ms, "hold end
+// state=2" 314611ms, deactivate 315081ms.
 - (void)rbHandleHold:(UILongPressGestureRecognizer *)sender
                delta:(double)delta
                label:(NSString *)label {
     if (sender.state == UIGestureRecognizerStateBegan) {
+        self.holdGeneration += 1;
+        NSUInteger generation = self.holdGeneration;
         self.holdActive = YES;
         // Re-arm explicitly: the button's touchDown already did it, but a card
         // rebuild between the two can have cleared the flag.
         RBPrivacyArmInteraction();
-        RBLog(@"nowplaying hold begin %@", label);
+        RBLog(@"nowplaying hold begin %@ gen=%lu", label, (unsigned long)generation);
         [self rbNudgeBy:delta];
 
         // Failsafe. If the card is rebuilt mid-hold the recogniser is torn down
         // without ever reporting Ended, and a permanently armed panel would
-        // refuse to close for every later tap. One shot, and it only fires if
-        // this particular hold is still marked live.
+        // refuse to close for every later tap. One shot, and it only applies to
+        // THIS hold -- the generation check is what keeps a timer from five
+        // seconds ago from disarming the hold the user just started.
         __weak typeof(self) weakSelf = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             __strong typeof(self) strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf.holdActive) return;
+            if (!strongSelf || strongSelf.holdGeneration != generation) return;
+            if (!strongSelf.holdActive) return;
             strongSelf.holdActive = NO;
-            RBLog(@"nowplaying hold failsafe disarm");
+            RBLog(@"nowplaying hold failsafe disarm gen=%lu", (unsigned long)generation);
             [strongSelf rbScheduleDisarm];
         });
         return;
     }
 
+    // Changed (2) is still a finger on the glass; Possible (0) should never
+    // reach a handler. Only Ended (3), Cancelled (4) and Failed (5) end a hold.
+    if (sender.state != UIGestureRecognizerStateEnded &&
+        sender.state != UIGestureRecognizerStateCancelled &&
+        sender.state != UIGestureRecognizerStateFailed) {
+        return;
+    }
+
     if (!self.holdActive) return;
     self.holdActive = NO;
+    // The hold is over, so any failsafe still queued for it is moot.
+    self.holdGeneration += 1;
     RBLog(@"nowplaying hold end %@ state=%ld", label, (long)sender.state);
     [self rbScheduleDisarm];
 }
