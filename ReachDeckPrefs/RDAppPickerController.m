@@ -33,6 +33,9 @@ static NSString *const kRDAppsKey = @"cardCustomApps";
 @end
 
 @protocol RDAppWorkspace <NSObject>
+// The +defaultWorkspace hop is on the protocol so the receiver stays typed; on a
+// bare id the compiler reports "no known instance method" under -Werror.
++ (id)defaultWorkspace;
 - (NSArray *)allApplications;
 - (NSArray *)allInstalledApplications;
 @end
@@ -172,7 +175,7 @@ static NSString *RDAppProxyName(id<RDAppProxy> proxy, NSString *bundleID) {
     return _specifiers;
 }
 
-- (NSArray *)rdBuildSpecifiers {
+- (NSMutableArray *)rdBuildSpecifiers {
     NSMutableArray *out = [NSMutableArray array];
     NSArray<NSString *> *selected = [self rdSelectedBundleIDs];
 
