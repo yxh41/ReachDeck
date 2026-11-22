@@ -62,6 +62,26 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
+			<string>更多卡片</string>
+		<key>footerText</key>
+		<string>两张卡片时上下并排显示；三张以上时右侧出现图标轨道，点按切换。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>剪贴板卡片</string>
+			<key>key</key>
+			<string>cardClipboard</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.zlhkf.ReachDeck</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
 			<string>显示位置</string>
 			<key>footerText</key>
 			<string>卡片默认放在便捷访问区域下方。若看不到卡片，打开下方开关试试顶部。</string>

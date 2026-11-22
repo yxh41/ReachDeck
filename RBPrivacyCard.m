@@ -122,6 +122,7 @@ static RBPrivacyCard *rbActivePrivacyCard = nil; // 0.2.31: for cross-process ca
 // 0.2.31 exported state, read from Tweak.xm's -deactivateReachability hook.
 // C linkage (see header) so the ObjC++ tweak can call into this ObjC file.
 BOOL RBPrivacyInteractionActive(void) { return rbPrivacyInteractionActive; }
+void RBPrivacyArmInteraction(void) { rbPrivacyInteractionActive = YES; }
 void RBPrivacyCancelInteraction(void) {
     rbPrivacyInteractionActive = NO;
     [rbActivePrivacyCard rbDismissRowMenu:nil];
@@ -156,6 +157,8 @@ void RBPrivacyCancelInteraction(void) {
 - (NSInteger)rbPriority { return _rbPriority; }
 - (NSString *)rbIdentifier { return _rbIdentifier; }
 - (BOOL)rbWantsPin { return _rbWantsPin; }
+- (NSString *)rbRailImageName { return @"eye.fill"; }
+- (NSString *)rbRailTitle { return @"隐私"; }
 
 - (void)rbRefresh {
     // Container calls this on appear. The provider push (ingestAttributions:) is the

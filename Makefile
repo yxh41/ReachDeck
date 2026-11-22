@@ -9,7 +9,7 @@ THEOS_PACKAGE_SCHEME = roothide
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = ReachDeck
-ReachDeck_FILES = Tweak.xm RBPrivacyCard.m
+ReachDeck_FILES = Tweak.xm RBPrivacyCard.m RBClipboardCard.m
 ReachDeck_CFLAGS = -fobjc-arc -Werror -Wall
 ReachDeck_EXTRA_FRAMEWORKS =
 

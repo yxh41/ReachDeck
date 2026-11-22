@@ -19,6 +19,7 @@ extern void RBLog(NSString * _Nonnull fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 // hook suppresses the SYSTEM reachability dismiss while this is YES, otherwise
 // a long hold on a card row collapses Reachability before the menu can be used.
 extern BOOL RBPrivacyInteractionActive(void);
+extern void RBPrivacyArmInteraction(void);
 extern void RBPrivacyCancelInteraction(void);
 #ifdef __cplusplus
 }

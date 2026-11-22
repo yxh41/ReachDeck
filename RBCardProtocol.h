@@ -24,6 +24,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)rbWillUnmount;
 /// Whether the card wants the long-press "pin" gesture to defeat the 0.8s keep-alive.
 @property (nonatomic, readonly) BOOL rbWantsPin;
+/// 0.3.0: identity shown in the vertical card rail (SF Symbol name + label).
+@property (nonatomic, readonly, copy) NSString *rbRailImageName;
+@property (nonatomic, readonly, copy) NSString *rbRailTitle;
+/// 0.3.0: shared appearance settings applied to every card.
+- (void)setStyleOpacity:(CGFloat)opacity corner:(CGFloat)corner border:(CGFloat)border compact:(BOOL)compact;
 
 @end
 
