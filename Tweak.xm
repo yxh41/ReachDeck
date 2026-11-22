@@ -7,6 +7,7 @@
 #import "RBCardProtocol.h"
 #import "RBPrivacyCard.h"
 #import "RBClipboardCard.h"
+#import "RBNowPlayingCard.h"
 
 // Diagnostic log (0.0.3+): ASCII-only strings so they survive toolchain string
 // handling; mirrored to syslog and a plist-dir file the user can send us.
@@ -98,9 +99,11 @@ static void RBDumpIvars(const char *clsName) {
 
 static RBPrivacyCard *privacyCard = nil;
 static RBClipboardCard *clipboardCard = nil;
+static RBNowPlayingCard *nowPlayingCard = nil;
 static BOOL rbEnabled = YES;
 static BOOL rbCardPrivacy = YES;
 static BOOL rbCardClipboard = YES;
+static BOOL rbCardNowPlaying = YES;
 static BOOL rbHideSystemServices = NO;
 static BOOL rbCardAtBottom = YES;         // 0.2.1: derived from cardAtTop (default off => bottom)
 // 0.2.19 style: defaults reproduce the pre-style look exactly.
@@ -126,6 +129,11 @@ static NSArray<id<RBCard>> *rbSortedCards = nil;
 static CGFloat const kRBPeekOffset = 22.0; // how far the rear card sticks out
 static UIControl *rbPeekTap = nil;
 static UILabel *rbPeekLabel = nil;
+// 0.4.0: page dots on the band's right side. The pill only says "tap for the
+// next card", which stops being enough at three cards -- you cannot tell where
+// you are in the cycle, so the dots carry the position and the pill keeps the
+// action. Decorative only: never tagged, never interactive.
+static UIStackView *rbPeekDots = nil;
 // 0.3.1: geometry the deck is allowed to occupy on the current presentation.
 // Kept as statics because viewDidAppear re-measures after the reachability
 // animation settles (at viewWillAppear the host is not in a window yet).
@@ -142,6 +150,10 @@ static void RBRebuildCards(void) {
         [privacyCard setHideSystemServices:rbHideSystemServices];
         [cards addObject:privacyCard];
     }
+    if (rbCardNowPlaying) {
+        if (!nowPlayingCard) nowPlayingCard = [[RBNowPlayingCard alloc] init];
+        [cards addObject:nowPlayingCard];
+    }
     if (rbCardClipboard) {
         if (!clipboardCard) clipboardCard = [[RBClipboardCard alloc] init];
         [cards addObject:clipboardCard];
@@ -153,9 +165,9 @@ static void RBRebuildCards(void) {
         }
     }
     rbCards = [cards copy];
-    RBLog(@"rebuild cards privacy=%d clipboard=%d hideSys=%d bottom=%d count=%lu",
-          rbCardPrivacy, rbCardClipboard, rbHideSystemServices, rbCardAtBottom,
-          (unsigned long)rbCards.count);
+    RBLog(@"rebuild cards privacy=%d nowplaying=%d clipboard=%d hideSys=%d bottom=%d count=%lu",
+          rbCardPrivacy, rbCardNowPlaying, rbCardClipboard, rbHideSystemServices,
+          rbCardAtBottom, (unsigned long)rbCards.count);
 }
 
 // Pure data read — safe from a dylib initializer: Foundation file I/O only,
@@ -164,6 +176,7 @@ static void RBReadPrefs(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:RBPlistPath];
     rbEnabled = d[@"enabled"] ? [d[@"enabled"] boolValue] : YES;
     rbCardPrivacy = d[@"cardPrivacy"] ? [d[@"cardPrivacy"] boolValue] : YES;
+    rbCardNowPlaying = d[@"cardNowPlaying"] ? [d[@"cardNowPlaying"] boolValue] : YES;
     rbCardClipboard = d[@"cardClipboard"] ? [d[@"cardClipboard"] boolValue] : YES;
     rbHideSystemServices = d[@"hideSystemServices"] ? [d[@"hideSystemServices"] boolValue] : NO;
     // 0.2.1: the UI switch is "cardAtTop" (off = bottom, the visible band on this
@@ -242,6 +255,7 @@ static void RBReloadSettings(void) {
 - (void)rbPeekTouchCancel:(RBReachDeckPeekButton *)sender;
 - (void)rbShowCardAtIndex:(NSUInteger)index;
 - (void)rbPeekNameForIndex:(NSUInteger)index;
+- (void)rbUpdatePeekDots;
 - (void)rbUpdateUsableGeometry;
 @end
 
@@ -299,9 +313,9 @@ static void RBReloadSettings(void) {
 
 // The container spans the whole Reachability band, but only explicitly tagged
 // card rows ('RDB1'), the long-press menu/overlay ('RDB2'), the show-all /
-// collapse footer ('RDB3'), the card-stack sliver ('RDB4'), and the clipboard
-// card root ('RDB5') consume touches. Everything else returns nil so
-// Reachability gestures still pass through.
+// collapse footer ('RDB3'), the card-stack sliver ('RDB4'), the clipboard card
+// root ('RDB5') and the now-playing transport buttons ('RDB6') consume touches.
+// Everything else returns nil so Reachability gestures still pass through.
 @interface RBReachDeckContainerView : UIView
 @end
 @implementation RBReachDeckContainerView
@@ -310,10 +324,11 @@ static void RBReloadSettings(void) {
     if (!hit || hit == self) return nil;
     for (UIView *v = hit; v && v != self; v = v.superview) {
         // 'RDB1' row; 'RDB2' menu/overlay; 'RDB3' expand footer;
-        // 'RDB4' card-stack sliver; 'RDB5' clipboard card root.
+        // 'RDB4' card-stack sliver; 'RDB5' clipboard card root;
+        // 'RDB6' now-playing transport button.
         if (v.tag == 0x52444231 || v.tag == 0x52444232 ||
             v.tag == 0x52444233 || v.tag == 0x52444234 ||
-            v.tag == 0x52444235) return hit;
+            v.tag == 0x52444235 || v.tag == 0x52444236) return hit;
     }
     return nil;
 }
@@ -362,6 +377,7 @@ static void RBReloadSettings(void) {
     rbSortedCards = nil;
     rbPeekTap = nil;
     rbPeekLabel = nil;
+    rbPeekDots = nil;
     rbStackView = nil;
     rbStackTopConstraint = nil;
     rbLiveController = nil;
@@ -599,12 +615,42 @@ static void RBReloadSettings(void) {
               (kRBPeekOffset + 0.5), kRBPeekOffset, rbStyleOpacity,
               rear.layer.borderWidth, pillAlpha);
 
+        // 0.4.0: page dots on the right of the band, mirroring the pill on the
+        // left. The pill says what the next tap does; the dots say where in the
+        // cycle you already are, which the pill alone cannot express once the
+        // deck holds three cards. Capped at 5 so a long deck cannot overflow.
+        NSUInteger dotCount = MIN(sorted.count, (NSUInteger)5);
+        UIStackView *dots = [[UIStackView alloc] init];
+        dots.axis = UILayoutConstraintAxisHorizontal;
+        dots.spacing = 4.0;
+        dots.alignment = UIStackViewAlignmentCenter;
+        dots.translatesAutoresizingMaskIntoConstraints = NO;
+        dots.userInteractionEnabled = NO;
+        for (NSUInteger i = 0; i < dotCount; i++) {
+            UIView *dot = [[UIView alloc] initWithFrame:CGRectZero];
+            dot.translatesAutoresizingMaskIntoConstraints = NO;
+            dot.userInteractionEnabled = NO;
+            dot.layer.cornerRadius = 2.0;
+            [dot.widthAnchor constraintEqualToConstant:4.0].active = YES;
+            [dot.heightAnchor constraintEqualToConstant:4.0].active = YES;
+            [dots addArrangedSubview:dot];
+        }
+        [container addSubview:dots];
+        rbPeekDots = dots;
+        [NSLayoutConstraint activateConstraints:@[
+            [dots.trailingAnchor constraintEqualToAnchor:rear.trailingAnchor constant:-14],
+            [dots.centerYAnchor constraintEqualToAnchor:stack.topAnchor
+                                           constant:-(kRBPeekOffset * 0.5)],
+        ]];
+
         // Name of the card sitting behind, so the pill says what it switches to.
         NSUInteger nextIdx = (rbCurrentCardIndex + 1) % sorted.count;
         [self rbPeekNameForIndex:nextIdx];
+        [self rbUpdatePeekDots];
     } else {
         rbPeekTap = nil;
         rbPeekLabel = nil;
+        rbPeekDots = nil;
     }
 
     for (NSUInteger i = 0; i < sorted.count; i++) {
@@ -711,6 +757,20 @@ static void RBReloadSettings(void) {
 }
 
 %new
+- (void)rbUpdatePeekDots {
+    if (!rbPeekDots) return;
+    NSUInteger i = 0;
+    NSUInteger on = rbCurrentCardIndex;
+    for (UIView *dot in rbPeekDots.arrangedSubviews) {
+        CGFloat alpha = (i == on) ? 0.88 : 0.26;
+        dot.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:alpha];
+        i++;
+    }
+    RBLog(@"peek dots count=%lu index=%lu",
+          (unsigned long)rbPeekDots.arrangedSubviews.count, (unsigned long)on);
+}
+
+%new
 - (void)rbPeekTouchDown:(RBReachDeckPeekButton *)sender {
     (void)sender;
     // Same rule as the expand footer and the old rail: arm the dismiss
@@ -762,6 +822,7 @@ static void RBReloadSettings(void) {
     if (rbSortedCards.count > 1) {
         [self rbPeekNameForIndex:((index + 1) % rbSortedCards.count)];
     }
+    [self rbUpdatePeekDots];
 }
 
 %new
