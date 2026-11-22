@@ -77,6 +77,8 @@
 			<true/>
 			<key>defaults</key>
 			<string>com.zlhkf.ReachDeck</string>
+			<key>footerText</key>
+			<string>长按上一条或下一条可向前 / 向后跳 15 秒；直播流不显示进度条。</string>
 		</dict>
 		<dict>
 			<key>cell</key>

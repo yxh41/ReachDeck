@@ -475,6 +475,11 @@ static UIImage *rbAppIcon(NSString *bundleID) {
 - (NSString *)rbTimeText:(double)seconds;
 - (void)rbSendCommand:(int)command label:(NSString *)label;
 - (void)rbSeekTo:(double)seconds;
+// 0.4.7: hold prev/next to nudge 15s each way; tap still changes track.
+- (BOOL)rbIsLiveBroadcast;
+- (void)rbNudgeBy:(double)delta;
+- (void)rbPrevLongPress:(UILongPressGestureRecognizer *)sender;
+- (void)rbNextLongPress:(UILongPressGestureRecognizer *)sender;
 - (void)rbScrubDown:(RBNPScrubber *)sender;
 - (void)rbScrubChanged:(RBNPScrubber *)sender;
 - (void)rbScrubEnded:(RBNPScrubber *)sender;
@@ -713,23 +718,36 @@ static UIImage *rbAppIcon(NSString *bundleID) {
     // While a finger is on the scrubber the clock and the bar belong to the
     // finger -- not to the 1s tick, and not to an in-flight fetch that landed
     // mid-drag. Everything else on the card still refreshes as usual.
+    BOOL live = [self rbIsLiveBroadcast];
     if (!self.scrubbing) {
-        self.timeLabel.text = has ? [NSString stringWithFormat:@"%@ / %@",
-                                     [self rbTimeText:self.elapsed], [self rbTimeText:self.duration]]
-                                  : @"";
+        // 0.4.7: a live stream has no length, so "elapsed / duration" used to read
+        // "0:12 / 0:00" -- two numbers that contradict each other. Show what is
+        // actually known: how long it has been on.
+        if (live) {
+            self.timeLabel.text = [NSString stringWithFormat:@"直播 · %@",
+                                   [self rbTimeText:self.elapsed]];
+        } else if (has) {
+            self.timeLabel.text = [NSString stringWithFormat:@"%@ / %@",
+                                   [self rbTimeText:self.elapsed], [self rbTimeText:self.duration]];
+        } else {
+            self.timeLabel.text = @"";
+        }
         double frac = 0;
-        if (has && self.duration > 1) {
+        if (has && !live && self.duration > 1) {
             frac = self.elapsed / self.duration;
             if (frac < 0) frac = 0;
             if (frac > 1) frac = 1;
         }
         self.scrubber.fraction = frac;
     }
-    self.scrubber.hidden = !has;
+    // A live stream has nothing to scrub to, and an empty bar under "LIVE" invites
+    // a drag that can never work. Hiding it also drops 22pt of card height, which
+    // is the honest size for a row that no longer has a bar.
+    self.scrubber.hidden = (!has || live);
     // With nothing playing -- or a track whose length is still unknown -- a drag
     // would move the bar with nowhere to seek to. Refusing the touch outright is
     // cleaner than accepting it and bailing out inside every handler.
-    self.scrubber.userInteractionEnabled = (has && self.duration > 1);
+    self.scrubber.userInteractionEnabled = (has && !live && self.duration > 1);
     self.playButton.enabled = has;
     self.prevButton.enabled = has;
     self.nextButton.enabled = has;
@@ -920,6 +938,38 @@ static UIImage *rbAppIcon(NSString *bundleID) {
         if (!strongSelf) return;
         [strongSelf rbFetch];
     });
+}
+
+- (BOOL)rbIsLiveBroadcast {
+    // MediaRemote has no "live" flag: a stream simply reports no duration. So the
+    // missing length IS the signal, and the test stays blunt on purpose -- a real
+    // track shorter than a second does not exist.
+    return (self.hasMedia && self.duration <= 1.0);
+}
+
+- (void)rbNudgeBy:(double)delta {
+    if (!self.hasMedia || [self rbIsLiveBroadcast]) return;
+    double from = self.elapsed;
+    double target = from + delta;
+    if (target < 0) target = 0;
+    if (target > self.duration) target = self.duration;
+    // A medium tap, distinct from the light one a track change makes: the only
+    // feedback that a hold did something is this and the bar jumping.
+    [self rbHaptic:UIImpactFeedbackStyleMedium];
+    RBLog(@"nowplaying nudge delta=%.0f from=%.0f to=%.0f", delta, from, target);
+    [self rbSeekTo:target];
+    [self rbScheduleDisarm];
+}
+
+- (void)rbPrevLongPress:(UILongPressGestureRecognizer *)sender {
+    // Only Began: a hold fires once, on recognition, not again on Ended.
+    if (sender.state != UIGestureRecognizerStateBegan) return;
+    [self rbNudgeBy:-15.0];
+}
+
+- (void)rbNextLongPress:(UILongPressGestureRecognizer *)sender {
+    if (sender.state != UIGestureRecognizerStateBegan) return;
+    [self rbNudgeBy:15.0];
 }
 
 - (void)rbHaptic:(UIImpactFeedbackStyle)style {
@@ -1136,6 +1186,27 @@ static UIImage *rbAppIcon(NSString *bundleID) {
     [transport addArrangedSubview:self.prevButton];
     [transport addArrangedSubview:self.playButton];
     [transport addArrangedSubview:self.nextButton];
+
+    // 🔴 0.4.7: a long-press recogniser is allowed HERE even though this project
+    // avoids them elsewhere (the scrubber uses raw touch tracking on purpose).
+    // The reason is that a hold has no translation, so it never enters the
+    // dismissal gesture's arbitration -- there is no slide to lose it to.
+    // cancelsTouchesInView keeps its default YES, and that is what makes the
+    // split work: a recognised hold cancels the button's touch-up, so a hold can
+    // never ALSO change the track. delaysTouchesEnded is off so a plain tap is
+    // not held back by half a second while the recogniser waits to fail.
+    UILongPressGestureRecognizer *prevHold =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                      action:@selector(rbPrevLongPress:)];
+    prevHold.minimumPressDuration = 0.5;
+    prevHold.delaysTouchesEnded = NO;
+    [self.prevButton addGestureRecognizer:prevHold];
+    UILongPressGestureRecognizer *nextHold =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                      action:@selector(rbNextLongPress:)];
+    nextHold.minimumPressDuration = 0.5;
+    nextHold.delaysTouchesEnded = NO;
+    [self.nextButton addGestureRecognizer:nextHold];
 
     [NSLayoutConstraint activateConstraints:@[
         [transport.centerXAnchor constraintEqualToAnchor:self.transportContainer.centerXAnchor],
