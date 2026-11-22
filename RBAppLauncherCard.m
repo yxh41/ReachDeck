@@ -3,12 +3,12 @@
 #import <dlfcn.h>             // dlopen/dlsym for SpringBoardServices
 
 static NSInteger const kRBDockRootTag = 0x52444241; // 'RDBA': card root
-static NSInteger const kRBDockTileTag = 0x52444242; // 'RDBB' + index (0..7)
-// 0.5.4: up to eight apps, five per row. A sixth app cannot share the first row
+static NSInteger const kRBDockTileTag = 0x52444242; // 'RDBB' + index (0..9)
+// 0.5.5: up to ten apps, five per row. A sixth app cannot share the first row
 // without shrinking every tile below the label's width, so the card grows a
 // second row instead of squeezing -- the height follows the constraints, no
 // hard-coded "expanded" mode.
-static NSUInteger const kRBDockMaxTiles = 8;
+static NSUInteger const kRBDockMaxTiles = 10;
 static NSUInteger const kRBDockRowTiles = 5;
 
 #pragma mark - private SpringBoard icon model
@@ -419,8 +419,8 @@ static void rbDockLaunch(NSString *bundleID) {
         return;
     }
 
-    // 0.5.4: smaller tiles so five fit on one row (and eight across two).
-    CGFloat side = self.styleCompact ? 38.0 : 44.0;
+    // 0.5.5: smaller tiles so five fit on one row (and ten across two).
+    CGFloat side = self.styleCompact ? 34.0 : 38.0;
     for (NSUInteger i = 0; i < self.tiles.count; i++) {
         UIView *tile = self.tiles[i];
         UIImageView *iconView = (UIImageView *)[tile viewWithTag:1001];
@@ -557,8 +557,11 @@ static void rbDockLaunch(NSString *bundleID) {
 
 - (void)buildView {
     CGFloat pad = self.styleCompact ? 8.0 : 11.0;
-    CGFloat side = self.styleCompact ? 38.0 : 44.0;
-    CGFloat rowGap = self.styleCompact ? 5.0 : 7.0;
+    CGFloat side = self.styleCompact ? 34.0 : 38.0;
+    // 0.5.5: header-to-row1 stays tight; only the gap BETWEEN the two rows
+    // grows, so ten tiles read as two distinct groups instead of one grid.
+    CGFloat headerGap = self.styleCompact ? 5.0 : 7.0;
+    CGFloat rowGap = self.styleCompact ? 11.0 : 14.0;
 
     // The row count is decided HERE, from the target list, and never toggled
     // later: a hidden UIStackView keeps every constraint alive, so showing a
@@ -631,7 +634,7 @@ static void rbDockLaunch(NSString *bundleID) {
         [header.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad + 1.0],
         [header.trailingAnchor constraintLessThanOrEqualToAnchor:root.trailingAnchor constant:-(pad + 1.0)],
 
-        [row1.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:rowGap],
+        [row1.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:headerGap],
         [row1.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad],
         [row1.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-pad],
 

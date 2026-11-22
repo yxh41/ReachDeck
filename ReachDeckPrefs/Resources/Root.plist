@@ -78,7 +78,7 @@
 			<key>defaults</key>
 			<string>com.zlhkf.ReachDeck</string>
 			<key>footerText</key>
-			<string>显示 Dock 里的四个 App，点按直接打开。也可以在下面自己指定要显示哪几个。</string>
+			<string>显示 Dock 里的 App（最多十个，排两行），点按直接打开。也可以在下面自己指定要显示哪几个。</string>
 		</dict>
 		<dict>
 			<key>cell</key>

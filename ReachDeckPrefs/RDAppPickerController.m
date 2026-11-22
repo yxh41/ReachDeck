@@ -16,7 +16,7 @@
 //     returns a lazy placeholder echoing the query), so every candidate is
 //     re-checked against the disk first.
 
-static NSUInteger const kRDMaxPickedApps = 8;
+static NSUInteger const kRDMaxPickedApps = 10;
 static CGFloat const kRDAppIconSide = 32.0;
 static NSString *const kRDAppsKey = @"cardCustomApps";
 static NSString *const kRDAppRowID = @"RDAppRow";
@@ -394,7 +394,7 @@ static NSString *RDAppProxyName(id<RDAppProxy> proxy, NSString *bundleID) {
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (!self.entries.count) return @"无法读取已安装的 App 列表，请重开设置再试。";
     if (!self.selected.count) {
-        return @"还没有选择，卡片目前显示 Dock 里的 App。最多可以选 8 个：前 5 个排一行，后面的自动换到第二行。";
+        return @"还没有选择，卡片目前显示 Dock 里的 App。最多可以选 10 个：前 5 个排一行，后面的自动换到第二行。";
     }
     return @"点按右侧有蓝色序号的 App 可以取消选择。已选的 App 会取代 Dock，按序号从左到右排列。";
 }
@@ -468,7 +468,7 @@ static NSString *RDAppProxyName(id<RDAppProxy> proxy, NSString *bundleID) {
 
 - (void)rdShowLimitAlert {
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"最多选择 8 个"
+        alertControllerWithTitle:@"最多选择 10 个"
                          message:@"卡片排两行：每行 5 个，第二行放剩下的。想换的话，先取消一个已选的 App。"
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"好"
