@@ -391,12 +391,17 @@ static void RBReloadSettings(void) {
     //               for the system Reachability dismiss; nothing is ever tiled.
     BOOL showPeek = (sorted.count >= 2);
 
-    // 0.3.3 card stack, "grabber + depth":
-    //   - a DIMMER CARD is drawn behind the front one (inset 8pt, 14pt higher,
-    //     radius +2), so depth is a physical fact rather than a hint;
+    // 0.3.3/0.3.4 card stack, "grabber + depth":
+    //   - the card behind is drawn as a BAND ONLY (14pt tall, inset 8pt, radius
+    //     +2). Depth is geometry, never an alpha difference;
     //   - the front card gets a 1pt light line on its top edge;
     //   - an 80x17 grabber pill straddles that edge (8.5pt above, 8.5pt below)
     //     and carries a chevron plus the NEXT card's name.
+    // 🔴 0.3.4 field report: at low card opacity the rear card used to be a FULL
+    // card painted behind the front one, so it bled through the translucent card
+    // and read as a ghost rectangle inside it -- worst with the border at 0,
+    // where the card has no silhouette to separate the two planes. A band that
+    // never extends behind the front card cannot bleed through at all.
     // The rear card is deliberately NOT a real card view: a real one brings its
     // own rows and hitTest and would steal touches from underneath.
     UIView *rear = nil;
@@ -404,11 +409,18 @@ static void RBReloadSettings(void) {
         rear = [[UIView alloc] initWithFrame:CGRectZero];
         rear.translatesAutoresizingMaskIntoConstraints = NO;
         rear.userInteractionEnabled = NO;
-        // Less opaque than the front card, so it reads as "behind glass".
-        rear.backgroundColor = [UIColor colorWithWhite:0.0 alpha:(rbStyleOpacity * 0.55 + 0.05)];
+        // SAME alpha as the card on purpose: depth comes from the inset + the
+        // offset + the light line, so the stack survives any opacity setting
+        // (a "dimmer behind" vanishes exactly when the card gets more lucent).
+        rear.backgroundColor = [UIColor colorWithWhite:0.0 alpha:rbStyleOpacity];
+        // Top corners only: inside a 14pt window this draws the card's real top
+        // arc (flush at the bottom, narrowing towards the top), not a pill.
         rear.layer.cornerRadius = MIN(rbStyleCorner + 2.0, 24.0);
         rear.layer.cornerCurve = kCACornerCurveContinuous;
-        rear.layer.borderWidth = 0.5;
+        rear.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+        // Follow the user's border setting: a hairline here would be the only
+        // outline in a borderless deck and read as a stray line.
+        rear.layer.borderWidth = (rbStyleBorder > 0.01) ? 0.5 : 0.0;
         rear.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.28].CGColor;
         [container addSubview:rear];
     }
@@ -456,7 +468,10 @@ static void RBReloadSettings(void) {
         UIView *hl = [[UIView alloc] initWithFrame:CGRectZero];
         hl.translatesAutoresizingMaskIntoConstraints = NO;
         hl.userInteractionEnabled = NO;
-        hl.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.30];
+        // With a borderless card this 1pt line is the ONLY thing separating the
+        // two planes, so it carries a little more weight in that case.
+        CGFloat hlAlpha = (rbStyleBorder > 0.01) ? 0.30 : 0.42;
+        hl.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:hlAlpha];
         [container addSubview:hl];
 
         RBReachDeckPeekButton *tap = [[RBReachDeckPeekButton alloc] initWithFrame:CGRectZero];
@@ -464,8 +479,11 @@ static void RBReloadSettings(void) {
         tap.tag = 0x52444234; // 'RDB4': accepted by the hitTest bridge
         tap.userInteractionEnabled = YES;
         tap.accessibilityTraits = UIAccessibilityTraitButton;
-        tap.backgroundColor = [UIColor colorWithWhite:0.0
-                                                alpha:MIN(rbStyleOpacity + 0.15, 1.0)];
+        // A handle has to stay tangible: at 20% card opacity "+0.15" would make
+        // the pill as lucent as everything else and it stopped reading as a
+        // control, so it keeps a floor of 0.55.
+        CGFloat pillAlpha = MIN(MAX(rbStyleOpacity + 0.15, 0.55), 1.0);
+        tap.backgroundColor = [UIColor colorWithWhite:0.0 alpha:pillAlpha];
         tap.layer.cornerRadius = 8.5;
         tap.layer.cornerCurve = kCACornerCurveContinuous;
         tap.layer.borderWidth = 0.5;
@@ -500,11 +518,12 @@ static void RBReloadSettings(void) {
         rbPeekLabel = name;
 
         [NSLayoutConstraint activateConstraints:@[
-            // rear card: 8pt inset, 14pt higher, extending down behind the front
+            // rear band: 8pt inset, 14pt higher, and ONLY the band -- the 0.5pt
+            // tail into the card just hides the anti-aliased seam.
             [rear.leadingAnchor constraintEqualToAnchor:stack.leadingAnchor constant:8],
             [rear.trailingAnchor constraintEqualToAnchor:stack.trailingAnchor constant:-8],
             [rear.topAnchor constraintEqualToAnchor:stack.topAnchor constant:-kRBPeekOffset],
-            [rear.bottomAnchor constraintEqualToAnchor:stack.bottomAnchor],
+            [rear.heightAnchor constraintEqualToConstant:(kRBPeekOffset + 0.5)],
             // 1pt light line on the front card's top edge, inset past the corners
             [hl.leadingAnchor constraintEqualToAnchor:stack.leadingAnchor constant:12],
             [hl.trailingAnchor constraintEqualToAnchor:stack.trailingAnchor constant:-12],
@@ -523,6 +542,13 @@ static void RBReloadSettings(void) {
             [name.trailingAnchor constraintEqualToAnchor:tap.trailingAnchor constant:-10],
             [name.centerYAnchor constraintEqualToAnchor:tap.centerYAnchor],
         ]];
+
+        // Self-evidence for the 0.3.4 fix: these are the exact values the band
+        // and the pill were built with, so a report can be checked without
+        // guessing what the sliders were set to.
+        RBLog(@"stack rear band h=%.1f inset=8 offset=%.0f alpha=%.2f border=%.1f hl=%.2f pill=%.2f",
+              (kRBPeekOffset + 0.5), kRBPeekOffset, rbStyleOpacity,
+              rear.layer.borderWidth, hlAlpha, pillAlpha);
 
         // Name of the card sitting behind, so the pill says what it switches to.
         NSUInteger nextIdx = (rbCurrentCardIndex + 1) % sorted.count;
