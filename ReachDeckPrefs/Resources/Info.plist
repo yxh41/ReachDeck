@@ -11,9 +11,9 @@
 	<key>CFBundleExecutable</key>
 	<string>ReachDeckPrefs</string>
 	<key>CFBundleVersion</key>
-	<string>0.5.2</string>
+	<string>0.5.3</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.5.2</string>
+	<string>0.5.3</string>
 	<key>NSPrincipalClass</key>
 	<string>RDRootListController</string>
 	<key>MinimumOSVersion</key>
