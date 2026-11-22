@@ -168,8 +168,24 @@ static NSUInteger const kRBMusicAppCount = sizeof(kRBMusicAppIDs) / sizeof(kRBMu
 // squeezing the label.
 static NSUInteger const kRBMusicAppMaxShown = 4;
 
+// 0.4.5: one character per app, used when no icon can be fetched at all. Four
+// identical music.note glyphs said nothing -- at a glance the row was four
+// blank tiles. A character at least answers "which app does this open".
+static NSString *const kRBMusicAppInitials[] = {
+    @"汽", @"网", @"Q", @"S", @"酷", @"音",
+};
+// The two tables are indexed together, so a mismatch is a silent wrong glyph.
+_Static_assert(sizeof(kRBMusicAppIDs) / sizeof(kRBMusicAppIDs[0]) ==
+               sizeof(kRBMusicAppInitials) / sizeof(kRBMusicAppInitials[0]),
+               "kRBMusicAppInitials must stay in step with kRBMusicAppIDs");
+
 @protocol RBAppProxy <NSObject>
 @property (nonatomic, readonly) NSString *bundleIdentifier;
+// Private and version-dependent -- every call site probes respondsToSelector:
+// first. Declared here only so the call is type-checked instead of going
+// through performSelector, which would lose the NSData return type under -Werror.
+- (NSData *)iconData;
+- (NSData *)iconDataForVariant:(int)variant;
 @end
 
 @interface LSApplicationProxy : NSObject
@@ -192,16 +208,70 @@ static BOOL rbAppInstalled(NSString *bundleID) {
 + (UIImage *)_applicationIconImageForBundleIdentifier:(NSString *)bundleID format:(int)format;
 @end
 
+static NSString *rbMusicAppInitial(NSString *bundleID) {
+    for (NSUInteger i = 0; i < kRBMusicAppCount; i++) {
+        if ([kRBMusicAppIDs[i] isEqualToString:bundleID]) return kRBMusicAppInitials[i];
+    }
+    return @"♪";
+}
+
+// 🔴 0.4.4 field report: the fourth tile came out blank. A private icon lookup
+// does not have to fail loudly -- it can hand back a correctly sized but FULLY
+// TRANSPARENT placeholder, which sails past a nil check and then paints
+// nothing. So "did I get an image" is the wrong question; the right one is "is
+// there a visible pixel in it". The image is rendered down to 1x1 and its alpha
+// sampled -- four tiles, once per mount, is not a measurable cost.
+static BOOL rbImageHasContent(UIImage *image) {
+    if (!image || !image.CGImage) return NO;
+    if (image.size.width < 8.0 || image.size.height < 8.0) return NO;
+    unsigned char px[4] = {0, 0, 0, 0};
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, 1, 1, 8, 4, space,
+                                             (uint32_t)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(space);
+    if (!ctx) return YES;   // cannot measure, so trust what the lookup returned
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+    CGContextDrawImage(ctx, CGRectMake(0.0, 0.0, 1.0, 1.0), image.CGImage);
+    CGContextRelease(ctx);
+    return px[3] > 12;
+}
+
 static UIImage *rbAppIcon(NSString *bundleID) {
     if (!bundleID.length) return nil;
-    // 🔴 Guarded: this is a private UIKit entry point. If a future build drops it
-    // an unguarded call would raise unrecognised-selector inside SpringBoard,
-    // which is a Safe Mode crash for the sake of a 18pt thumbnail.
-    if (![UIImage respondsToSelector:@selector(_applicationIconImageForBundleIdentifier:format:)]) {
+    // Path 1: the private UIKit lookup. 🔴 Guarded -- an unguarded miss raises
+    // unrecognised-selector inside SpringBoard, which is a Safe Mode crash for
+    // the sake of a 30pt thumbnail.
+    if ([UIImage respondsToSelector:@selector(_applicationIconImageForBundleIdentifier:format:)]) {
+        UIImage *img = [UIImage _applicationIconImageForBundleIdentifier:bundleID format:2];
+        if (rbImageHasContent(img)) return img;
+        RBLog(@"nowplaying icon uikit empty app=%@ size=%.0fx%.0f cg=%d",
+              bundleID, img.size.width, img.size.height, (int)(img.CGImage != NULL));
+    } else {
         RBLog(@"nowplaying app icon unavailable: selector missing");
-        return nil;
     }
-    return [UIImage _applicationIconImageForBundleIdentifier:bundleID format:2];
+    // Path 2: the icon PNG straight out of LaunchServices. This is what covers
+    // the bundles UIKit declines to render -- system apps in particular, which is
+    // exactly the blank tile that was reported. Both accessors are probed because
+    // which of them exists has changed across releases.
+    Class cls = NSClassFromString(@"LSApplicationProxy");
+    if (cls) {
+        id<RBAppProxy> proxy = (id<RBAppProxy>)[(id)cls applicationProxyForIdentifier:bundleID];
+        NSData *data = nil;
+        if ([proxy respondsToSelector:@selector(iconData)]) data = [proxy iconData];
+        if (data.length == 0 && [proxy respondsToSelector:@selector(iconDataForVariant:)]) {
+            data = [proxy iconDataForVariant:0];
+        }
+        if (data.length) {
+            UIImage *img = [UIImage imageWithData:data];
+            if (rbImageHasContent(img)) {
+                RBLog(@"nowplaying icon proxy app=%@ bytes=%lu",
+                      bundleID, (unsigned long)data.length);
+                return img;
+            }
+        }
+    }
+    RBLog(@"nowplaying icon none app=%@", bundleID);
+    return nil;
 }
 
 #pragma mark - scrubber
@@ -1127,14 +1197,21 @@ static UIImage *rbAppIcon(NSString *bundleID) {
             // Background image scales to fill, which is what a 30pt tile wants.
             [b setBackgroundImage:icon forState:UIControlStateNormal];
         } else {
-            UIImageSymbolConfiguration *cfg =
-                [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIFontWeightMedium];
-            [b setImage:[[UIImage systemImageNamed:@"music.note" withConfiguration:cfg]
-                         imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate]
-               forState:UIControlStateNormal];
-            b.tintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.70];
-            b.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.14];
+            // 0.4.5: the fallback used to be a shared music.note glyph, so every
+            // icon-less tile looked the same and the row read as blank. One
+            // character per app is carried instead -- it is the last line of
+            // defence, not the plan.
+            [b setTitle:rbMusicAppInitial(targets[i]) forState:UIControlStateNormal];
+            b.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+            [b setTitleColor:[[UIColor whiteColor] colorWithAlphaComponent:0.92]
+                    forState:UIControlStateNormal];
+            b.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18];
         }
+        // Self-evidence: which tiles got a real icon, and which one did not, so a
+        // report can be matched to a tile position without guessing which apps
+        // are installed.
+        RBLog(@"nowplaying empty tile idx=%lu app=%@ icon=%d",
+              (unsigned long)i, targets[i], (int)(icon != nil));
         [b addTarget:self action:@selector(rbOpenTargetTapped:)
     forControlEvents:UIControlEventTouchUpInside];
         [b addTarget:self action:@selector(rbTouchDown:)
