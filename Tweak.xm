@@ -114,11 +114,15 @@ static NSUInteger rbHitTestLogCount = 0; // bounded self-evidence for the touch 
 static UIView *rbStickyRow = nil;        // ReachPlayer emptyView trick: keep down/up on one view
 static NSUInteger rbCurrentCardIndex = 0; // 0.3.0: deck selection
 static NSArray<id<RBCard>> *rbSortedCards = nil;
-// 0.3.2 card stack: the sliver of the card behind the front one, plus its tap
-// target. Only present when two or more cards are enabled.
-static CGFloat const kRBPeekHeight = 18.0;
-static UIView *rbPeekView = nil;
+// 0.3.3 card stack, "grabber + depth":
+//   rear card   decorative card behind the front one (never interactive); it is
+//               a plain rounded rect on purpose -- a real card view would bring
+//               its own rows and hitTest and steal touches from underneath
+//   rbPeekTap   the grabber pill straddling the front card's top edge (tap target)
+//   rbPeekLabel next card's short name inside that pill
+static CGFloat const kRBPeekOffset = 14.0; // how far the rear card sticks out
 static UIControl *rbPeekTap = nil;
+static UILabel *rbPeekLabel = nil;
 // 0.3.1: geometry the deck is allowed to occupy on the current presentation.
 // Kept as statics because viewDidAppear re-measures after the reachability
 // animation settles (at viewWillAppear the host is not in a window yet).
@@ -234,6 +238,7 @@ static void RBReloadSettings(void) {
 - (void)rbPeekTouchUp:(RBReachDeckPeekButton *)sender;
 - (void)rbPeekTouchCancel:(RBReachDeckPeekButton *)sender;
 - (void)rbShowCardAtIndex:(NSUInteger)index;
+- (void)rbPeekNameForIndex:(NSUInteger)index;
 - (void)rbUpdateUsableGeometry;
 @end
 
@@ -317,8 +322,8 @@ static void RBReloadSettings(void) {
     }
     rbCurrentCardIndex = 0;
     rbSortedCards = nil;
-    rbPeekView = nil;
     rbPeekTap = nil;
+    rbPeekLabel = nil;
     rbStackView = nil;
     rbStackTopConstraint = nil;
     rbLiveController = nil;
@@ -378,72 +383,34 @@ static void RBReloadSettings(void) {
     }];
     rbSortedCards = sorted;
     if (rbCurrentCardIndex >= sorted.count) rbCurrentCardIndex = 0;
-    // 0.3.2 presentation rule (approved design):
+    // 0.3.2/0.3.3 presentation rule (approved design):
     //   1 card  -> single card
     //   2+ cards -> CARD STACK: only the front card is laid out, the next one
-    //               shows an 18pt sliver along the top edge, and tapping that
-    //               sliver cycles. Vertical swipes stay reserved for the
-    //               system Reachability dismiss; nothing is ever tiled.
+    //               is drawn behind it with a grabber pill on the shared edge,
+    //               and tapping the pill cycles. Vertical swipes stay reserved
+    //               for the system Reachability dismiss; nothing is ever tiled.
     BOOL showPeek = (sorted.count >= 2);
 
-    // 0.3.2: the sliver of the card behind. An 18pt strip with ONLY its top
-    // corners rounded (maskedCorners) so it reads as a card edge sliding out
-    // from under the front card. Reuses the 'RDB4' tag the 0.3.0 rail had.
+    // 0.3.3 card stack, "grabber + depth":
+    //   - a DIMMER CARD is drawn behind the front one (inset 8pt, 14pt higher,
+    //     radius +2), so depth is a physical fact rather than a hint;
+    //   - the front card gets a 1pt light line on its top edge;
+    //   - an 80x17 grabber pill straddles that edge (8.5pt above, 8.5pt below)
+    //     and carries a chevron plus the NEXT card's name.
+    // The rear card is deliberately NOT a real card view: a real one brings its
+    // own rows and hitTest and would steal touches from underneath.
+    UIView *rear = nil;
     if (showPeek) {
-        UIView *peek = [[UIView alloc] initWithFrame:CGRectZero];
-        peek.translatesAutoresizingMaskIntoConstraints = NO;
-        peek.userInteractionEnabled = NO; // the tap control above handles touches
-        peek.backgroundColor = [UIColor colorWithWhite:0.0 alpha:(rbStyleOpacity * 0.92 + 0.08)];
-        peek.layer.cornerRadius = MIN(rbStyleCorner, 12.0);
-        peek.layer.cornerCurve = kCACornerCurveContinuous;
-        peek.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
-        peek.layer.borderWidth = 0.5;
-        peek.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.30].CGColor;
-        [container addSubview:peek];
-        rbPeekView = peek;
-
-        RBReachDeckPeekButton *tap = [[RBReachDeckPeekButton alloc] initWithFrame:CGRectZero];
-        tap.translatesAutoresizingMaskIntoConstraints = NO;
-        tap.tag = 0x52444234; // 'RDB4': accepted by the hitTest bridge
-        tap.userInteractionEnabled = YES;
-        tap.accessibilityTraits = UIAccessibilityTraitButton;
-        // Identity of the card sitting behind, so VoiceOver announces what the
-        // sliver switches TO (rbRailTitle is the card's short display name).
-        NSUInteger nextIdx = (rbCurrentCardIndex + 1) % sorted.count;
-        id<RBCard> nextCard = sorted[nextIdx];
-        NSString *nextTitle = [nextCard respondsToSelector:@selector(rbRailTitle)]
-            ? nextCard.rbRailTitle : nil;
-        tap.accessibilityLabel = nextTitle.length
-            ? [NSString stringWithFormat:@"切换到%@", nextTitle]
-            : @"切换卡片";
-        [tap addTarget:self action:@selector(rbPeekTouchDown:)
-      forControlEvents:UIControlEventTouchDown];
-        [tap addTarget:self action:@selector(rbPeekTouchUp:)
-      forControlEvents:UIControlEventTouchUpInside];
-        [tap addTarget:self action:@selector(rbPeekTouchCancel:)
-      forControlEvents:(UIControlEventTouchCancel |
-                        UIControlEventTouchUpOutside |
-                        UIControlEventTouchDragExit)];
-        [container addSubview:tap];
-        rbPeekTap = tap;
-
-        // A small chevron on the sliver makes the affordance unmistakable.
-        UIImageView *chevron = [[UIImageView alloc] initWithImage:
-                                [UIImage systemImageNamed:@"chevron.up"]];
-        chevron.translatesAutoresizingMaskIntoConstraints = NO;
-        chevron.contentMode = UIViewContentModeScaleAspectFit;
-        chevron.tintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
-        chevron.userInteractionEnabled = NO;
-        [tap addSubview:chevron];
-        [NSLayoutConstraint activateConstraints:@[
-            [chevron.centerXAnchor constraintEqualToAnchor:tap.centerXAnchor],
-            [chevron.centerYAnchor constraintEqualToAnchor:tap.centerYAnchor],
-            [chevron.widthAnchor constraintEqualToConstant:10],
-            [chevron.heightAnchor constraintEqualToConstant:10],
-        ]];
-    } else {
-        rbPeekView = nil;
-        rbPeekTap = nil;
+        rear = [[UIView alloc] initWithFrame:CGRectZero];
+        rear.translatesAutoresizingMaskIntoConstraints = NO;
+        rear.userInteractionEnabled = NO;
+        // Less opaque than the front card, so it reads as "behind glass".
+        rear.backgroundColor = [UIColor colorWithWhite:0.0 alpha:(rbStyleOpacity * 0.55 + 0.05)];
+        rear.layer.cornerRadius = MIN(rbStyleCorner + 2.0, 24.0);
+        rear.layer.cornerCurve = kCACornerCurveContinuous;
+        rear.layer.borderWidth = 0.5;
+        rear.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.28].CGColor;
+        [container addSubview:rear];
     }
 
     // Content is centred like ReachPlayer.
@@ -483,20 +450,86 @@ static void RBReloadSettings(void) {
     [NSLayoutConstraint activateConstraints:stackConstraints];
     rbStackView = stack;
 
-    if (showPeek) {
-        // The sliver is inset 10pt from the card on both sides and sits flush on
-        // top of it; the tap target is slightly wider and 2pt taller at the
-        // bottom so the edge is comfortable to hit without covering real content.
+    // 0.3.3: the highlight + grabber are created AFTER the stack so they render
+    // above the card (a sibling added earlier would be covered by it).
+    if (showPeek && rear) {
+        UIView *hl = [[UIView alloc] initWithFrame:CGRectZero];
+        hl.translatesAutoresizingMaskIntoConstraints = NO;
+        hl.userInteractionEnabled = NO;
+        hl.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.30];
+        [container addSubview:hl];
+
+        RBReachDeckPeekButton *tap = [[RBReachDeckPeekButton alloc] initWithFrame:CGRectZero];
+        tap.translatesAutoresizingMaskIntoConstraints = NO;
+        tap.tag = 0x52444234; // 'RDB4': accepted by the hitTest bridge
+        tap.userInteractionEnabled = YES;
+        tap.accessibilityTraits = UIAccessibilityTraitButton;
+        tap.backgroundColor = [UIColor colorWithWhite:0.0
+                                                alpha:MIN(rbStyleOpacity + 0.15, 1.0)];
+        tap.layer.cornerRadius = 8.5;
+        tap.layer.cornerCurve = kCACornerCurveContinuous;
+        tap.layer.borderWidth = 0.5;
+        tap.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.45].CGColor;
+        [tap addTarget:self action:@selector(rbPeekTouchDown:)
+      forControlEvents:UIControlEventTouchDown];
+        [tap addTarget:self action:@selector(rbPeekTouchUp:)
+      forControlEvents:UIControlEventTouchUpInside];
+        [tap addTarget:self action:@selector(rbPeekTouchCancel:)
+      forControlEvents:(UIControlEventTouchCancel |
+                        UIControlEventTouchUpOutside |
+                        UIControlEventTouchDragExit)];
+        [container addSubview:tap];
+        rbPeekTap = tap;
+
+        UIImageView *chevron = [[UIImageView alloc] initWithImage:
+                                [UIImage systemImageNamed:@"chevron.up"]];
+        chevron.translatesAutoresizingMaskIntoConstraints = NO;
+        chevron.contentMode = UIViewContentModeScaleAspectFit;
+        chevron.tintColor = [[UIColor whiteColor] colorWithAlphaComponent:0.60];
+        chevron.userInteractionEnabled = NO;
+        [tap addSubview:chevron];
+
+        UILabel *name = [[UILabel alloc] init];
+        name.translatesAutoresizingMaskIntoConstraints = NO;
+        name.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+        name.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.85];
+        name.textAlignment = NSTextAlignmentLeft;
+        name.lineBreakMode = NSLineBreakByTruncatingTail;
+        name.userInteractionEnabled = NO;
+        [tap addSubview:name];
+        rbPeekLabel = name;
+
         [NSLayoutConstraint activateConstraints:@[
-            [rbPeekView.leadingAnchor constraintEqualToAnchor:stack.leadingAnchor constant:10],
-            [rbPeekView.trailingAnchor constraintEqualToAnchor:stack.trailingAnchor constant:-10],
-            [rbPeekView.bottomAnchor constraintEqualToAnchor:stack.topAnchor],
-            [rbPeekView.heightAnchor constraintEqualToConstant:kRBPeekHeight],
-            [rbPeekTap.leadingAnchor constraintEqualToAnchor:rbPeekView.leadingAnchor constant:-6],
-            [rbPeekTap.trailingAnchor constraintEqualToAnchor:rbPeekView.trailingAnchor constant:6],
-            [rbPeekTap.topAnchor constraintEqualToAnchor:rbPeekView.topAnchor constant:-2],
-            [rbPeekTap.bottomAnchor constraintEqualToAnchor:stack.topAnchor constant:2],
+            // rear card: 8pt inset, 14pt higher, extending down behind the front
+            [rear.leadingAnchor constraintEqualToAnchor:stack.leadingAnchor constant:8],
+            [rear.trailingAnchor constraintEqualToAnchor:stack.trailingAnchor constant:-8],
+            [rear.topAnchor constraintEqualToAnchor:stack.topAnchor constant:-kRBPeekOffset],
+            [rear.bottomAnchor constraintEqualToAnchor:stack.bottomAnchor],
+            // 1pt light line on the front card's top edge, inset past the corners
+            [hl.leadingAnchor constraintEqualToAnchor:stack.leadingAnchor constant:12],
+            [hl.trailingAnchor constraintEqualToAnchor:stack.trailingAnchor constant:-12],
+            [hl.topAnchor constraintEqualToAnchor:stack.topAnchor constant:0.5],
+            [hl.heightAnchor constraintEqualToConstant:1],
+            // grabber pill straddles that edge: 8.5pt above, 8.5pt below
+            [tap.centerXAnchor constraintEqualToAnchor:stack.centerXAnchor],
+            [tap.centerYAnchor constraintEqualToAnchor:stack.topAnchor],
+            [tap.widthAnchor constraintEqualToConstant:80],
+            [tap.heightAnchor constraintEqualToConstant:17],
+            [chevron.leadingAnchor constraintEqualToAnchor:tap.leadingAnchor constant:12],
+            [chevron.centerYAnchor constraintEqualToAnchor:tap.centerYAnchor],
+            [chevron.widthAnchor constraintEqualToConstant:10],
+            [chevron.heightAnchor constraintEqualToConstant:10],
+            [name.leadingAnchor constraintEqualToAnchor:chevron.trailingAnchor constant:5],
+            [name.trailingAnchor constraintEqualToAnchor:tap.trailingAnchor constant:-10],
+            [name.centerYAnchor constraintEqualToAnchor:tap.centerYAnchor],
         ]];
+
+        // Name of the card sitting behind, so the pill says what it switches to.
+        NSUInteger nextIdx = (rbCurrentCardIndex + 1) % sorted.count;
+        [self rbPeekNameForIndex:nextIdx];
+    } else {
+        rbPeekTap = nil;
+        rbPeekLabel = nil;
     }
 
     for (NSUInteger i = 0; i < sorted.count; i++) {
@@ -560,9 +593,9 @@ static void RBReloadSettings(void) {
         RBLog(@"deck usable safeTop fallback=%.0f (window reported 0)", safeTop);
     }
     CGFloat notchBottom = safeTop - CGRectGetMinY(containerInWindow);
-    // 0.3.2: the card-stack sliver needs its own 18pt + 2pt above the front
-    // card, so the whole deck starts that much lower and stays below the notch.
-    CGFloat peekReserve = (rbSortedCards.count >= 2) ? (kRBPeekHeight + 2.0) : 0.0;
+    // 0.3.3: the rear card sticks out kRBPeekOffset above the front card, so the
+    // whole deck starts that much lower and stays below the notch.
+    CGFloat peekReserve = (rbSortedCards.count >= 2) ? (kRBPeekOffset + 2.0) : 0.0;
     CGFloat topLimit = notchBottom + 10.0 + peekReserve;
     if (topLimit < 10.0) topLimit = 10.0;
     CGFloat maxTop = CGRectGetHeight(rbContainer.bounds) * 0.45;
@@ -586,6 +619,19 @@ static void RBReloadSettings(void) {
         if ([card respondsToSelector:@selector(rbSetAvailableHeight:)]) {
             [card rbSetAvailableHeight:avail];
         }
+    }
+}
+
+%new
+- (void)rbPeekNameForIndex:(NSUInteger)index {
+    if (index >= rbSortedCards.count) return;
+    id<RBCard> card = rbSortedCards[index];
+    NSString *title = [card respondsToSelector:@selector(rbRailTitle)] ? card.rbRailTitle : nil;
+    if (rbPeekLabel) rbPeekLabel.text = title.length ? title : @"";
+    if (rbPeekTap) {
+        rbPeekTap.accessibilityLabel = title.length
+            ? [NSString stringWithFormat:@"切换到%@", title]
+            : @"切换卡片";
     }
 }
 
@@ -637,14 +683,9 @@ static void RBReloadSettings(void) {
     RBLog(@"peek switch index=%lu id=%@",
           (unsigned long)index, [target rbIdentifier]);
 
-    // Keep the sliver's VoiceOver label pointing at the NEW card behind it.
-    if (rbPeekTap && rbSortedCards.count > 1) {
-        id<RBCard> behind = rbSortedCards[(index + 1) % rbSortedCards.count];
-        NSString *behindTitle = [behind respondsToSelector:@selector(rbRailTitle)]
-            ? behind.rbRailTitle : nil;
-        rbPeekTap.accessibilityLabel = behindTitle.length
-            ? [NSString stringWithFormat:@"切换到%@", behindTitle]
-            : @"切换卡片";
+    // Keep the grabber pill pointing at the NEW card behind it.
+    if (rbSortedCards.count > 1) {
+        [self rbPeekNameForIndex:((index + 1) % rbSortedCards.count)];
     }
 }
 
