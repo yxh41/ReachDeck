@@ -2,6 +2,7 @@
 #import "RBPrivacyCard.h"   // RBLog + shared interaction suppression
 #import <dlfcn.h>            // dlopen for private frameworks
 #import <objc/runtime.h>     // objc_getClass / class_copyMethodList
+#import <objc/message.h>     // objc_msgSend (explicit casts below need the decl)
 #import <string.h>           // strstr in rbq_probe
 
 // ─────────────────────────────────────────────────────────────────────────────
