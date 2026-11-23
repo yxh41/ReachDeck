@@ -127,7 +127,17 @@ static id rbq_flashlightController(void) {
     Class c = objc_getClass("SBUIFlashlightController");
     if (!c) c = rbq_cls("SBUIFlashlightController",
                         "/System/Library/PrivateFrameworks/SpringBoardUI.framework/SpringBoardUI");
-    return rbq_get(c, NSSelectorFromString(@"sharedInstance"));
+    id ctl = rbq_get(c, NSSelectorFromString(@"sharedInstance"));
+    static BOOL logged = NO;
+    if (!logged) {
+        logged = YES;
+        RBLog(@"qc flashlight controller cls=%d inst=%d level=%d on=%d off=%d",
+              (int)(c != Nil), (int)(ctl != nil),
+              (int)rbq_can(ctl, NSSelectorFromString(@"level")),
+              (int)rbq_can(ctl, NSSelectorFromString(@"turnFlashlightOnForReason:")),
+              (int)rbq_can(ctl, NSSelectorFromString(@"turnFlashlightOffForReason:")));
+    }
+    return ctl;
 }
 
 static BOOL rbq_flashlightRead(void) {
@@ -159,7 +169,6 @@ static BOOL rbq_flashlightSet(BOOL on) {
         }
         if (on) {
             // Match the system: set a level first, then turn on for a reason.
-            SEL sLevel = NSSelectorFromString(@"level");
             SEL sLoad = NSSelectorFromString(@"_loadFlashlightLevel");
             SEL sSet = NSSelectorFromString(@"setLevel:");
             unsigned long long lv = 4;
