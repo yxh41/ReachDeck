@@ -9,6 +9,7 @@
 #import "RBClipboardCard.h"
 #import "RBNowPlayingCard.h"
 #import "RBAppLauncherCard.h"
+#import "RBQuickControlsCard.h"
 
 // Diagnostic log (0.0.3+): ASCII-only strings so they survive toolchain string
 // handling; mirrored to syslog and a plist-dir file the user can send us.
@@ -103,11 +104,14 @@ static RBClipboardCard *clipboardCard = nil;
 static RBNowPlayingCard *nowPlayingCard = nil;
 // 0.5.1: dock apps card -- the four icons sitting in the Dock, one tap to launch.
 static RBAppLauncherCard *dockAppsCard = nil;
+// 0.6.0: quick controls card — flashlight / ringer / low power / dark / orient lock / lock.
+static RBQuickControlsCard *quickCard = nil;
 static BOOL rbEnabled = YES;
 static BOOL rbCardPrivacy = YES;
 static BOOL rbCardClipboard = YES;
 static BOOL rbCardNowPlaying = YES;
 static BOOL rbCardDockApps = YES;
+static BOOL rbCardQuick = YES;
 // 0.5.2: bundle IDs picked in Settings. Empty or nil means "follow the dock",
 // which is why the dock path had to stay: an unconfigured install must keep
 // working after the upgrade without anyone opening Settings.
@@ -158,6 +162,10 @@ static void RBRebuildCards(void) {
         [dockAppsCard rbSetCustomTargets:rbCustomApps];
         [cards addObject:dockAppsCard];
     }
+    if (rbCardQuick) {
+        if (!quickCard) quickCard = [[RBQuickControlsCard alloc] init];
+        [cards addObject:quickCard];
+    }
     if (rbCardPrivacy) {
         if (!privacyCard) privacyCard = [[RBPrivacyCard alloc] init];
         [privacyCard setHideSystemServices:rbHideSystemServices];
@@ -178,8 +186,8 @@ static void RBRebuildCards(void) {
         }
     }
     rbCards = [cards copy];
-    RBLog(@"rebuild cards dockapps=%d custom=%lu privacy=%d nowplaying=%d clipboard=%d hideSys=%d bottom=%d count=%lu",
-          rbCardDockApps, (unsigned long)rbCustomApps.count, rbCardPrivacy, rbCardNowPlaying,
+    RBLog(@"rebuild cards dockapps=%d custom=%lu quick=%d privacy=%d nowplaying=%d clipboard=%d hideSys=%d bottom=%d count=%lu",
+          rbCardDockApps, (unsigned long)rbCustomApps.count, rbCardQuick, rbCardPrivacy, rbCardNowPlaying,
           rbCardClipboard, rbHideSystemServices, rbCardAtBottom, (unsigned long)rbCards.count);
 }
 
@@ -192,6 +200,7 @@ static void RBReadPrefs(void) {
     rbCardNowPlaying = d[@"cardNowPlaying"] ? [d[@"cardNowPlaying"] boolValue] : YES;
     rbCardClipboard = d[@"cardClipboard"] ? [d[@"cardClipboard"] boolValue] : YES;
     rbCardDockApps = d[@"cardDockApps"] ? [d[@"cardDockApps"] boolValue] : YES;
+    rbCardQuick = d[@"cardQuick"] ? [d[@"cardQuick"] boolValue] : YES;
     // 0.5.2: an array of bundle IDs from the app picker. Anything else (a stale
     // string from a downgrade, a plist edited by hand) is ignored rather than
     // passed on, so the card can never be handed a type it does not expect.
@@ -350,13 +359,15 @@ static void RBReloadSettings(void) {
         // 'RDB8'..'RDB=' the empty-state music app buttons ('RDB8' + index, the
         // card caps them at four, the band leaves room for six);
         // 'RDBA'..'RDBK' the dock-apps card root ('RDBA') and its ten tiles
-        // (0.5.5 raised the cap from eight to ten, so the range grew with it).
+        // (0.5.5 raised the cap from eight to ten, so the range grew with it);
+        // 'RDBL'..'RDBR' the quick-controls card root and its six tiles (0.6.0).
         if (v.tag == 0x52444231 || v.tag == 0x52444232 ||
             v.tag == 0x52444233 || v.tag == 0x52444234 ||
             v.tag == 0x52444235 || v.tag == 0x52444236 ||
             v.tag == 0x52444237 ||
             (v.tag >= 0x52444238 && v.tag <= 0x5244423D) ||
-            (v.tag >= 0x52444241 && v.tag <= 0x5244424B)) return hit;
+            (v.tag >= 0x52444241 && v.tag <= 0x5244424B) ||
+            (v.tag >= 0x5244424C && v.tag <= 0x52444252)) return hit;
     }
     return nil;
 }

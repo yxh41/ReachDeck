@@ -70,6 +70,20 @@
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
+			<string>快捷开关卡片</string>
+			<key>key</key>
+			<string>cardQuick</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.zlhkf.ReachDeck</string>
+			<key>footerText</key>
+			<string>手电筒、静音、低电量、深浅模式、方向锁、锁屏。点一下即切换，再点一下切回。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
 			<string>常用 App 卡片</string>
 			<key>key</key>
 			<string>cardDockApps</string>
