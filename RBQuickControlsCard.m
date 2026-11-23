@@ -106,21 +106,41 @@ static NSString *const kRBQNames[] = {
     @"手电筒", @"静音", @"低电量", @"深浅模式", @"方向锁", @"锁屏"
 };
 static NSString *const kRBQIcons[] = {
-    @"flashlight.on.fill", @"bell.slash.fill", @"battery.bolt",
+    @"flashlight.on.fill", @"bell.slash.fill", @"battery.100.bolt",
     @"moon.fill", @"lock.rotation", @"power"
 };
+// iOS 16 is picky about some SF Symbol names (battery.bolt was not one of them).
+// Every tile gets a plain glyph fallback so no slot is ever blank.
+static NSString *const kRBQIconFallbacks[] = {
+    @"flashlight.on.fill", @"bell.slash", @"bolt.fill",
+    @"moon", @"lock", @"power"
+};
 
-#pragma mark - Flashlight (public AVFoundation API, safe from any process)
+#pragma mark - Flashlight
 
-// Light uses the documented AVCaptureDevice torch API. AVFoundation is a
-// public framework already loaded in SpringBoard; no private class needed.
+// The Control Center flashlight is owned by SpringBoard's SBUIFlashlightController.
+// Its -level is the ONLY read that reflects a light turned on from Control Center;
+// AVCaptureDevice.torchActive always read back 0 inside SpringBoard (0.6.0 bug:
+// the card could only ever turn the light ON, never OFF). This is the same class
+// the open-source FlashlightSettings tweak (wrp1002, iOS 12-16) drives.
+static id rbq_flashlightController(void) {
+    Class c = objc_getClass("SBUIFlashlightController");
+    if (!c) c = rbq_cls("SBUIFlashlightController",
+                        "/System/Library/PrivateFrameworks/SpringBoardUI.framework/SpringBoardUI");
+    return rbq_get(c, NSSelectorFromString(@"sharedInstance"));
+}
+
 static BOOL rbq_flashlightRead(void) {
+    id ctl = rbq_flashlightController();
+    SEL sLevel = NSSelectorFromString(@"level");
+    if (rbq_can(ctl, sLevel)) {
+        unsigned long long lv = ((unsigned long long (*)(id, SEL))objc_msgSend)(ctl, sLevel);
+        return lv != 0;
+    }
+    // Last resort only: this reads 0 in SpringBoard, but keep it for completeness.
     Class c = rbq_cls("AVCaptureDevice", "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
     SEL sDev = NSSelectorFromString(@"defaultDeviceWithDeviceType:mediaType:position:");
     if (!rbq_cancls(c, sDev)) return NO;
-    // Public constants: AVCaptureDeviceTypeBuiltInWideAngleCamera == the
-    // literal string, AVMediaTypeVideo == @"vide", AVCaptureDevicePositionBack == 1.
-    // Using literals avoids linking AVFoundation just for the constants.
     id dev = ((id (*)(id, SEL, id, id, NSInteger))objc_msgSend)(
         (id)c, sDev, @"AVCaptureDeviceTypeBuiltInWideAngleCamera", @"vide", 1);
     if (!dev || !rbq_can(dev, NSSelectorFromString(@"torchActive"))) return NO;
@@ -128,9 +148,37 @@ static BOOL rbq_flashlightRead(void) {
 }
 
 static BOOL rbq_flashlightSet(BOOL on) {
+    id ctl = rbq_flashlightController();
+    SEL sAvail = NSSelectorFromString(@"isAvailable");
+    SEL sOn = NSSelectorFromString(@"turnFlashlightOnForReason:");
+    SEL sOff = NSSelectorFromString(@"turnFlashlightOffForReason:");
+    if (rbq_can(ctl, sOn) && rbq_can(ctl, sOff)) {
+        if (rbq_can(ctl, sAvail) && !((BOOL (*)(id, SEL))objc_msgSend)(ctl, sAvail)) {
+            RBLog(@"qc flashlight: SBUIFlashlightController unavailable");
+            return NO;
+        }
+        if (on) {
+            // Match the system: set a level first, then turn on for a reason.
+            SEL sLevel = NSSelectorFromString(@"level");
+            SEL sLoad = NSSelectorFromString(@"_loadFlashlightLevel");
+            SEL sSet = NSSelectorFromString(@"setLevel:");
+            unsigned long long lv = 4;
+            if (rbq_can(ctl, sLoad)) lv = ((unsigned long long (*)(id, SEL))objc_msgSend)(ctl, sLoad);
+            if (lv == 0) lv = 4;
+            if (rbq_can(ctl, sSet)) ((void (*)(id, SEL, unsigned long long))objc_msgSend)(ctl, sSet, lv);
+            ((void (*)(id, SEL, id))objc_msgSend)(ctl, sOn, @"ReachDeck");
+            RBLog(@"qc flashlight: SBUIFlashlightController on level=%llu", lv);
+        } else {
+            ((void (*)(id, SEL, id))objc_msgSend)(ctl, sOff, @"ReachDeck");
+            RBLog(@"qc flashlight: SBUIFlashlightController off");
+        }
+        return YES;
+    }
+    // Fallback: public AVCaptureDevice torch (works on iOS, but its state cannot
+    // be read back from SpringBoard -- only used when the private controller is gone).
     Class c = rbq_cls("AVCaptureDevice", "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
     SEL sDev = NSSelectorFromString(@"defaultDeviceWithDeviceType:mediaType:position:");
-    if (!rbq_cancls(c, sDev)) { RBLog(@"qc flashlight: AVCaptureDevice API missing"); return NO; }
+    if (!rbq_cancls(c, sDev)) { RBLog(@"qc flashlight: no controller and no AVCaptureDevice"); return NO; }
     id dev = ((id (*)(id, SEL, id, id, NSInteger))objc_msgSend)(
         (id)c, sDev, @"AVCaptureDeviceTypeBuiltInWideAngleCamera", @"vide", 1);
     if (!dev) { RBLog(@"qc flashlight: no back camera device"); return NO; }
@@ -139,22 +187,15 @@ static BOOL rbq_flashlightSet(BOOL on) {
     if (!rbq_can(dev, sLock)) { RBLog(@"qc flashlight: lockForConfiguration missing"); return NO; }
     BOOL locked = ((BOOL (*)(id, SEL, id *))objc_msgSend)(dev, sLock, &err);
     if (!locked) { RBLog(@"qc flashlight: lock failed err=%@", err); return NO; }
-    if (on) {
-        SEL sTorch = NSSelectorFromString(@"setTorchModeOnWithLevel:error:");
-        if (rbq_can(dev, sTorch)) {
-            ((BOOL (*)(id, SEL, float, id *))objc_msgSend)(dev, sTorch, 1.0f, &err);
-        } else {
-            // Fallback: plain torchMode setter (public, enum On = 1).
-            SEL sMode = NSSelectorFromString(@"setTorchMode:");
-            if (rbq_can(dev, sMode)) ((void (*)(id, SEL, NSInteger))objc_msgSend)(dev, sMode, 1);
-            else RBLog(@"qc flashlight: no torch setter");
-        }
-    } else {
-        SEL sMode = NSSelectorFromString(@"setTorchMode:");
-        if (rbq_can(dev, sMode)) ((void (*)(id, SEL, NSInteger))objc_msgSend)(dev, sMode, 0);
+    SEL sMode = NSSelectorFromString(@"setTorchMode:");
+    if (rbq_can(dev, sMode)) {
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(dev, sMode, on ? 1 : 0);
+    } else if (on && rbq_can(dev, NSSelectorFromString(@"setTorchModeOnWithLevel:error:"))) {
+        ((BOOL (*)(id, SEL, float, id *))objc_msgSend)(
+            dev, NSSelectorFromString(@"setTorchModeOnWithLevel:error:"), 1.0f, &err);
     }
     ((void (*)(id, SEL))objc_msgSend)(dev, NSSelectorFromString(@"unlockForConfiguration"));
-    RBLog(@"qc flashlight set=%d err=%@", (int)on, err);
+    RBLog(@"qc flashlight: AVCaptureDevice fallback set=%d err=%@", (int)on, err);
     return YES;
 }
 
@@ -449,7 +490,9 @@ static NSUInteger const kRBQTilesPerRow = 3;
     iconView.contentMode = UIViewContentModeScaleAspectFit;
     iconView.tintColor = [UIColor whiteColor];
     UIImage *img = [UIImage systemImageNamed:kRBQIcons[idx]];
+    if (!img) img = [UIImage systemImageNamed:kRBQIconFallbacks[idx]];
     iconView.image = img;
+    if (!img) RBLog(@"qc icon missing idx=%ld name=%@", (long)idx, kRBQIcons[idx]);
     [tile addSubview:iconView];
 
     UILabel *name = [[UILabel alloc] initWithFrame:CGRectZero];
