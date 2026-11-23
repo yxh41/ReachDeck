@@ -129,6 +129,10 @@ static NSUInteger rbHitTestLogCount = 0; // bounded self-evidence for the touch 
 static UIView *rbStickyRow = nil;        // ReachPlayer emptyView trick: keep down/up on one view
 static NSUInteger rbCurrentCardIndex = 0; // 0.3.0: deck selection
 static NSArray<id<RBCard>> *rbSortedCards = nil;
+// 0.6.2: monotonic switch token. Bumped on every card switch so a fade from a
+// PREVIOUS switch cannot write alpha/transform back onto the current card when
+// it finishes late. This is the core of the rapid-tap overlap/offset fix.
+static NSUInteger rbSwitchGeneration = 0;
 // 0.3.3 card stack, "grabber + depth":
 //   rear card   decorative card behind the front one (never interactive); it is
 //               a plain rounded rect on purpose -- a real card view would bring
@@ -697,6 +701,13 @@ static void RBReloadSettings(void) {
         if ([card respondsToSelector:@selector(rbRefresh)]) [card rbRefresh];
         UIView *v = card.rbView;
         if (!v) continue;
+        // 0.6.2: a remount (viewDidAppear fires twice on the reachability
+        // spring) can catch a card mid-fade from the previous presentation.
+        // Start every card from one known, untransformed state so a leftover
+        // alpha/scale can never make its rows or icons look missing.
+        [v.layer removeAllAnimations];
+        v.alpha = 1.0;
+        v.transform = CGAffineTransformIdentity;
         v.translatesAutoresizingMaskIntoConstraints = NO;
         // Card stack: exactly one card is laid out at a time.
         if (showPeek) v.hidden = (i != rbCurrentCardIndex);
@@ -823,39 +834,80 @@ static void RBReloadSettings(void) {
 %new
 - (void)rbShowCardAtIndex:(NSUInteger)index {
     if (index >= rbSortedCards.count) return;
-    for (NSUInteger i = 0; i < rbSortedCards.count; i++) {
-        id<RBCard> card = rbSortedCards[i];
+
+    // 0.6.2 FIX: make a switch DETERMINISTIC. Rapid taps used to stack several
+    // 0.24s animations -- the caller animated UIStackView's hidden change while
+    // this method faded each incoming card -- so an outgoing card kept having
+    // its alpha/transform driven by an in-flight animation. That is what read
+    // as overlapping / offset cards and "lost" icons (the icons are set
+    // synchronously; the VIEW was sitting at alpha ~0 / a scaled transform).
+    // Bump the generation first: a stale fade's completion becomes a no-op.
+    NSUInteger gen = ++rbSwitchGeneration;
+
+    // 1) Kill every in-flight animation, reset EVERY card to a known state.
+    for (id<RBCard> card in rbSortedCards) {
         UIView *v = card.rbView;
-        v.hidden = (i != index);
-        if (i != index && [card respondsToSelector:@selector(rbWillUnmount)]) {
-            [card rbWillUnmount];
+        if (!v) continue;
+        [v.layer removeAllAnimations];
+        if (v.alpha < 0.999 || !CGAffineTransformIsIdentity(v.transform)) {
+            [UIView performWithoutAnimation:^{
+                v.alpha = 1.0;
+                v.transform = CGAffineTransformIdentity;
+            }];
         }
     }
-    id<RBCard> target = rbSortedCards[index];
-    if ([target respondsToSelector:@selector(rbRefresh)]) [target rbRefresh];
 
-    // The card that was hidden behind the sliver "slides out": a short fade +
-    // scale so the switch reads as depth rather than a hard cut. The reset is
-    // performed WITHOUT animation (the caller already opened one for the height
-    // change), and it ends at identity so the card's own hitTest geometry is
-    // never left transformed.
+    // 2) Commit membership + layout with NO animation. UIStackView must never
+    //    animate a hidden-flag change on its arrangedSubviews: that was the
+    //    source of cards sliding into each other's positions on fast taps.
+    [UIView performWithoutAnimation:^{
+        for (NSUInteger i = 0; i < rbSortedCards.count; i++) {
+            id<RBCard> card = rbSortedCards[i];
+            UIView *v = card.rbView;
+            v.hidden = (i != index);
+            if (i != index && [card respondsToSelector:@selector(rbWillUnmount)]) {
+                [card rbWillUnmount];
+            }
+        }
+        id<RBCard> target = rbSortedCards[index];
+        if ([target respondsToSelector:@selector(rbRefresh)]) [target rbRefresh];
+        [rbContainer layoutIfNeeded];
+    }];
+
+    // 3) Exactly ONE self-contained fade for the incoming card. The completion
+    //    re-pins identity only when we are still the newest switch, so a late
+    //    older fade can never corrupt the card that is showing now.
+    id<RBCard> target = rbSortedCards[index];
     UIView *incoming = target.rbView;
     if (incoming) {
+        [incoming.layer removeAllAnimations];
         [UIView performWithoutAnimation:^{
             incoming.alpha = 0.0;
             incoming.transform = CGAffineTransformMakeScale(0.965, 0.965);
         }];
+        __weak typeof(self) weakSelf = self;
         [UIView animateWithDuration:0.24
                               delay:0
                             options:UIViewAnimationOptionCurveEaseOut |
-                                    UIViewAnimationOptionBeginFromCurrentState
+                                    UIViewAnimationOptionBeginFromCurrentState |
+                                    UIViewAnimationOptionAllowUserInteraction
                          animations:^{
             incoming.alpha = 1.0;
             incoming.transform = CGAffineTransformIdentity;
-        } completion:nil];
+        } completion:^(BOOL finished) {
+            (void)finished;
+            __strong typeof(self) strongSelf = weakSelf;
+            if (!strongSelf || rbSwitchGeneration != gen) return;
+            [UIView performWithoutAnimation:^{
+                incoming.alpha = 1.0;
+                incoming.transform = CGAffineTransformIdentity;
+            }];
+        }];
     }
-    RBLog(@"peek switch index=%lu id=%@",
-          (unsigned long)index, [target rbIdentifier]);
+    RBLog(@"peek switch index=%lu id=%@ gen=%lu",
+          (unsigned long)index, [target rbIdentifier], (unsigned long)gen);
+    RBLog(@"peek switch reset gen=%lu cards=%lu",
+          (unsigned long)gen, (unsigned long)rbSortedCards.count);
 
     // Keep the grabber pill pointing at the NEW card behind it.
     if (rbSortedCards.count > 1) {
@@ -873,15 +925,12 @@ static void RBReloadSettings(void) {
     }
     NSUInteger next = (rbCurrentCardIndex + 1) % rbSortedCards.count;
     rbCurrentCardIndex = next;
-    // Opened around the switch so the deck's height change (a tall expanded
-    // privacy card -> the short clipboard card) eases instead of popping.
-    [UIView animateWithDuration:0.24 delay:0 options:UIViewAnimationOptionCurveEaseOut
-                     animations:^{
-        [self rbShowCardAtIndex:next];
-        // Force the pass inside the block, otherwise the hidden-flag change is
-        // laid out after the block closes and the height would pop.
-        [rbContainer layoutIfNeeded];
-    } completion:nil];
+    // 0.6.2: NO outer animateWithDuration. rbShowCardAtIndex: now commits the
+    // hidden / height change with performWithoutAnimation and runs exactly one
+    // self-contained fade. The old outer block animated UIStackView's hidden
+    // change and let two 0.24s animations fight over alpha/transform on rapid
+    // taps -> overlap, offset rows, icons that looked gone.
+    [self rbShowCardAtIndex:next];
 
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
