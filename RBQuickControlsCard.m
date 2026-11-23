@@ -3,7 +3,8 @@
 #import <dlfcn.h>            // dlopen for private frameworks
 #import <objc/runtime.h>     // objc_getClass / class_copyMethodList
 #import <objc/message.h>     // objc_msgSend (explicit casts below need the decl)
-#import <string.h>           // strstr in rbq_probe
+#import <string.h>           // strstr in rbq_probe / rbq_pick
+#import <stdlib.h>           // free in rbq_responders
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Private-API helpers. Ported from the vcamx drawer's vcam_sys_* set, which was
@@ -61,6 +62,47 @@ static id rbq_get(Class c, SEL mk) {
     return ((id (*)(id, SEL))objc_msgSend)((id)c, mk);
 }
 
+// 0.6.3: cross-class responder scan (ported from vcamx vcam_sys_responders).
+// 🔴 classSide=NO scans INSTANCE methods. The 0.6.1 lock path scanned class
+//    methods (class_respondsToSelector on each class itself via objc_copyClassList)
+//    then sent the selector to the Class object -- the real screen-off selector
+//    is an instance method / C function, so that path could never fire.
+// 🔴 Return the USABLE count (min(cnt,maxn)), never the raw hit count: vcamx 717
+//    returned 115 for a 12-slot array -> out-of-bounds read -> SpringBoard Safe Mode.
+static int rbq_responders(SEL sel, const char *tag, BOOL classSide, Class *out, int maxn) {
+    int cnt = 0;
+    unsigned int total = 0;
+    Class *all = objc_copyClassList(&total);
+    if (!all) { RBLog(@"qc responders %s: copyClassList failed", tag); return 0; }
+    for (unsigned int i = 0; i < total; i++) {
+        Class c = all[i];
+        Class host = classSide ? object_getClass(c) : c;
+        if (host && class_respondsToSelector(host, sel)) {
+            if (out && cnt < maxn) out[cnt] = c;
+            cnt++;
+            if (cnt <= 8) RBLog(@"qc responders %s <- %s", tag, class_getName(c));
+        }
+    }
+    free(all);
+    if (cnt == 0) RBLog(@"qc responders %s: none", tag);
+    else if (cnt > 8) RBLog(@"qc responders %s: total=%d (listed first 8)", tag, cnt);
+    return (out && cnt > maxn) ? maxn : cnt;
+}
+
+// 0.6.3: pick a responder class by whitelist substring (vcam_sys_pick).
+// 🔴 Strict mode: no whitelist hit => nil. Returning arr[0] once picked a wholly
+//    unrelated class (vcamx 718 Safe Mode); better to skip a tier than misfire.
+static Class rbq_pick(Class *arr, int n, const char **prefer, int np) {
+    if (n <= 0 || !arr) return nil;
+    for (int j = 0; j < np; j++) {
+        for (int i = 0; i < n; i++) {
+            const char *nm = arr[i] ? class_getName(arr[i]) : NULL;
+            if (nm && strstr(nm, prefer[j])) return arr[i];
+        }
+    }
+    return nil;
+}
+
 // Get an instance via common singleton entry points (nil safe).
 static id rbq_instance(Class c) {
     if (!c) return nil;
@@ -71,6 +113,15 @@ static id rbq_instance(Class c) {
         if (rbq_cancls(c, s)) return ((id (*)(id, SEL))objc_msgSend)((id)c, s);
     }
     return nil;
+}
+
+// 0.6.3: read the real lock state for before/after self-evidence.
+// Defined AFTER rbq_instance on purpose (plain C: no forward declaration).
+static BOOL rbq_lockActive(void) {
+    id mgr = rbq_instance(objc_getClass("SBLockScreenManager"));
+    SEL s = NSSelectorFromString(@"isLockScreenActive");
+    if (!rbq_can(mgr, s)) return NO;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(mgr, s);
 }
 
 // Method-name probe: dump a class's methods matching a keyword to the log.
@@ -360,36 +411,98 @@ static BOOL rbq_orientSet(BOOL lock) {
     return NO;
 }
 
-#pragma mark - Lock screen (_simulateLockButtonPress — verified 717)
+#pragma mark - Lock screen (vcamx 717 verified — screen-off, not light-only lock)
 
-// Screen-off (real side-button semantics), NOT the light-only lockUIFromSource.
+// 0.6.3 FIX: 0.6.1 sent _simulateLockButtonPress to a CLASS object found by
+// scanning class methods -- but the real screen-off path is a C function in
+// UIKitServices plus an INSTANCE method on SB classes. It therefore never fired
+// (field report: "lock has no effect"). Port the full device-verified 6-tier
+// ladder from the vcamx drawer (w2symtrace sys:lock, rounds 716/717/718):
+//  ① C function dlsym ② instance responders Animated ③ lockAndDimDevice…
+//  ⑥ light-only lockUIFromSource as the LAST fallback (that was 716's symptom).
+// Every tier is guarded; the log carries the real before-state plus the exact
+// tier/class that fired, so a device report can be checked without guessing.
 static BOOL rbq_lockScreen(void) {
-    SEL sSim = NSSelectorFromString(@"_simulateLockButtonPress");
-    // Find the host class by scanning loaded classes (SpringBoard has the method).
-    unsigned int total = 0;
-    Class *all = objc_copyClassList(&total);
-    Class host = Nil;
-    if (all) {
-        for (unsigned int i = 0; i < total; i++) {
-            if (class_respondsToSelector(all[i], sSim)) { host = all[i]; break; }
+    BOOL before = rbq_lockActive();
+    SEL selSim  = NSSelectorFromString(@"_simulateLockButtonPress");
+    SEL selSimA = NSSelectorFromString(@"_simulateLockButtonPressAnimated:");
+    SEL selLD   = NSSelectorFromString(@"lockAndDimDevice");
+    SEL selLDD  = NSSelectorFromString(@"lockAndDimDeviceDisconnectingCallIfNecessary:");
+
+    Class rSim[12], rSimA[12], rLD[12], rLDD[12];
+    int nSim  = rbq_responders(selSim,  "_simulateLockButtonPress", NO, rSim, 12);
+    int nSimA = rbq_responders(selSimA, "_simulateLockButtonPressAnimated:", NO, rSimA, 12);
+    int nLD   = rbq_responders(selLD,   "lockAndDimDevice", NO, rLD, 12);
+    int nLDD  = rbq_responders(selLDD,  "lockAndDimDeviceDisconnecting", NO, rLDD, 12);
+    RBLog(@"qc lock start before=%d nSim=%d nSimA=%d nLD=%d nLDD=%d",
+          (int)before, nSim, nSimA, nLD, nLDD);
+
+    // ① SHELLX-verified screen-off path: the C function itself, not an ObjC method.
+    void *wUI = rbq_dl("/System/Library/PrivateFrameworks/UIKitServices.framework/UIKitServices");
+    void *fpSim = wUI ? dlsym(wUI, "_simulateLockButtonPress") : NULL;
+    RBLog(@"qc lock tier1 dlsym=%p", fpSim);
+    if (fpSim) {
+        ((void (*)(void))fpSim)();
+        RBLog(@"qc lock: tier1 C _simulateLockButtonPress()");
+        return YES;
+    }
+
+    // ② responders: instance method on the host class (strict whitelist pick).
+    const char *prefer[] = {"SBLockScreenManager", "SBUIController", "SpringBoard", "LockScreen"};
+    if (nSim > 0) {
+        Class c = rbq_pick(rSim, nSim, prefer, 4);
+        id inst = rbq_instance(c);
+        if (rbq_can(inst, selSim)) {
+            ((void (*)(id, SEL))objc_msgSend)(inst, selSim);
+            RBLog(@"qc lock: tier2 %s._simulateLockButtonPress()", class_getName(c));
+            return YES;
         }
-        free(all);
     }
-    if (host && rbq_cancls(host, sSim)) {
-        ((void (*)(id, SEL))objc_msgSend)((id)host, sSim);
-        RBLog(@"qc lock: _simulateLockButtonPress via %s", class_getName(host));
+    // ③ _simulateLockButtonPressAnimated:YES
+    if (nSimA > 0) {
+        Class c = rbq_pick(rSimA, nSimA, prefer, 3);
+        id inst = rbq_instance(c);
+        if (rbq_can(inst, selSimA)) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(inst, selSimA, YES);
+            RBLog(@"qc lock: tier3 %s._simulateLockButtonPressAnimated:YES", class_getName(c));
+            return YES;
+        }
+    }
+    // ④/⑤ lockAndDimDevice family (lock + dim = screen off).
+    if (nLD > 0) {
+        Class c = rbq_pick(rLD, nLD, prefer, 3);
+        id inst = rbq_instance(c);
+        if (rbq_can(inst, selLD)) {
+            ((void (*)(id, SEL))objc_msgSend)(inst, selLD);
+            RBLog(@"qc lock: tier4 %s.lockAndDimDevice()", class_getName(c));
+            return YES;
+        }
+    }
+    if (nLDD > 0) {
+        Class c = rbq_pick(rLDD, nLDD, prefer, 3);
+        id inst = rbq_instance(c);
+        if (rbq_can(inst, selLDD)) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(inst, selLDD, YES);
+            RBLog(@"qc lock: tier5 %s.lockAndDimDeviceDisconnectingCallIfNecessary:YES", class_getName(c));
+            return YES;
+        }
+    }
+
+    // ⑥ LAST resort: light-only lock (716's symptom — only usable if all off-paths failed).
+    id mgr = rbq_instance(objc_getClass("SBLockScreenManager"));
+    SEL lm3 = @selector(lockUIFromSource:withOptions:completion:);
+    SEL lm2 = @selector(lockUIFromSource:withOptions:);
+    if (rbq_can(mgr, lm3)) {
+        ((void (*)(id, SEL, NSInteger, id, id))objc_msgSend)(mgr, lm3, 1, nil, nil);
+        RBLog(@"qc lock: tier6 light-only lockUIFromSource:1");
         return YES;
     }
-    // Fallback: SBUILockManager-style instance path, still guarded.
-    Class cLS = objc_getClass("SBLockScreenManager");
-    id mgr = rbq_instance(cLS);
-    SEL sLD = NSSelectorFromString(@"lockAndDimDevice");
-    if (rbq_can(mgr, sLD)) {
-        ((void (*)(id, SEL))objc_msgSend)(mgr, sLD);
-        RBLog(@"qc lock: lockAndDimDevice fallback");
+    if (rbq_can(mgr, lm2)) {
+        ((void (*)(id, SEL, NSInteger, id))objc_msgSend)(mgr, lm2, 1, nil);
+        RBLog(@"qc lock: tier6b light-only lockUIFromSource:1");
         return YES;
     }
-    RBLog(@"qc lock: no path (host=%d)", (int)(host != Nil));
+    RBLog(@"qc lock: no path");
     return NO;
 }
 
