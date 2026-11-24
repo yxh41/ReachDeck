@@ -1,5 +1,6 @@
 #import "RDRootListController.h"
 #import "RDAppPickerController.h"
+#import "RDCardOrderController.h"
 
 @implementation RDRootListController
 
@@ -13,6 +14,9 @@
             if ([[spec propertyForKey:@"id"] isEqualToString:@"rdAppPickerLink"]) {
                 [spec setButtonAction:@selector(rdOpenAppPicker)];
                 self.rdPickerLink = spec;
+            } else if ([[spec propertyForKey:@"id"] isEqualToString:@"rdCardOrderLink"]) {
+                [spec setButtonAction:@selector(rdOpenCardOrder)];
+                self.rdOrderLink = spec;
             }
         }
     }
@@ -27,6 +31,11 @@
 - (void)rdOpenAppPicker {
     RDAppPickerController *picker = [[RDAppPickerController alloc] init];
     [self.navigationController pushViewController:picker animated:YES];
+}
+
+- (void)rdOpenCardOrder {
+    RDCardOrderController *order = [[RDCardOrderController alloc] init];
+    [self.navigationController pushViewController:order animated:YES];
 }
 
 - (void)rdUpdatePickerLinkTitle {

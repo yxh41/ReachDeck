@@ -78,7 +78,7 @@
 			<key>defaults</key>
 			<string>com.zlhkf.ReachDeck</string>
 			<key>footerText</key>
-			<string>手电筒、静音、低电量、深浅模式、方向锁、锁屏。点一下即切换，再点一下切回。</string>
+			<string>手电筒、静音、低电量、深浅模式、方向锁、锁屏、录屏、媒体静音、定位。点一下即切换，再点一下切回。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -127,6 +127,14 @@
 			<true/>
 			<key>defaults</key>
 			<string>com.zlhkf.ReachDeck</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>卡片顺序</string>
+			<key>id</key>
+			<string>rdCardOrderLink</string>
 		</dict>
 		<dict>
 			<key>cell</key>

@@ -116,6 +116,10 @@ static BOOL rbCardQuick = YES;
 // which is why the dock path had to stay: an unconfigured install must keep
 // working after the upgrade without anyone opening Settings.
 static NSArray *rbCustomApps = nil;
+// 0.6.6: user-defined card order — an array of rbIdentifier strings written by
+// the Settings order page. Empty/nil keeps the historical rbPriority order, so
+// an upgrade (or a hand-edited/partial plist) can never break the deck.
+static NSArray<NSString *> *rbCardOrder = nil;
 static BOOL rbHideSystemServices = NO;
 static BOOL rbCardAtBottom = YES;         // 0.2.1: derived from cardAtTop (default off => bottom)
 // 0.2.19 style: defaults reproduce the pre-style look exactly.
@@ -195,6 +199,35 @@ static void RBRebuildCards(void) {
           rbCardClipboard, rbHideSystemServices, rbCardAtBottom, (unsigned long)rbCards.count);
 }
 
+// 0.6.6: order the enabled cards. First come the identifiers the user placed
+// in Settings' order page; anything not listed (a card switched on later, a
+// partial/stale list) is appended in the original rbPriority order. That makes
+// every state well-defined and keeps upgrades a no-op when cardOrder is empty.
+static NSArray<id<RBCard>> *RBSortedCards(void) {
+    NSMutableArray<id<RBCard>> *out = [NSMutableArray arrayWithCapacity:rbCards.count];
+    if (rbCardOrder.count) {
+        for (id item in rbCardOrder) {
+            if (![item isKindOfClass:[NSString class]]) continue;
+            for (id<RBCard> card in rbCards) {
+                if ([[card rbIdentifier] isEqualToString:item]) {
+                    [out addObject:card];
+                    break;
+                }
+            }
+        }
+    }
+    NSMutableArray<id<RBCard>> *rest = [rbCards mutableCopy];
+    [rest removeObjectsInArray:out];
+    [rest sortUsingComparator:^NSComparisonResult(id<RBCard> a, id<RBCard> b) {
+        return [@(a.rbPriority) compare:@(b.rbPriority)];
+    }];
+    [out addObjectsFromArray:rest];
+    RBLog(@"sort cards explicit=%lu total=%lu first=%@",
+          (unsigned long)(rbCardOrder.count), (unsigned long)out.count,
+          out.count ? [out[0] rbIdentifier] : @"none");
+    return [out copy];
+}
+
 // Pure data read — safe from a dylib initializer: Foundation file I/O only,
 // no UIKit and no class hooks.
 static void RBReadPrefs(void) {
@@ -210,6 +243,10 @@ static void RBReadPrefs(void) {
     // passed on, so the card can never be handed a type it does not expect.
     id customList = d[@"cardCustomApps"];
     rbCustomApps = [customList isKindOfClass:[NSArray class]] ? [customList copy] : nil;
+    // 0.6.6: card order from Settings. Only an array of strings is accepted;
+    // each entry is matched against a card's rbIdentifier at sort time.
+    id orderList = d[@"cardOrder"];
+    rbCardOrder = [orderList isKindOfClass:[NSArray class]] ? [orderList copy] : nil;
     rbHideSystemServices = d[@"hideSystemServices"] ? [d[@"hideSystemServices"] boolValue] : NO;
     // 0.2.1: the UI switch is "cardAtTop" (off = bottom, the visible band on this
     // device). Honour the old cardAtBottom key too for users upgrading from 0.1.x.
@@ -476,9 +513,9 @@ static void RBReloadSettings(void) {
         [container.trailingAnchor constraintEqualToAnchor:topEffect.trailingAnchor],
     ]];
 
-    NSArray<id<RBCard>> *sorted = [rbCards sortedArrayUsingComparator:^NSComparisonResult(id<RBCard> a, id<RBCard> b) {
-        return [@(a.rbPriority) compare:@(b.rbPriority)];
-    }];
+    // 0.6.6: honour the order set in Settings; rbPriority is the fallback for
+    // cards the list does not mention (or when the list is empty after upgrade).
+    NSArray<id<RBCard>> *sorted = RBSortedCards();
     rbSortedCards = sorted;
     if (rbCurrentCardIndex >= sorted.count) rbCurrentCardIndex = 0;
     // 0.3.2/0.3.3 presentation rule (approved design):
@@ -767,8 +804,14 @@ static void RBReloadSettings(void) {
     CGFloat notchBottom = safeTop - CGRectGetMinY(containerInWindow);
     // 0.3.3: the rear card sticks out kRBPeekOffset above the front card, so the
     // whole deck starts that much lower and stays below the notch.
-    CGFloat peekReserve = (rbSortedCards.count >= 2) ? (kRBPeekOffset + 2.0) : 0.0;
-    CGFloat topLimit = notchBottom + 10.0 + peekReserve;
+    // 0.6.6: quick controls grew 6 -> 9 tiles in 0.6.4 (two rows -> three), so
+    // the 750 center-Y constraint pulled stack.top higher and the rear band
+    // (stack.top - kRBPeekOffset) ended up only ~12pt below the notch -- its
+    // rounded top was visibly clipped. Widen the clearance to ~26pt by raising
+    // both the notch pad (10 -> 16) and the peek reserve (+2 -> +10). This also
+    // nudges the whole deck down, which is the "card sits too high" complaint.
+    CGFloat peekReserve = (rbSortedCards.count >= 2) ? (kRBPeekOffset + 10.0) : 0.0;
+    CGFloat topLimit = notchBottom + 16.0 + peekReserve;
     if (topLimit < 10.0) topLimit = 10.0;
     CGFloat maxTop = CGRectGetHeight(rbContainer.bounds) * 0.45;
     if (topLimit > maxTop) {
