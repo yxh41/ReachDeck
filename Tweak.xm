@@ -159,6 +159,25 @@ static UIStackView *rbPeekDots = nil;
 // animation settles (at viewWillAppear the host is not in a window yet).
 static UIStackView *rbStackView = nil;
 static NSLayoutConstraint *rbStackTopConstraint = nil;
+// 0.6.7: keep the center-Y constraint so a single card (quick controls, which
+// grew to nine tiles) can sit lower without moving every other card.
+static NSLayoutConstraint *rbStackCenterYConstraint = nil;
+// 0.6.7: hitTest fires before any control's touchDown, so arming there beats
+// the system's ~236ms dismiss callback. A generation token stops a stale
+// release from disarming a newer interaction.
+static NSUInteger rbCardArmGeneration = 0;
+static void RBPrivacyArmCardRegion(void) {
+    RBPrivacyArmInteraction();
+    NSUInteger gen = ++rbCardArmGeneration;
+    static NSUInteger logged = 0;
+    if (logged < 4) { RBLog(@"card region arm gen=%lu", (unsigned long)gen); logged++; }
+    // 0.5s covers the system's ~236ms dismiss callback with margin, but still
+    // lets a deliberate swipe-down (which starts OFF any card) close normally.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gen == rbCardArmGeneration) RBPrivacyCancelInteraction();
+    });
+}
 
 // Rebuild the active card list from prefs. Cards are created once and reused; only
 // membership changes. This keeps sensor state intact across preference toggles.
@@ -326,6 +345,7 @@ static void RBReloadSettings(void) {
 - (void)rbPeekNameForIndex:(NSUInteger)index;
 - (void)rbUpdatePeekDots;
 - (void)rbUpdateUsableGeometry;
+- (void)rbApplyCardOffset;
 @end
 
 // SBSensorActivityDataProvider — read-only, exact selectors we call.
@@ -393,6 +413,17 @@ static void RBReloadSettings(void) {
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     if (!hit || hit == self) return nil;
+    // 0.6.7: the system fires -deactivateReachability ~236ms after touch begin.
+    // Only tagged controls armed the suppress flag before, so a tap on the
+    // card's header/padding (still inside the visible card, no tag) let the
+    // panel collapse. Arm on ANY touch landing inside the current card view;
+    // the 0.5s TTL releases it well before a deliberate swipe-down gesture.
+    id<RBCard> live = (rbCurrentCardIndex < rbSortedCards.count)
+        ? rbSortedCards[rbCurrentCardIndex] : nil;
+    UIView *liveView = live ? [live rbView] : nil;
+    if (liveView && (hit == liveView || [hit isDescendantOfView:liveView])) {
+        RBPrivacyArmCardRegion();
+    }
     for (UIView *v = hit; v && v != self; v = v.superview) {
         // 'RDB1' row; 'RDB2' menu/overlay; 'RDB3' expand footer;
         // 'RDB4' card-stack sliver; 'RDB5' clipboard card root;
@@ -579,6 +610,7 @@ static void RBReloadSettings(void) {
         [stack.centerYAnchor constraintEqualToAnchor:container.centerYAnchor
                                             constant:(rbCardAtBottom ? 140.0 : -110.0)];
     stackCenterY.priority = UILayoutPriorityDefaultHigh; // 750
+    rbStackCenterYConstraint = stackCenterY; // 0.6.7: per-card vertical offset
     // 0.3.1: the top clamp is REQUIRED and its constant is replaced at
     // viewDidAppear with the real safe-area line (see rbUpdateUsableGeometry).
     // 60 is only the pre-measurement placeholder. The bottom clamp drops to 999
@@ -761,6 +793,9 @@ static void RBReloadSettings(void) {
           NSStringFromClass([topEffect class]), NSStringFromCGRect(container.frame),
           NSStringFromCGRect([container convertRect:container.bounds toView:nil]), (int)rbCardAtBottom);
 
+    // 0.6.7: apply the per-card vertical offset before measuring, so the
+    // nine-tile card's measured geometry reflects its actual (lower) position.
+    [self rbApplyCardOffset];
     // 0.3.1 diagnostic: measure the usable band immediately (works when we
     // remount while already on screen) and once more after the presentation
     // animation settles, so a report carries real numbers instead of guesses.
@@ -777,6 +812,21 @@ static void RBReloadSettings(void) {
               (unsigned long)sorted.count,
               showPeek ? @"peek" : @"single");
     });
+}
+
+%new
+// 0.6.7: nine-tile quick controls is taller than the rest, so with a shared
+// center-Y it reads noticeably higher. Nudge ONLY that card down via the
+// saved center constraint; every other card keeps the proven placement.
+- (void)rbApplyCardOffset {
+    if (!rbStackCenterYConstraint) return;
+    CGFloat extra = 0.0;
+    id<RBCard> current = (rbCurrentCardIndex < rbSortedCards.count)
+        ? rbSortedCards[rbCurrentCardIndex] : nil;
+    NSString *ident = current ? [current rbIdentifier] : nil;
+    if ([ident isEqualToString:@"quickcontrols"]) extra = 30.0;
+    rbStackCenterYConstraint.constant = (rbCardAtBottom ? 140.0 : -110.0) + extra;
+    RBLog(@"card offset id=%@ extra=%.0f bottom=%d", ident ?: @"none", extra, rbCardAtBottom);
 }
 
 %new
@@ -915,6 +965,10 @@ static void RBReloadSettings(void) {
         }
         id<RBCard> target = rbSortedCards[index];
         if ([target respondsToSelector:@selector(rbRefresh)]) [target rbRefresh];
+        // 0.6.7: re-apply the per-card offset (quick controls sits lower) while
+        // still inside performWithoutAnimation, so a fast switch cannot animate
+        // the center constraint and fight the incoming card's fade.
+        [self rbApplyCardOffset];
         [rbContainer layoutIfNeeded];
     }];
 
