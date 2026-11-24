@@ -364,14 +364,15 @@ static void RBReloadSettings(void) {
         // card caps them at four, the band leaves room for six);
         // 'RDBA'..'RDBK' the dock-apps card root ('RDBA') and its ten tiles
         // (0.5.5 raised the cap from eight to ten, so the range grew with it);
-        // 'RDBL'..'RDBR' the quick-controls card root and its six tiles (0.6.0).
+        // 'RDBL'..'RDBU' the quick-controls card root and its nine tiles
+        // (0.6.4 raised the count from six to nine, so the range grew with it).
         if (v.tag == 0x52444231 || v.tag == 0x52444232 ||
             v.tag == 0x52444233 || v.tag == 0x52444234 ||
             v.tag == 0x52444235 || v.tag == 0x52444236 ||
             v.tag == 0x52444237 ||
             (v.tag >= 0x52444238 && v.tag <= 0x5244423D) ||
             (v.tag >= 0x52444241 && v.tag <= 0x5244424B) ||
-            (v.tag >= 0x5244424C && v.tag <= 0x52444252)) return hit;
+            (v.tag >= 0x5244424C && v.tag <= 0x52444255)) return hit;
     }
     return nil;
 }

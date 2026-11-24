@@ -150,21 +150,28 @@ typedef NS_ENUM(NSUInteger, RBQuickToggle) {
     RBQDarkMode,
     RBQOrientLock,
     RBQLockScreen,
+    RBQScreenRecord,   // 0.6.4 — momentary (start/stop), vcamx RPScreenRecorder path
+    RBQMediaMute,      // 0.6.4 — media volume mute/restore, vcamx SBVolumeControl path
+    RBQLocation,       // 0.6.4 — CLLocationManager private toggle, read-back self-evident
     RBQCount
 };
+_Static_assert(RBQCount == 9, "names/icons/fallbacks arrays must match RBQCount");
 
 static NSString *const kRBQNames[] = {
-    @"手电筒", @"静音", @"低电量", @"深浅模式", @"方向锁", @"锁屏"
+    @"手电筒", @"静音", @"低电量", @"深浅模式", @"方向锁", @"锁屏",
+    @"录屏", @"媒体静音", @"定位"
 };
 static NSString *const kRBQIcons[] = {
     @"flashlight.on.fill", @"bell.slash.fill", @"battery.100.bolt",
-    @"moon.fill", @"lock.rotation", @"power"
+    @"moon.fill", @"lock.rotation", @"power",
+    @"record.circle", @"speaker.slash.fill", @"location.fill"
 };
 // iOS 16 is picky about some SF Symbol names (battery.bolt was not one of them).
 // Every tile gets a plain glyph fallback so no slot is ever blank.
 static NSString *const kRBQIconFallbacks[] = {
     @"flashlight.on.fill", @"bell.slash", @"bolt.fill",
-    @"moon", @"lock", @"power"
+    @"moon", @"lock", @"power",
+    @"circle.fill", @"speaker.slash", @"location"
 };
 
 #pragma mark - Flashlight
@@ -506,6 +513,144 @@ static BOOL rbq_lockScreen(void) {
     return NO;
 }
 
+#pragma mark - 0.6.4 new toggles (all ported from vcamx w2symtrace, device-verified)
+
+// Screen recording. Momentary (start/stop), no persistent toggle state.
+// vcamx sys:record: RPScreenRecorder.sharedRecorder, isRecording read-back,
+// startSystemRecordingWithMicrophoneEnabled:handler: / stopSystemRecording:.
+// RPScreenRecorder's singleton is +sharedRecorder (not in rbq_instance's list).
+static id rbq_recorderInstance(void) {
+    Class c = rbq_cls("RPScreenRecorder",
+                      "/System/Library/Frameworks/ReplayKit.framework/ReplayKit");
+    return rbq_get(c, NSSelectorFromString(@"sharedRecorder"));
+}
+
+static BOOL rbq_recordActive(void) {
+    id rec = rbq_recorderInstance();
+    SEL s = NSSelectorFromString(@"isRecording");
+    if (!rbq_can(rec, s)) return NO;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(rec, s);
+}
+
+static void rbq_recordToggle(void) {
+    id rec = rbq_recorderInstance();
+    if (!rec) { RBLog(@"qc record: no RPScreenRecorder"); return; }
+    SEL sIs = NSSelectorFromString(@"isRecording");
+    BOOL on = rbq_can(rec, sIs) ? ((BOOL (*)(id, SEL))objc_msgSend)(rec, sIs) : NO;
+    if (on) {
+        SEL sStop = NSSelectorFromString(@"stopSystemRecording:");
+        if (rbq_can(rec, sStop)) {
+            ((void (*)(id, SEL, id))objc_msgSend)(rec, sStop, (id)^(NSError *e) { (void)e; });
+            RBLog(@"qc record: stopSystemRecording:");
+        } else {
+            SEL sStop2 = NSSelectorFromString(@"stopRecordingWithHandler:");
+            if (rbq_can(rec, sStop2)) {
+                ((void (*)(id, SEL, id))objc_msgSend)(rec, sStop2, (id)^(NSError *e) { (void)e; });
+                RBLog(@"qc record: stopRecordingWithHandler:");
+            } else RBLog(@"qc record: no stop selector");
+        }
+        return;
+    }
+    SEL sFull = NSSelectorFromString(@"startRecordingWithMicrophoneEnabled:windowToRecord:systemRecording:handler:");
+    SEL sStart = NSSelectorFromString(@"startSystemRecordingWithMicrophoneEnabled:handler:");
+    if (rbq_can(rec, sFull)) {
+        ((void (*)(id, SEL, BOOL, id, BOOL, id))objc_msgSend)(rec, sFull, NO, nil, YES, (id)^(NSError *e) { (void)e; });
+        RBLog(@"qc record: startRecording systemRecording:YES mic:NO");
+    } else if (rbq_can(rec, sStart)) {
+        ((void (*)(id, SEL, BOOL, id))objc_msgSend)(rec, sStart, NO, (id)^(NSError *e) { (void)e; });
+        RBLog(@"qc record: startSystemRecording mic:NO");
+    } else {
+        RBLog(@"qc record: no start selector");
+    }
+}
+
+// Media mute: vcamx sys:mediamute 717 — save current volume, set 0, restore on
+// next tap. Category is fixed @"Audio/Video"; three guarded tiers.
+static BOOL s_qcMediaMuted = NO;
+static float s_qcMediaSaved = 0.5f;
+
+static void rbq_mediaMuteToggle(void) {
+    NSString *cat = @"Audio/Video";
+    BOOL mute = !s_qcMediaMuted;
+    // Read current volume for the save slot (AVSystemController, guarded).
+    Class cAV = rbq_cls2("AVSystemController",
+                         "/System/Library/PrivateFrameworks/Celestial.framework/Celestial",
+                         "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
+    id avc = rbq_get(cAV, NSSelectorFromString(@"sharedAVSystemController"));
+    SEL gv = NSSelectorFromString(@"getVolume:forCategory:");
+    float cur = -1.0f;
+    if (rbq_can(avc, gv)) ((BOOL (*)(id, SEL, float *, id))objc_msgSend)(avc, gv, &cur, cat);
+    if (mute && cur > 0.01f) s_qcMediaSaved = cur;
+    float target = mute ? 0.0f : (s_qcMediaSaved > 0.01f ? s_qcMediaSaved : 0.5f);
+
+    SEL sSetVol = NSSelectorFromString(@"setActiveCategoryVolume:");
+    // Tier 1: SBMediaController.sharedInstance.volumeControl (SHELLX same path).
+    id bp = rbq_instance(objc_getClass("SBMediaController"));
+    id vc = rbq_can(bp, NSSelectorFromString(@"volumeControl"))
+          ? ((id (*)(id, SEL))objc_msgSend)(bp, NSSelectorFromString(@"volumeControl")) : nil;
+    if (rbq_can(vc, sSetVol)) {
+        ((void (*)(id, SEL, float))objc_msgSend)(vc, sSetVol, target);
+        s_qcMediaMuted = mute;
+        RBLog(@"qc mediamute: tier1 SBMediaController.volumeControl set=%.2f", target);
+        return;
+    }
+    // Tier 2: SBVolumeControl singleton directly.
+    id vc2 = rbq_instance(objc_getClass("SBVolumeControl"));
+    if (rbq_can(vc2, sSetVol)) {
+        ((void (*)(id, SEL, float))objc_msgSend)(vc2, sSetVol, target);
+        s_qcMediaMuted = mute;
+        RBLog(@"qc mediamute: tier2 SBVolumeControl set=%.2f", target);
+        return;
+    }
+    // Tier 3: responders with strict whitelist.
+    Class rVC[12];
+    int nVC = rbq_responders(sSetVol, "setActiveCategoryVolume:", NO, rVC, 12);
+    if (nVC > 0) {
+        const char *prefer[] = {"SBVolumeControl", "SBMediaController", "Volume"};
+        Class cc = rbq_pick(rVC, nVC, prefer, 3);
+        id inst = rbq_instance(cc);
+        if (rbq_can(inst, sSetVol)) {
+            ((void (*)(id, SEL, float))objc_msgSend)(inst, sSetVol, target);
+            s_qcMediaMuted = mute;
+            RBLog(@"qc mediamute: tier3 %s set=%.2f", class_getName(cc), target);
+            return;
+        }
+    }
+    RBLog(@"qc mediamute: no path (nVC=%d)", nVC);
+}
+
+// Location: vcamx sys:location 720 — CLLocationManager class/instance setter.
+// 🔴 Private API; on many iOS 16 builds the write is a no-op, so the 0.6s
+// read-back in rbqTileUp is the only proof. Never crashes (all guarded).
+static BOOL rbq_locationRead(void) {
+    Class c = rbq_cls("CLLocationManager",
+                      "/System/Library/Frameworks/CoreLocation.framework/CoreLocation");
+    SEL sGet = NSSelectorFromString(@"locationServicesEnabled");
+    if (rbq_cancls(c, sGet)) return ((BOOL (*)(id, SEL))objc_msgSend)((id)c, sGet);
+    return NO;
+}
+
+static void rbq_locationToggle(void) {
+    Class c = rbq_cls("CLLocationManager",
+                      "/System/Library/Frameworks/CoreLocation.framework/CoreLocation");
+    SEL sSet = NSSelectorFromString(@"setLocationServicesEnabled:");
+    SEL sGet = NSSelectorFromString(@"locationServicesEnabled");
+    BOOL before = rbq_cancls(c, sGet) ? ((BOOL (*)(id, SEL))objc_msgSend)((id)c, sGet) : NO;
+    BOOL want = !before;
+    if (rbq_cancls(c, sSet)) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)((id)c, sSet, want);
+        RBLog(@"qc location: class setter want=%d", (int)want);
+    } else {
+        id inst = c ? [[c alloc] init] : nil;
+        if (rbq_can(inst, sSet)) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(inst, sSet, want);
+            RBLog(@"qc location: instance setter want=%d", (int)want);
+        } else {
+            RBLog(@"qc location: no setter (cls=%d)", (int)(c != Nil));
+        }
+    }
+}
+
 #pragma mark - state / action dispatch
 
 static BOOL rbq_readState(NSUInteger idx) {
@@ -520,13 +665,16 @@ static BOOL rbq_readState(NSUInteger idx) {
         case RBQDarkMode:   return rbq_darkRead();
         case RBQOrientLock: return rbq_orientRead(rbq_orientMgr());
         case RBQLockScreen: return NO;   // momentary action, no persistent state
+        case RBQScreenRecord: return rbq_recordActive();
+        case RBQMediaMute:   return s_qcMediaMuted;
+        case RBQLocation:    return rbq_locationRead();
         default: return NO;
     }
 }
 
-// Returns NO for momentary actions (lock screen).
+// Returns NO for momentary actions (lock screen, screen recording).
 static BOOL rbq_hasPersistentState(NSUInteger idx) {
-    return idx != RBQLockScreen;
+    return idx != RBQLockScreen && idx != RBQScreenRecord;
 }
 
 static void rbq_perform(NSUInteger idx) {
@@ -537,6 +685,9 @@ static void rbq_perform(NSUInteger idx) {
         case RBQDarkMode:   rbq_darkSet(); break;   // toggle semantics
         case RBQOrientLock: rbq_orientSet(!rbq_readState(idx)); break;
         case RBQLockScreen: rbq_lockScreen(); break;
+        case RBQScreenRecord: rbq_recordToggle(); break;
+        case RBQMediaMute:   rbq_mediaMuteToggle(); break;
+        case RBQLocation:    rbq_locationToggle(); break;
         default: break;
     }
 }
@@ -688,30 +839,39 @@ static NSUInteger const kRBQTilesPerRow = 3;
     self.tiles = [NSMutableArray arrayWithCapacity:RBQCount];
     self.stateLabels = [NSMutableArray arrayWithCapacity:RBQCount];
 
-    UIStackView *row1 = [self rbMakeRow];
-    UIStackView *row2 = [self rbMakeRow];
+    // 0.6.4: 9 tiles = 3 rows of 3. Built generically so adding a tile only
+    // means extending the enum/tables, not rewriting row wiring again.
+    NSUInteger rowCount = (RBQCount + kRBQTilesPerRow - 1) / kRBQTilesPerRow;
+    NSMutableArray<UIStackView *> *rows = [NSMutableArray arrayWithCapacity:rowCount];
+    for (NSUInteger r = 0; r < rowCount; r++) {
+        UIStackView *row = [self rbMakeRow];
+        [rows addObject:row];
+        [root addSubview:row];
+    }
     for (NSUInteger i = 0; i < RBQCount; i++) {
         UIControl *tile = [self rbMakeTileAtIndex:i side:38.0];
-        [(i < kRBQTilesPerRow ? row1 : row2) addArrangedSubview:tile];
+        [rows[i / kRBQTilesPerRow] addArrangedSubview:tile];
         [self.tiles addObject:tile];
         [self.stateLabels addObject:[tile viewWithTag:1003]];
     }
 
     [root addSubview:header];
-    [root addSubview:row1];
-    [root addSubview:row2];
-    [NSLayoutConstraint activateConstraints:@[
+    NSMutableArray<NSLayoutConstraint *> *cs = [NSMutableArray arrayWithObjects:
         [header.topAnchor constraintEqualToAnchor:root.topAnchor constant:pad],
         [header.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad + 1.0],
         [header.trailingAnchor constraintLessThanOrEqualToAnchor:root.trailingAnchor constant:-(pad + 1.0)],
-        [row1.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:(self.styleCompact ? 5.0 : 7.0)],
-        [row1.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad],
-        [row1.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-pad],
-        [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:rowGap],
-        [row2.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad],
-        [row2.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-pad],
-        [row2.bottomAnchor constraintEqualToAnchor:root.bottomAnchor constant:-pad],
-    ]];
+        nil];
+    UIStackView *prev = nil;
+    for (NSUInteger r = 0; r < rows.count; r++) {
+        UIStackView *row = rows[r];
+        [cs addObject:[row.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:pad]];
+        [cs addObject:[row.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-pad]];
+        [cs addObject:[row.topAnchor constraintEqualToAnchor:(prev ? prev.bottomAnchor : header.bottomAnchor)
+                                                   constant:(r == 0 ? (self.styleCompact ? 5.0 : 7.0) : rowGap)]];
+        prev = row;
+    }
+    [cs addObject:[prev.bottomAnchor constraintEqualToAnchor:root.bottomAnchor constant:-pad]];
+    [NSLayoutConstraint activateConstraints:cs];
     self.view = root;
 }
 

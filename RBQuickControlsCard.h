@@ -1,5 +1,6 @@
-// Quick controls card — six toggles you would otherwise reach the top for:
-// flashlight, ringer mute, low power, dark mode, orientation lock, lock screen.
+// Quick controls card — toggles you would otherwise reach the top for:
+// flashlight, ringer mute, low power, dark mode, orientation lock, lock screen,
+// screen recording, media mute, location (0.6.4 added the last three).
 //
 // SAFETY CONTRACT (learned from the vcamx drawer action work):
 //   * Every private class is resolved lazily via dlopen + objc_getClass, and
