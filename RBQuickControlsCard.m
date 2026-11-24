@@ -564,45 +564,69 @@ static void rbq_recordToggle(void) {
     }
 }
 
-// Media mute: vcamx sys:mediamute 717 — save current volume, set 0, restore on
-// next tap. Category is fixed @"Audio/Video"; three guarded tiers.
-static BOOL s_qcMediaMuted = NO;
+// Media mute: vcamx sys:mediamute 717. 🔴 0.6.5 FIX of the 0.6.4 port:
+//   (1) 0.6.4 kept only the three setActiveCategoryVolume: tiers — that selector
+//       writes the CURRENTLY ACTIVE category (often ringtone/ambient when no
+//       media is playing), so the media volume never moved -> "no response".
+//       vcamx's tier ④ setVolumeTo:forCategory: is the ONE path that names
+//       @"Audio/Video" explicitly. It was dropped in the port; now primary.
+//   (2) 0.6.4 read its state from a private flag, so the tile/verify always
+//       claimed success. State is now read from the REAL media volume.
 static float s_qcMediaSaved = 0.5f;
 
-static void rbq_mediaMuteToggle(void) {
-    NSString *cat = @"Audio/Video";
-    BOOL mute = !s_qcMediaMuted;
-    // Read current volume for the save slot (AVSystemController, guarded).
+// Real media volume from AVSystemController (the same object vcamx reads).
+// -1.0f means unreadable; the caller degrades to "not muted".
+static float rbq_mediaVolumeRead(void) {
     Class cAV = rbq_cls2("AVSystemController",
                          "/System/Library/PrivateFrameworks/Celestial.framework/Celestial",
                          "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
     id avc = rbq_get(cAV, NSSelectorFromString(@"sharedAVSystemController"));
     SEL gv = NSSelectorFromString(@"getVolume:forCategory:");
-    float cur = -1.0f;
-    if (rbq_can(avc, gv)) ((BOOL (*)(id, SEL, float *, id))objc_msgSend)(avc, gv, &cur, cat);
-    if (mute && cur > 0.01f) s_qcMediaSaved = cur;
-    float target = mute ? 0.0f : (s_qcMediaSaved > 0.01f ? s_qcMediaSaved : 0.5f);
+    float v = -1.0f;
+    if (rbq_can(avc, gv)) {
+        ((BOOL (*)(id, SEL, float *, id))objc_msgSend)(avc, gv, &v, @"Audio/Video");
+    }
+    return v;
+}
 
+static void rbq_mediaMuteToggle(void) {
+    NSString *cat = @"Audio/Video";
+    float cur = rbq_mediaVolumeRead();
+    BOOL muted = (cur >= 0.0f && cur < 0.02f);   // real device state, not a flag
+    BOOL wantMute = !muted;
+    if (wantMute && cur > 0.01f) s_qcMediaSaved = cur;
+    float target = wantMute ? 0.0f : (s_qcMediaSaved > 0.01f ? s_qcMediaSaved : 0.5f);
+    RBLog(@"qc mediamute start cur=%.2f muted=%d want=%d target=%.2f",
+          cur, (int)muted, (int)wantMute, target);
+
+    // Primary: vcamx tier ④ — explicit category, writes MEDIA volume no matter
+    // which category happens to be active. This is the path 0.6.4 was missing.
+    Class cAV = rbq_cls2("AVSystemController",
+                         "/System/Library/PrivateFrameworks/Celestial.framework/Celestial",
+                         "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
+    id avc = rbq_get(cAV, NSSelectorFromString(@"sharedAVSystemController"));
+    SEL sv = NSSelectorFromString(@"setVolumeTo:forCategory:");
+    if (rbq_can(avc, sv)) {
+        BOOL ok = ((BOOL (*)(id, SEL, float, id))objc_msgSend)(avc, sv, target, cat);
+        RBLog(@"qc mediamute: tier1 setVolumeTo:forCategory:%.2f ok=%d", target, (int)ok);
+        return;
+    }
+    // Fallbacks: vcamx tiers ①②③ — setActiveCategoryVolume: (active category).
     SEL sSetVol = NSSelectorFromString(@"setActiveCategoryVolume:");
-    // Tier 1: SBMediaController.sharedInstance.volumeControl (SHELLX same path).
     id bp = rbq_instance(objc_getClass("SBMediaController"));
     id vc = rbq_can(bp, NSSelectorFromString(@"volumeControl"))
           ? ((id (*)(id, SEL))objc_msgSend)(bp, NSSelectorFromString(@"volumeControl")) : nil;
     if (rbq_can(vc, sSetVol)) {
         ((void (*)(id, SEL, float))objc_msgSend)(vc, sSetVol, target);
-        s_qcMediaMuted = mute;
-        RBLog(@"qc mediamute: tier1 SBMediaController.volumeControl set=%.2f", target);
+        RBLog(@"qc mediamute: tier2 SBMediaController.volumeControl set=%.2f", target);
         return;
     }
-    // Tier 2: SBVolumeControl singleton directly.
     id vc2 = rbq_instance(objc_getClass("SBVolumeControl"));
     if (rbq_can(vc2, sSetVol)) {
         ((void (*)(id, SEL, float))objc_msgSend)(vc2, sSetVol, target);
-        s_qcMediaMuted = mute;
-        RBLog(@"qc mediamute: tier2 SBVolumeControl set=%.2f", target);
+        RBLog(@"qc mediamute: tier3 SBVolumeControl set=%.2f", target);
         return;
     }
-    // Tier 3: responders with strict whitelist.
     Class rVC[12];
     int nVC = rbq_responders(sSetVol, "setActiveCategoryVolume:", NO, rVC, 12);
     if (nVC > 0) {
@@ -611,8 +635,7 @@ static void rbq_mediaMuteToggle(void) {
         id inst = rbq_instance(cc);
         if (rbq_can(inst, sSetVol)) {
             ((void (*)(id, SEL, float))objc_msgSend)(inst, sSetVol, target);
-            s_qcMediaMuted = mute;
-            RBLog(@"qc mediamute: tier3 %s set=%.2f", class_getName(cc), target);
+            RBLog(@"qc mediamute: tier4 %s set=%.2f", class_getName(cc), target);
             return;
         }
     }
@@ -666,7 +689,9 @@ static BOOL rbq_readState(NSUInteger idx) {
         case RBQOrientLock: return rbq_orientRead(rbq_orientMgr());
         case RBQLockScreen: return NO;   // momentary action, no persistent state
         case RBQScreenRecord: return rbq_recordActive();
-        case RBQMediaMute:   return s_qcMediaMuted;
+        // 0.6.5: read the REAL media volume, not a private flag — a fake flag
+        // made the tile/verify claim success while the device stayed loud.
+        case RBQMediaMute: { float v = rbq_mediaVolumeRead(); return v >= 0.0f && v < 0.02f; }
         case RBQLocation:    return rbq_locationRead();
         default: return NO;
     }
