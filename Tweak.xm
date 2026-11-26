@@ -133,6 +133,13 @@ static NSUInteger rbHitTestLogCount = 0; // bounded self-evidence for the touch 
 static UIView *rbStickyRow = nil;        // ReachPlayer emptyView trick: keep down/up on one view
 static NSUInteger rbCurrentCardIndex = 0; // 0.3.0: deck selection
 static NSArray<id<RBCard>> *rbSortedCards = nil;
+// 0.6.8: privacy card auto-pop. When on, a privacy card with content takes
+// over the deck no matter which card the user is on; when its content clears,
+// the deck returns to the card the user last picked by hand.
+static BOOL rbPrivacyAutoPop = NO;               // off by default: upgrade-safe
+static NSUInteger rbUserChosenCardIndex = 0;     // last card the user selected
+static BOOL rbPrivacyPopping = NO;               // currently showing the privacy takeover
+static BOOL rbPrivacyPopSuspended = NO;          // user took over during this content cycle
 // 0.6.2: monotonic switch token. Bumped on every card switch so a fade from a
 // PREVIOUS switch cannot write alpha/transform back onto the current card when
 // it finishes late. This is the core of the rapid-tap overlap/offset fix.
@@ -247,6 +254,21 @@ static NSArray<id<RBCard>> *RBSortedCards(void) {
     return [out copy];
 }
 
+// 0.6.8: index of the privacy card in the current sorted deck (NSNotFound if
+// it is disabled). Content is measured from allRows via rbContentCount, NOT the
+// collapsed visible rows, so a 3-row peek still counts as "has content".
+static NSUInteger RBPrivacyCardIndex(void) {
+    if (!privacyCard || !rbSortedCards) return NSNotFound;
+    for (NSUInteger i = 0; i < rbSortedCards.count; i++) {
+        if (rbSortedCards[i] == privacyCard) return i;
+    }
+    return NSNotFound;
+}
+static BOOL RBPrivacyHasContent(void) {
+    if (!privacyCard || ![privacyCard respondsToSelector:@selector(rbContentCount)]) return NO;
+    return [privacyCard rbContentCount] > 0;
+}
+
 // Pure data read — safe from a dylib initializer: Foundation file I/O only,
 // no UIKit and no class hooks.
 static void RBReadPrefs(void) {
@@ -257,6 +279,9 @@ static void RBReadPrefs(void) {
     rbCardClipboard = d[@"cardClipboard"] ? [d[@"cardClipboard"] boolValue] : YES;
     rbCardDockApps = d[@"cardDockApps"] ? [d[@"cardDockApps"] boolValue] : YES;
     rbCardQuick = d[@"cardQuick"] ? [d[@"cardQuick"] boolValue] : YES;
+    // 0.6.8: auto-pop the privacy card when it has content. Default NO so an
+    // upgrade never changes an existing install's card order behaviour.
+    rbPrivacyAutoPop = d[@"privacyAutoPop"] ? [d[@"privacyAutoPop"] boolValue] : NO;
     // 0.5.2: an array of bundle IDs from the app picker. Anything else (a stale
     // string from a downgrade, a plist edited by hand) is ignored rather than
     // passed on, so the card can never be handed a type it does not expect.
@@ -346,6 +371,7 @@ static void RBReloadSettings(void) {
 - (void)rbUpdatePeekDots;
 - (void)rbUpdateUsableGeometry;
 - (void)rbApplyCardOffset;
+- (void)rbApplyPrivacyPop;
 @end
 
 // SBSensorActivityDataProvider — read-only, exact selectors we call.
@@ -486,6 +512,11 @@ static void RBReloadSettings(void) {
         if ([card respondsToSelector:@selector(rbWillUnmount)]) [card rbWillUnmount];
     }
     rbCurrentCardIndex = 0;
+    // 0.6.8: a new presentation starts non-popping; a fresh content cycle is
+    // allowed to pop again. rbUserChosenCardIndex is kept on purpose so the
+    // deck can restore "the card I was on" across presentations.
+    rbPrivacyPopping = NO;
+    rbPrivacyPopSuspended = NO;
     rbSortedCards = nil;
     rbPeekTap = nil;
     rbPeekLabel = nil;
@@ -796,6 +827,9 @@ static void RBReloadSettings(void) {
     // 0.6.7: apply the per-card vertical offset before measuring, so the
     // nine-tile card's measured geometry reflects its actual (lower) position.
     [self rbApplyCardOffset];
+    // 0.6.8: apply privacy takeover at mount so a fresh presentation opens
+    // straight onto the privacy card when it has content and the switch is on.
+    [self rbApplyPrivacyPop];
     // 0.3.1 diagnostic: measure the usable band immediately (works when we
     // remount while already on screen) and once more after the presentation
     // animation settles, so a report carries real numbers instead of guesses.
@@ -827,6 +861,57 @@ static void RBReloadSettings(void) {
     if ([ident isEqualToString:@"quickcontrols"]) extra = 30.0;
     rbStackCenterYConstraint.constant = (rbCardAtBottom ? 140.0 : -110.0) + extra;
     RBLog(@"card offset id=%@ extra=%.0f bottom=%d", ident ?: @"none", extra, rbCardAtBottom);
+}
+
+%new
+// 0.6.8: privacy takeover state machine. Called on mount, on sensor content
+// change and on settings reload. Only ever MOVES the deck when the desired
+// visibility actually differs, so the high-frequency sensor feed cannot stack
+// up switch animations.
+- (void)rbApplyPrivacyPop {
+    NSUInteger pIdx = RBPrivacyCardIndex();
+    BOOL has = RBPrivacyHasContent();
+    BOOL wantPop = rbPrivacyAutoPop && (pIdx != NSNotFound) && has && !rbPrivacyPopSuspended;
+
+    // Content just cleared: end the suppression cycle so the NEXT content
+    // appearance can pop again (user takeover only lasts one content cycle).
+    if (!has && rbPrivacyPopSuspended) {
+        rbPrivacyPopSuspended = NO;
+        RBLog(@"privacy pop suspend cleared (content gone)");
+    }
+
+    if (wantPop && !rbPrivacyPopping) {
+        // Entering takeover. rbUserChosenCardIndex is ONLY updated when the
+        // user actually taps the grabber (see rbPeekTouchUp), so it survives a
+        // whole presentation cycle and correctly restores "the card I was on".
+        rbPrivacyPopping = YES;
+        [self rbShowCardAtIndex:pIdx];
+        RBLog(@"privacy pop ENTER pIdx=%lu user=%lu content=%lu",
+              (unsigned long)pIdx, (unsigned long)rbUserChosenCardIndex,
+              (unsigned long)[privacyCard rbContentCount]);
+    } else if (!wantPop && rbPrivacyPopping) {
+        // Leaving takeover (content gone / switch off / user took over): return
+        // to the last card the user chose, clamped to the current deck.
+        rbPrivacyPopping = NO;
+        NSUInteger back = rbUserChosenCardIndex;
+        if (back >= rbSortedCards.count || back == pIdx) {
+            // User choice is stale or IS the privacy card: fall back to the
+            // first non-privacy card instead of bouncing straight back in.
+            back = NSNotFound;
+            for (NSUInteger i = 0; i < rbSortedCards.count; i++) {
+                if (i != pIdx) { back = i; break; }
+            }
+            if (back == NSNotFound) back = rbCurrentCardIndex; // privacy-only deck: stay put
+        }
+        [self rbShowCardAtIndex:back];
+        RBLog(@"privacy pop EXIT -> %lu pop=%d suspend=%d switch=%d",
+              (unsigned long)back, (int)rbPrivacyPopping,
+              (int)rbPrivacyPopSuspended, (int)rbPrivacyAutoPop);
+    } else if (wantPop && rbPrivacyPopping && rbCurrentCardIndex != pIdx) {
+        // Deck was rebuilt/reordered while popping: stay on the privacy card.
+        [self rbShowCardAtIndex:pIdx];
+        RBLog(@"privacy pop RE-ANCHOR pIdx=%lu", (unsigned long)pIdx);
+    }
 }
 
 %new
@@ -1023,6 +1108,15 @@ static void RBReloadSettings(void) {
     }
     NSUInteger next = (rbCurrentCardIndex + 1) % rbSortedCards.count;
     rbCurrentCardIndex = next;
+    // 0.6.8: a grabber tap is an explicit user choice. Record it as the card
+    // to restore after a future privacy takeover, and if we were currently
+    // popping, take over for this content cycle so we don't yank them back.
+    rbUserChosenCardIndex = next;
+    if (rbPrivacyPopping) {
+        rbPrivacyPopping = NO;
+        rbPrivacyPopSuspended = YES;
+        RBLog(@"privacy pop user takeover -> %lu suspend=YES", (unsigned long)next);
+    }
     // 0.6.2: NO outer animateWithDuration. rbShowCardAtIndex: now commits the
     // hidden / height change with performWithoutAnimation and runs exactly one
     // self-contained fade. The old outer block animated UIStackView's hidden
@@ -1125,6 +1219,11 @@ static void RBReloadSettings(void) {
     NSSet *attrs = all ?: active;
     if (privacyCard) [privacyCard ingestAttributions:attrs activeAttributions:active];
     RBLog(@"sensor data active=%lu all=%lu", (unsigned long)active.count, (unsigned long)all.count);
+    // 0.6.8: content changed — re-evaluate the privacy takeover while the deck
+    // is actually on screen. When it is not, the next mount applies the state.
+    if (rbLiveController && rbContainer) {
+        [rbLiveController performSelector:@selector(rbApplyPrivacyPop)];
+    }
 }
 
 %end

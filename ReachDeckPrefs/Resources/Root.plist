@@ -60,6 +60,20 @@
 		</dict>
 		<dict>
 			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>隐私卡自动弹出</string>
+			<key>key</key>
+			<string>privacyAutoPop</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.zlhkf.ReachDeck</string>
+			<key>footerText</key>
+			<string>打开后，只要隐私卡有内容，划出便捷访问时优先显示它；内容消失后自动回到你原来在看的卡片。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
 			<string>更多卡片</string>

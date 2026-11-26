@@ -36,6 +36,10 @@ extern void RBPrivacyCancelInteraction(void);
 /// When YES, system-service attributions (no bundle / isSystemService) are filtered out.
 - (void)setHideSystemServices:(BOOL)hide;
 
+/// 0.6.8: total rows available (before the collapsed/expanded windowing), used
+/// by the tweak's auto-pop logic to decide whether the privacy card "has content".
+- (NSUInteger)rbContentCount;
+
 /// 0.2.19 visual style; 0.2.20 adds border. Called from the tweak when settings load/change.
 /// Rebuilds the card UI on next access so changes apply without a respring.
 /// opacity 0..1 (background alpha), corner 0..24pt, border 0..3pt (white outline),

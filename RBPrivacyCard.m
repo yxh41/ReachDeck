@@ -137,6 +137,10 @@ void RBPrivacyCancelInteraction(void) {
 
 #pragma mark - RBCard
 
+// 0.6.8: total rows before windowing. Deliberately uses allRows (not the
+// collapsed `rows`) so a 3-row collapsed card still reports its real content.
+- (NSUInteger)rbContentCount { return self.allRows.count; }
+
 - (UIView *)rbView {
     // Lazy UI construction: first real access happens inside addRBContainer,
     // i.e. on the main thread with UIApplication fully up.
