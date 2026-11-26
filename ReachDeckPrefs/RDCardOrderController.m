@@ -11,7 +11,7 @@ static NSString *const kRDCardIDs[] = {
     @"dockapps", @"quickcontrols", @"privacy", @"nowplaying", @"clipboard"
 };
 static NSString *const kRDCardNames[] = {
-    @"常用 App", @"快捷开关", @"隐私", @"正在播放", @"剪贴板"
+    @"常用 App", @"快捷开关", @"隐私", @"正在播放", @"剪贴板历史"
 };
 static NSString *const kRDCardIcons[] = {
     @"app.fill", @"slider.horizontal.3", @"eye.fill", @"music.note", @"doc.on.clipboard.fill"

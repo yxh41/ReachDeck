@@ -134,13 +134,15 @@
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
-			<string>剪贴板卡片</string>
+			<string>剪贴板历史卡片</string>
 			<key>key</key>
 			<string>cardClipboard</string>
 			<key>default</key>
 			<true/>
 			<key>defaults</key>
 			<string>com.zlhkf.ReachDeck</string>
+			<key>footerText</key>
+			<string>自动记住最近复制的文本、图片、链接（最多 20 条，不写入磁盘）。点按任一历史即可回填到剪贴板。</string>
 		</dict>
 		<dict>
 			<key>cell</key>

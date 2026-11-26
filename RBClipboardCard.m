@@ -1,7 +1,10 @@
 #import "RBClipboardCard.h"
 #import "RBPrivacyCard.h"   // RBLog + shared interaction suppression
+#import <objc/runtime.h>    // associated object: row index
 
 static NSInteger const kRBClipboardTag = 0x52444235; // 'RDB5': clipboard card root
+static NSUInteger const kRBHistoryCap = 20;          // in-memory items, newest first
+static NSUInteger const kRBDefaultRowLimit = 5;      // visible rows when height unknown
 
 static NSString *RBClipboardSingleLine(NSString *text, NSUInteger limit) {
     if (text.length == 0) return @"";
@@ -13,29 +16,41 @@ static NSString *RBClipboardSingleLine(NSString *text, NSUInteger limit) {
     return s;
 }
 
+@interface RBClipboardItem : NSObject
+@property (nonatomic, copy) NSString *type;
+@property (nonatomic, copy) NSString *detail;
+@property (nonatomic, copy) NSString *preview;
+@property (nonatomic, copy) NSString *time;
+@property (nonatomic, copy) NSString *fingerprint;
+@property (nonatomic, strong) id payload;
+@end
+@implementation RBClipboardItem
+@end
+
 @interface RBClipboardCard ()
 @property (nonatomic, strong) UIView *view;
 @property (nonatomic, strong) UIStackView *contentStack;
-@property (nonatomic, strong) UILabel *headerLabel;
-@property (nonatomic, strong) UILabel *typeLabel;
-@property (nonatomic, strong) UILabel *previewLabel;
+@property (nonatomic, strong) UILabel *countLabel;
 @property (nonatomic, strong) UILabel *hintLabel;
-@property (nonatomic, copy) NSString *clipType;
-@property (nonatomic, copy) NSString *clipDetail;
-@property (nonatomic, copy) NSString *clipPreview;
-@property (nonatomic, assign) BOOL hasContent;
-@property (nonatomic, assign) BOOL revealed;
+@property (nonatomic, strong) NSMutableArray<RBClipboardItem *> *history;
+@property (nonatomic, strong) NSMutableArray<UIControl *> *rowControls;
+@property (nonatomic, assign) NSInteger lastChangeCount;
+@property (nonatomic, assign) BOOL historyReady;
+@property (nonatomic, assign) BOOL suppressCapture;
+@property (nonatomic, assign) CGFloat availableHeight;
 @property (nonatomic, assign) CGFloat styleOpacity;
 @property (nonatomic, assign) CGFloat styleCorner;
 @property (nonatomic, assign) CGFloat styleBorder;
 @property (nonatomic, assign) BOOL styleCompact;
+@property (nonatomic, strong) dispatch_source_t pollTimer;
 - (void)buildView;
-- (void)rbReadPasteboard;
-- (void)rbUpdateLabels;
-- (void)rbPasteboardChanged:(NSNotification *)note;
+- (void)rbStartPolling;
+- (void)rbPollPasteboard;
+- (BOOL)rbCaptureCurrent;
+- (NSUInteger)rbEffectiveRowLimit;
+- (void)rbRenderRows;
+- (void)rbRestoreAtIndex:(NSUInteger)index;
 - (void)rbTouchDown:(UIControl *)sender;
-- (void)rbTouchUp:(UIControl *)sender;
-- (void)rbTouchCancel:(UIControl *)sender;
 - (void)rbScheduleDisarm;
 @end
 
@@ -44,22 +59,23 @@ static NSString *RBClipboardSingleLine(NSString *text, NSUInteger limit) {
 - (instancetype)init {
     self = [super init];
     if (self) {
-        // These defaults match RBPrivacyCard so the two cards look like one deck.
         _styleOpacity = 0.72;
         _styleCorner = 16;
         _styleBorder = 1;
         _styleCompact = NO;
-        _revealed = NO;
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(rbPasteboardChanged:)
-                                                     name:UIPasteboardChangedNotification
-                                                   object:nil];
+        _history = [NSMutableArray arrayWithCapacity:kRBHistoryCap];
+        _rowControls = [NSMutableArray array];
+        _lastChangeCount = -1;
+        [self rbStartPolling];
     }
     return self;
 }
 
 - (void)dealloc {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    if (_pollTimer) {
+        dispatch_source_cancel(_pollTimer);
+        _pollTimer = nil;
+    }
 }
 
 #pragma mark - RBCard
@@ -68,26 +84,24 @@ static NSString *RBClipboardSingleLine(NSString *text, NSUInteger limit) {
 - (NSString *)rbIdentifier { return @"clipboard"; }
 - (BOOL)rbWantsPin { return YES; }
 - (NSString *)rbRailImageName { return @"doc.on.clipboard.fill"; }
-- (NSString *)rbRailTitle { return @"剪贴板"; }
+- (NSString *)rbRailTitle { return @"剪贴板历史"; }
 
 - (UIView *)rbView {
     if (!self.view) {
         [self buildView];
-        [self rbReadPasteboard];
-        [self rbUpdateLabels];
+        [self rbCaptureCurrent];
+        [self rbRenderRows];
     }
     return self.view;
 }
 
 - (void)rbRefresh {
-    [self rbReadPasteboard];
-    [self rbUpdateLabels];
+    [self rbCaptureCurrent];
+    [self rbRenderRows];
 }
 
 - (void)rbWillUnmount {
-    // Clipboard content stays masked on every new Reachability presentation.
-    self.revealed = NO;
-    [self rbUpdateLabels];
+    // Nothing masked by default; the list is safe to show on every mount.
 }
 
 - (void)setStyleOpacity:(CGFloat)opacity corner:(CGFloat)corner border:(CGFloat)border compact:(BOOL)compact {
@@ -107,40 +121,70 @@ static NSString *RBClipboardSingleLine(NSString *text, NSUInteger limit) {
           opacity, corner, border, (int)compact);
     self.view = nil;
     self.contentStack = nil;
-    self.headerLabel = nil;
-    self.typeLabel = nil;
-    self.previewLabel = nil;
+    self.countLabel = nil;
     self.hintLabel = nil;
+    [self.rowControls removeAllObjects];
 }
 
-#pragma mark - pasteboard
+- (void)rbSetAvailableHeight:(CGFloat)height {
+    if (height <= 0) return;
+    if (fabs(height - self.availableHeight) < 1.0) return;
+    NSUInteger before = [self rbEffectiveRowLimit];
+    self.availableHeight = height;
+    NSUInteger after = [self rbEffectiveRowLimit];
+    RBLog(@"clipboard available height=%.0f cap %lu->%lu",
+          height, (unsigned long)before, (unsigned long)after);
+    if (before == after) return;
+    [self rbRenderRows];
+}
 
-- (void)rbPasteboardChanged:(NSNotification *)note {
-    (void)note;
-    // Weak self: the card is a long-lived singleton, so a self-retaining block
-    // would keep a stale UI alive after a style rebuild.
+#pragma mark - capture
+
+// 0.6.9: SpringBoard never receives cross-process UIPasteboard notifications,
+// so a low-frequency timer polls changeCount. Reading changeCount is a single
+// integer read; the clipboard payload is only touched when it actually changed.
+- (void)rbStartPolling {
+    if (self.pollTimer) return;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    self.pollTimer = timer;
+    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
     __weak typeof(self) weakSelf = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
+    dispatch_source_set_event_handler(timer, ^{
         __strong typeof(self) strongSelf = weakSelf;
         if (!strongSelf) return;
-        [strongSelf rbRefresh];
+        [strongSelf rbPollPasteboard];
     });
+    dispatch_resume(timer);
+    RBLog(@"clipboard history poll started");
 }
 
-- (void)rbReadPasteboard {
+- (void)rbPollPasteboard {
+    BOOL added = [self rbCaptureCurrent];
+    if (added) [self rbRenderRows];
+}
+
+- (BOOL)rbCaptureCurrent {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    NSString *type = nil;
-    NSString *detail = nil;
-    NSString *preview = nil;
-    NSUInteger length = 0;
+    NSInteger cc = pb.changeCount;
+    if (self.historyReady && cc == self.lastChangeCount) return NO;
+    self.historyReady = YES;
+    self.lastChangeCount = cc;
+    if (self.suppressCapture) {
+        self.suppressCapture = NO;
+        return NO;
+    }
+
+    NSString *type = nil, *detail = nil, *preview = nil, *fingerprint = nil;
+    id payload = nil;
 
     if (pb.hasStrings) {
         NSString *text = pb.string;
         if (text.length > 0) {
             type = @"文本";
-            length = text.length;
-            detail = [NSString stringWithFormat:@"%lu 字", (unsigned long)length];
-            preview = RBClipboardSingleLine(text, 96);
+            detail = [NSString stringWithFormat:@"%lu 字", (unsigned long)text.length];
+            preview = RBClipboardSingleLine(text, 60);
+            fingerprint = [@"t:" stringByAppendingString:text];
+            payload = [text copy];
         }
     } else if (pb.hasImages) {
         UIImage *image = pb.image;
@@ -150,59 +194,224 @@ static NSString *RBClipboardSingleLine(NSString *text, NSUInteger limit) {
             CGFloat h = image.size.height * image.scale;
             detail = [NSString stringWithFormat:@"%.0f × %.0f", w, h];
             preview = @"图片内容";
-            length = (NSUInteger)(w * h);
+            // An image has no cheap stable hash; size + pixel count is enough
+            // to collapse consecutive duplicates of the same screenshot.
+            fingerprint = [NSString stringWithFormat:@"i:%.0fx%.0f:%lu",
+                           w, h, (unsigned long)(w * h)];
+            payload = image;
         }
     } else if (pb.hasURLs) {
         NSURL *url = pb.URL;
         if (url.absoluteString.length > 0) {
             type = @"链接";
-            length = url.absoluteString.length;
-            detail = [NSString stringWithFormat:@"%lu 字符", (unsigned long)length];
-            preview = RBClipboardSingleLine(url.absoluteString, 96);
+            detail = [NSString stringWithFormat:@"%lu 字符", (unsigned long)url.absoluteString.length];
+            preview = RBClipboardSingleLine(url.absoluteString, 60);
+            fingerprint = [@"u:" stringByAppendingString:url.absoluteString];
+            payload = url;
+        }
+    }
+    if (!type || !fingerprint) {
+        RBLog(@"clipboard history clear-or-empty cc=%ld", (long)cc);
+        return NO;
+    }
+
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm:ss";
+    });
+
+    // Same content copied again: bump its timestamp and move to the front,
+    // but do not grow the list.
+    if (self.history.count > 0) {
+        RBClipboardItem *head = self.history[0];
+        if ([head.fingerprint isEqualToString:fingerprint]) {
+            head.time = [fmt stringFromDate:[NSDate date]];
+            RBLog(@"clipboard history dup type=%@ count=%lu cc=%ld",
+                  type, (unsigned long)self.history.count, (long)cc);
+            return NO;
         }
     }
 
-    BOOL has = type.length > 0;
-    NSString *typeCmp = type ?: @"";
-    NSString *detailCmp = detail ?: @"";
-    NSString *previewCmp = preview ?: @"";
-    BOOL changed = (has != self.hasContent) ||
-                   ![typeCmp isEqualToString:self.clipType ?: @""] ||
-                   ![detailCmp isEqualToString:self.clipDetail ?: @""] ||
-                   ![previewCmp isEqualToString:self.clipPreview ?: @""];
-    self.hasContent = has;
-    self.clipType = has ? type : nil;
-    self.clipDetail = has ? detail : nil;
-    self.clipPreview = has ? preview : nil;
-    if (changed) self.revealed = NO;
-    RBLog(@"clipboard type=%@ chars=%lu revealed=%d",
-          has ? type : @"none", (unsigned long)length, (int)self.revealed);
+    RBClipboardItem *item = [[RBClipboardItem alloc] init];
+    item.type = type;
+    item.detail = detail;
+    item.preview = preview;
+    item.time = [fmt stringFromDate:[NSDate date]];
+    item.fingerprint = fingerprint;
+    item.payload = payload;
+    [self.history insertObject:item atIndex:0];
+    while (self.history.count > kRBHistoryCap) [self.history removeLastObject];
+
+    RBLog(@"clipboard history add type=%@ count=%lu cc=%ld",
+          type, (unsigned long)self.history.count, (long)cc);
+    return YES;
 }
 
-- (void)rbUpdateLabels {
-    if (!self.view) return;
-    self.headerLabel.text = @"剪贴板";
-    self.typeLabel.text = self.hasContent ? self.clipType : @"";
-    if (!self.hasContent) {
-        self.previewLabel.text = @"剪贴板为空";
-        self.previewLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.58];
-        self.hintLabel.text = @"复制内容后会显示在这里";
-        return;
+#pragma mark - rows
+
+// height(N) = pad*2 + headerH + gap + N*rowH + (N-1)*gap.
+- (NSUInteger)rbEffectiveRowLimit {
+    NSUInteger total = self.history.count;
+    if (total == 0) return 0;
+    if (self.availableHeight <= 0) return MIN(total, kRBDefaultRowLimit);
+    CGFloat pad = _styleCompact ? 9.0 : 12.0;
+    CGFloat gap = _styleCompact ? 5.0 : 7.0;
+    CGFloat rowH = _styleCompact ? 40.0 : 46.0;
+    CGFloat headerH = _styleCompact ? 13.0 : 14.0;
+    CGFloat fixed = pad * 2 + headerH + gap;
+    CGFloat room = self.availableHeight - fixed;
+    if (room <= 0) return 1;
+    NSUInteger cap = (NSUInteger)floor((room + gap) / (rowH + gap));
+    if (cap < 1) cap = 1;
+    if (cap > kRBDefaultRowLimit) cap = kRBDefaultRowLimit;
+    return MIN(total, cap);
+}
+
+- (void)rbRenderRows {
+    if (!self.contentStack) return;
+    for (UIControl *c in self.rowControls) {
+        [c removeFromSuperview];
     }
-    self.previewLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.94];
-    self.previewLabel.text = self.revealed ? self.clipPreview : @"••••••";
-    self.hintLabel.text = [NSString stringWithFormat:@"%@ · %@ · %@",
-                           self.clipType, self.clipDetail,
-                           self.revealed ? @"点按隐藏" : @"点按显示"];
+    [self.rowControls removeAllObjects];
+
+    if (self.history.count == 0) {
+        if (!self.hintLabel) {
+            self.hintLabel = [[UILabel alloc] init];
+            self.hintLabel.numberOfLines = 1;
+            self.hintLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+            self.hintLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.52];
+            self.hintLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+            self.hintLabel.userInteractionEnabled = NO;
+        }
+        self.hintLabel.text = @"复制内容后会显示在这里，点按任一历史即可回填";
+        [self.contentStack addArrangedSubview:self.hintLabel];
+    } else {
+        if (self.hintLabel.superview == self.contentStack) {
+            [self.hintLabel removeFromSuperview];
+        }
+        NSUInteger limit = [self rbEffectiveRowLimit];
+        for (NSUInteger i = 0; i < limit; i++) {
+            RBClipboardItem *item = self.history[i];
+            UIControl *row = [self rbRowForItem:item index:i];
+            [self.contentStack addArrangedSubview:row];
+            [self.rowControls addObject:row];
+        }
+    }
+    self.countLabel.text = self.history.count
+        ? [NSString stringWithFormat:@"%lu 条", (unsigned long)self.history.count]
+        : @"";
+}
+
+// Each row deliberately reuses 'RDB5' so the container's hitTest whitelist and
+// 0.6.7's card-region touch arming cover it with no change to Tweak.xm.
+- (UIControl *)rbRowForItem:(RBClipboardItem *)item index:(NSUInteger)index {
+    UIControl *row = [[UIControl alloc] init];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    row.tag = kRBClipboardTag;
+    row.userInteractionEnabled = YES;
+    row.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.06];
+    row.layer.cornerRadius = 7;
+    row.layer.cornerCurve = kCACornerCurveContinuous;
+    [row addTarget:self action:@selector(rbTouchDown:) forControlEvents:UIControlEventTouchDown];
+    [row addTarget:self action:@selector(rbRowTapped:)
+          forControlEvents:UIControlEventTouchUpInside];
+    [row addTarget:self action:@selector(rbScheduleDisarm)
+          forControlEvents:(UIControlEventTouchCancel | UIControlEventTouchUpOutside)];
+
+    UILabel *typeL = [[UILabel alloc] init];
+    typeL.text = item.type;
+    typeL.font = [UIFont systemFontOfSize:(_styleCompact ? 10 : 11) weight:UIFontWeightSemibold];
+    typeL.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.66];
+    typeL.textAlignment = NSTextAlignmentCenter;
+    [typeL setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [typeL setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+    UILabel *previewL = [[UILabel alloc] init];
+    previewL.text = item.preview;
+    previewL.numberOfLines = 1;
+    previewL.lineBreakMode = NSLineBreakByTruncatingTail;
+    previewL.font = [UIFont systemFontOfSize:(_styleCompact ? 12 : 13) weight:UIFontWeightRegular];
+    previewL.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.94];
+
+    UILabel *timeL = [[UILabel alloc] init];
+    timeL.text = item.time ?: @"";
+    timeL.font = [UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
+    timeL.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.50];
+    [timeL setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+    UIStackView *line = [[UIStackView alloc] initWithArrangedSubviews:@[typeL, previewL, timeL]];
+    line.axis = UILayoutConstraintAxisHorizontal;
+    line.alignment = UIStackViewAlignmentCenter;
+    line.spacing = 8;
+    line.translatesAutoresizingMaskIntoConstraints = NO;
+    line.userInteractionEnabled = NO;
+    [row addSubview:line];
+
+    CGFloat inset = _styleCompact ? 8.0 : 10.0;
+    [NSLayoutConstraint activateConstraints:@[
+        [line.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:inset],
+        [line.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-inset],
+        [line.topAnchor constraintEqualToAnchor:row.topAnchor constant:4],
+        [line.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-4],
+        [typeL.widthAnchor constraintEqualToConstant:(_styleCompact ? 30 : 34)],
+    ]];
+    [row setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
+    [row setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
+    objc_setAssociatedObject(row, "rbIndex", @(index), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return row;
+}
+
+#pragma mark - restore
+
+- (void)rbRestoreAtIndex:(NSUInteger)index {
+    if (index >= self.history.count) return;
+    RBClipboardItem *item = self.history[index];
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    if ([item.payload isKindOfClass:[NSString class]]) {
+        pb.string = (NSString *)item.payload;
+    } else if ([item.payload isKindOfClass:[UIImage class]]) {
+        pb.image = (UIImage *)item.payload;
+    } else if ([item.payload isKindOfClass:[NSURL class]]) {
+        pb.URL = (NSURL *)item.payload;
+    }
+    self.suppressCapture = YES;
+    self.lastChangeCount = pb.changeCount;
+    RBLog(@"clipboard history restore type=%@ index=%lu",
+          item.type, (unsigned long)index);
+    [self rbScheduleDisarm];
+}
+
+- (void)rbRowTapped:(UIControl *)sender {
+    NSNumber *n = objc_getAssociatedObject(sender, "rbIndex");
+    if (n) [self rbRestoreAtIndex:n.unsignedIntegerValue];
+}
+
+#pragma mark - interaction
+
+- (void)rbTouchDown:(UIControl *)sender {
+    (void)sender;
+    RBPrivacyArmInteraction();
+}
+
+- (void)rbScheduleDisarm {
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        RBPrivacyCancelInteraction();
+    });
 }
 
 #pragma mark - view
 
 - (void)buildView {
     CGFloat pad = _styleCompact ? 9 : 12;
-    CGFloat gap = _styleCompact ? 4 : 6;
+    CGFloat gap = _styleCompact ? 5 : 7;
 
-    UIControl *root = [[UIControl alloc] initWithFrame:CGRectZero];
+    UIView *root = [[UIView alloc] initWithFrame:CGRectZero];
     root.translatesAutoresizingMaskIntoConstraints = NO;
     root.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:_styleOpacity];
     root.layer.cornerRadius = _styleCorner;
@@ -214,14 +423,6 @@ static NSString *RBClipboardSingleLine(NSString *text, NSUInteger limit) {
     root.userInteractionEnabled = YES;
     [root setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
     [root setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
-    [root addTarget:self action:@selector(rbTouchDown:)
-   forControlEvents:UIControlEventTouchDown];
-    [root addTarget:self action:@selector(rbTouchUp:)
-   forControlEvents:UIControlEventTouchUpInside];
-    [root addTarget:self action:@selector(rbTouchCancel:)
-   forControlEvents:(UIControlEventTouchCancel |
-                     UIControlEventTouchUpOutside |
-                     UIControlEventTouchDragExit)];
     self.view = root;
 
     self.contentStack = [[UIStackView alloc] init];
@@ -229,7 +430,7 @@ static NSString *RBClipboardSingleLine(NSString *text, NSUInteger limit) {
     self.contentStack.spacing = gap;
     self.contentStack.alignment = UIStackViewAlignmentFill;
     self.contentStack.translatesAutoresizingMaskIntoConstraints = NO;
-    self.contentStack.userInteractionEnabled = NO; // whole card is one button
+    self.contentStack.userInteractionEnabled = YES;
     [root addSubview:self.contentStack];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -246,74 +447,21 @@ static NSString *RBClipboardSingleLine(NSString *text, NSUInteger limit) {
     headerRow.spacing = 8;
     headerRow.userInteractionEnabled = NO;
 
-    self.headerLabel = [[UILabel alloc] init];
-    self.headerLabel.text = @"剪贴板";
-    self.headerLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
-    self.headerLabel.font = [UIFont systemFontOfSize:(_styleCompact ? 10 : 11) weight:UIFontWeightSemibold];
-    self.headerLabel.userInteractionEnabled = NO;
-    [self.headerLabel setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-    [headerRow addArrangedSubview:self.headerLabel];
+    UILabel *header = [[UILabel alloc] init];
+    header.text = @"剪贴板历史";
+    header.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.55];
+    header.font = [UIFont systemFontOfSize:(_styleCompact ? 10 : 11) weight:UIFontWeightSemibold];
+    [header setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [headerRow addArrangedSubview:header];
 
-    self.typeLabel = [[UILabel alloc] init];
-    self.typeLabel.textAlignment = NSTextAlignmentRight;
-    self.typeLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.68];
-    self.typeLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
-    self.typeLabel.userInteractionEnabled = NO;
-    [self.typeLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow
-                                                   forAxis:UILayoutConstraintAxisHorizontal];
-    [headerRow addArrangedSubview:self.typeLabel];
+    self.countLabel = [[UILabel alloc] init];
+    self.countLabel.textAlignment = NSTextAlignmentRight;
+    self.countLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.62];
+    self.countLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    [self.countLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow
+                                                     forAxis:UILayoutConstraintAxisHorizontal];
+    [headerRow addArrangedSubview:self.countLabel];
     [self.contentStack addArrangedSubview:headerRow];
-
-    self.previewLabel = [[UILabel alloc] init];
-    self.previewLabel.numberOfLines = 2;
-    self.previewLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    self.previewLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.94];
-    self.previewLabel.font = [UIFont systemFontOfSize:(_styleCompact ? 13 : 14) weight:UIFontWeightSemibold];
-    self.previewLabel.userInteractionEnabled = NO;
-    [self.contentStack addArrangedSubview:self.previewLabel];
-
-    self.hintLabel = [[UILabel alloc] init];
-    self.hintLabel.numberOfLines = 1;
-    self.hintLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    self.hintLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.52];
-    self.hintLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
-    self.hintLabel.userInteractionEnabled = NO;
-    [self.contentStack addArrangedSubview:self.hintLabel];
-}
-
-#pragma mark - interaction
-
-// Same rule as the privacy card footer: arm suppression on touchDown, because
-// SpringBoard's dismiss callback can arrive before touchUpInside.
-- (void)rbTouchDown:(UIControl *)sender {
-    (void)sender;
-    RBPrivacyArmInteraction();
-    RBLog(@"clipboard touch down");
-}
-
-- (void)rbTouchUp:(UIControl *)sender {
-    (void)sender;
-    if (self.hasContent) {
-        self.revealed = !self.revealed;
-        [self rbUpdateLabels];
-        RBLog(@"clipboard reveal=%d", (int)self.revealed);
-    }
-    [self rbScheduleDisarm];
-}
-
-- (void)rbTouchCancel:(UIControl *)sender {
-    (void)sender;
-    [self rbScheduleDisarm];
-}
-
-- (void)rbScheduleDisarm {
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        __strong typeof(self) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        RBPrivacyCancelInteraction();
-    });
 }
 
 @end
